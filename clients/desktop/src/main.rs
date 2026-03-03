@@ -17,9 +17,7 @@ fn main() -> Result<()> {
     init_logging();
 
     let args = Args::parse();
-    game::run(game::GameConfig {
-        server_addr: args.server,
-    })
+    game::run(game::GameConfig { server_addr: args.server })
 }
 
 fn init_logging() {
@@ -37,15 +35,7 @@ fn init_logging() {
                 log::Level::Debug => ("\x1b[90m", "\x1b[0m"),
                 log::Level::Trace => ("\x1b[90m", "\x1b[0m"),
             };
-            writeln!(
-                buf,
-                "[{} {}{}{}] {}",
-                ts,
-                c0,
-                record.level(),
-                c1,
-                record.args()
-            )
+            writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
         })
         .init();
 }

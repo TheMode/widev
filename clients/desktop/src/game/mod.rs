@@ -82,10 +82,7 @@ impl Default for PredictionConfig {
 
 impl PredictionConfig {
     fn affects_translation(self) -> bool {
-        self.enabled
-            && self
-                .affected_mask
-                .contains(protocol::TransformPredictionMask::TRANSLATION)
+        self.enabled && self.affected_mask.contains(protocol::TransformPredictionMask::TRANSLATION)
     }
 }
 
@@ -179,7 +176,7 @@ impl ClientGame {
                 protocol::PredictionKind::Interpolation => {
                     element.draw_x += (element.target_x - element.draw_x) * LERP_ALPHA;
                     element.draw_y += (element.target_y - element.draw_y) * LERP_ALPHA;
-                }
+                },
                 protocol::PredictionKind::Extrapolation => {
                     let predicted_x = element.draw_x + element.velocity_x * FIXED_FRAME_DT_SECONDS;
                     let predicted_y = element.draw_y + element.velocity_y * FIXED_FRAME_DT_SECONDS;
@@ -187,7 +184,7 @@ impl ClientGame {
                         + (element.target_x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
                     element.draw_y = predicted_y
                         + (element.target_y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
-                }
+                },
             }
         }
 
@@ -262,10 +259,7 @@ impl ClientGame {
             binding.last_value = value;
             binding.frames_since_send = 0;
 
-            outgoing.push(protocol::C2SPacket::InputValue {
-                binding_id: binding.id,
-                value,
-            });
+            outgoing.push(protocol::C2SPacket::InputValue { binding_id: binding.id, value });
         }
 
         for packet in outgoing {
@@ -296,28 +290,21 @@ impl ClientGame {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
                 log::info!("server tick rate: {tick_rate_hz}Hz");
-            }
-            protocol::S2CPacket::AssetManifest {
-                player_color_rgba,
-                player_size,
-            } => {
+            },
+            protocol::S2CPacket::AssetManifest { player_color_rgba, player_size } => {
                 self.draw_color_rgba = player_color_rgba;
                 self.draw_size = player_size;
-            }
+            },
             protocol::S2CPacket::SetGameName { name } => {
                 self.game_name = name;
-            }
+            },
             protocol::S2CPacket::SetTransformPrediction {
                 element_id,
                 enabled,
                 affected_mask,
                 kind,
             } => {
-                let config = PredictionConfig {
-                    enabled,
-                    affected_mask,
-                    kind,
-                };
+                let config = PredictionConfig { enabled, affected_mask, kind };
                 if let Some(element) = self.elements.get_mut(&element_id) {
                     element.prediction = config;
                 } else {
@@ -330,12 +317,8 @@ impl ClientGame {
                     affected_mask.bits(),
                     kind
                 );
-            }
-            protocol::S2CPacket::BindingDeclare {
-                binding_id,
-                identifier,
-                input_type,
-            } => {
+            },
+            protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
                 log::info!("binding request: {identifier} ({input_type:?})");
 
                 if let Some(cert_fp) = &self.server_cert_fingerprint {
@@ -366,7 +349,7 @@ impl ClientGame {
                     identifier,
                     input_type,
                 });
-            }
+            },
             protocol::S2CPacket::ElementMoved { element_id, x, y } => {
                 let now = Instant::now();
                 let element = self.elements.entry(element_id).or_insert(ElementState {
@@ -395,11 +378,11 @@ impl ClientGame {
                 element.last_authoritative_at = now;
                 element.target_x = x;
                 element.target_y = y;
-            }
+            },
             protocol::S2CPacket::ElementRemoved { element_id } => {
                 self.elements.remove(&element_id);
                 self.pending_prediction.remove(&element_id);
-            }
+            },
         }
 
         Ok(())

@@ -8,10 +8,7 @@ pub(super) fn input_path_from_key(key: Key) -> String {
 
 pub(super) fn key_from_input_path(path: &str) -> Option<Key> {
     let raw = path.strip_prefix(KEYBOARD_PATH_PREFIX)?;
-    all_keys()
-        .iter()
-        .copied()
-        .find(|key| format!("{key:?}") == raw)
+    all_keys().iter().copied().find(|key| format!("{key:?}") == raw)
 }
 
 fn all_keys() -> &'static [Key] {

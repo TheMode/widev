@@ -52,9 +52,7 @@ fn main() -> Result<()> {
 
     let socket = UdpSocket::bind(bind_addr)
         .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
-    socket
-        .set_nonblocking(true)
-        .context("failed to set UDP socket non-blocking")?;
+    socket.set_nonblocking(true).context("failed to set UDP socket non-blocking")?;
 
     let local_addr = socket.local_addr().context("failed to read local addr")?;
     log::info!("server listening on {local_addr}");
@@ -63,12 +61,8 @@ fn main() -> Result<()> {
     ensure_dev_certs(&cert_dir)?;
     let cert_path = cert_dir.join("cert.crt");
     let key_path = cert_dir.join("cert.key");
-    let cert_path_str = cert_path
-        .to_str()
-        .context("certificate path is not valid UTF-8")?;
-    let key_path_str = key_path
-        .to_str()
-        .context("private key path is not valid UTF-8")?;
+    let cert_path_str = cert_path.to_str().context("certificate path is not valid UTF-8")?;
+    let key_path_str = key_path.to_str().context("private key path is not valid UTF-8")?;
 
     let mut config = build_server_quic_config(cert_path_str, key_path_str, &cert_path, &key_path)?;
 
@@ -203,15 +197,7 @@ fn init_logging() {
                 log::Level::Debug => ("\x1b[90m", "\x1b[0m"),
                 log::Level::Trace => ("\x1b[90m", "\x1b[0m"),
             };
-            writeln!(
-                buf,
-                "[{} {}{}{}] {}",
-                ts,
-                c0,
-                record.level(),
-                c1,
-                record.args()
-            )
+            writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
         })
         .init();
 }
@@ -228,7 +214,7 @@ fn pump_app_packets(
                 if let Ok(packet) = decode_c2s(&app_buf[..len]) {
                     game.on_client_packet(state, session.client_id, packet);
                 }
-            }
+            },
             Err(quiche::Error::Done) => break,
             Err(_) => break,
         }
@@ -249,7 +235,7 @@ fn pump_app_packets(
                         session.stream_recv_buffers.remove(&stream_id);
                         break;
                     }
-                }
+                },
                 Err(quiche::Error::Done) => break,
                 Err(_) => break,
             }
@@ -264,10 +250,7 @@ fn recv_on_session(
     local_addr: SocketAddr,
     context: &str,
 ) {
-    let recv_info = RecvInfo {
-        from,
-        to: local_addr,
-    };
+    let recv_info = RecvInfo { from, to: local_addr };
     if let Err(err) = session.conn.recv(buf, recv_info) {
         if err != quiche::Error::Done {
             log::warn!("{context} failed: {err:?}");
@@ -305,10 +288,7 @@ fn queue_stream_packets(session: &mut Session, packets: Vec<StreamPacket>) {
                 .pending_stream_writes
                 .entry(stream_packet.stream_id)
                 .or_default()
-                .push_back(PendingStreamWrite {
-                    data: framed,
-                    offset: 0,
-                });
+                .push_back(PendingStreamWrite { data: framed, offset: 0 });
         }
     }
 }
@@ -321,10 +301,7 @@ fn flush_stream_writes(session: &mut Session) -> Result<()> {
         };
 
         while let Some(chunk) = queue.front_mut() {
-            match session
-                .conn
-                .stream_send(stream_id, &chunk.data[chunk.offset..], false)
-            {
+            match session.conn.stream_send(stream_id, &chunk.data[chunk.offset..], false) {
                 Ok(written) => {
                     chunk.offset += written;
                     if chunk.offset >= chunk.data.len() {
@@ -332,7 +309,7 @@ fn flush_stream_writes(session: &mut Session) -> Result<()> {
                     } else {
                         break;
                     }
-                }
+                },
                 Err(quiche::Error::Done) => break,
                 Err(err) => return Err(anyhow::anyhow!("stream_send failed: {err:?}")),
             }
@@ -364,7 +341,7 @@ fn flush_quic(socket: &UdpSocket, session: &mut Session, send_buf: &mut [u8]) ->
         match session.conn.send(send_buf) {
             Ok((len, send_info)) => {
                 socket.send_to(&send_buf[..len], send_info.to)?;
-            }
+            },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
         }
@@ -386,9 +363,7 @@ fn build_server_quic_config(
     config
         .load_priv_key_from_pem_file(key_path_str)
         .with_context(|| format!("failed to load {}", key_path.display()))?;
-    config
-        .set_application_protos(&[b"widev-poc-quic"])
-        .context("failed setting ALPN")?;
+    config.set_application_protos(&[b"widev-poc-quic"]).context("failed setting ALPN")?;
     config.set_max_idle_timeout(10_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);

@@ -47,10 +47,7 @@ impl RedSquareGame {
     fn spawn_element(client_id: ClientId) -> ElementState {
         let row = (client_id as f32 % 8.0).floor();
         let col = ((client_id / 8) as f32 % 8.0).floor();
-        ElementState {
-            x: 120.0 + col * 60.0,
-            y: 120.0 + row * 60.0,
-        }
+        ElementState { x: 120.0 + col * 60.0, y: 120.0 + row * 60.0 }
     }
 
     fn send_bootstrap(&mut self, state: &mut GameState, client_id: ClientId) {
@@ -67,9 +64,7 @@ impl RedSquareGame {
         state.send_packet_on_stream(
             client_id,
             stream_id,
-            S2CPacket::SetGameName {
-                name: "Red Square Multiplayer".to_string(),
-            },
+            S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
         );
         state.send_packet_on_stream(
             client_id,
@@ -84,18 +79,12 @@ impl RedSquareGame {
         state.send_packet_on_stream(
             client_id,
             stream_id,
-            S2CPacket::AssetManifest {
-                player_color_rgba: [255, 0, 0, 255],
-                player_size: 32,
-            },
+            S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
         );
 
-        for (binding_id, identifier) in [
-            (1, "move_up"),
-            (2, "move_down"),
-            (3, "move_left"),
-            (4, "move_right"),
-        ] {
+        for (binding_id, identifier) in
+            [(1, "move_up"), (2, "move_down"), (3, "move_left"), (4, "move_right")]
+        {
             state.send_packet_on_stream(
                 client_id,
                 stream_id,
@@ -115,29 +104,15 @@ impl Game for RedSquareGame {
         let element = Self::spawn_element(client_id);
         self.players.insert(
             client_id,
-            PlayerState {
-                input: PlayerInput::default(),
-                element,
-                control_stream_id: stream_id,
-            },
+            PlayerState { input: PlayerInput::default(), element, control_stream_id: stream_id },
         );
 
         self.send_bootstrap(state, client_id);
 
-        let snapshots: Vec<(ClientId, ElementState)> = self
-            .players
-            .iter()
-            .map(|(id, p)| (*id, p.element))
-            .collect();
+        let snapshots: Vec<(ClientId, ElementState)> =
+            self.players.iter().map(|(id, p)| (*id, p.element)).collect();
         for (element_id, e) in snapshots {
-            state.enqueue_for(
-                client_id,
-                S2CPacket::ElementMoved {
-                    element_id,
-                    x: e.x,
-                    y: e.y,
-                },
-            );
+            state.enqueue_for(client_id, S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
             state.enqueue_for(
                 client_id,
                 S2CPacket::SetTransformPrediction {
@@ -149,11 +124,7 @@ impl Game for RedSquareGame {
             );
         }
 
-        let element = self
-            .players
-            .get(&client_id)
-            .map(|p| p.element)
-            .unwrap_or(element);
+        let element = self.players.get(&client_id).map(|p| p.element).unwrap_or(element);
         state.broadcast(S2CPacket::ElementMoved {
             element_id: client_id,
             x: element.x,
@@ -172,24 +143,19 @@ impl Game for RedSquareGame {
     fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId) {
         self.players.remove(&client_id);
 
-        state.broadcast(S2CPacket::ElementRemoved {
-            element_id: client_id,
-        });
+        state.broadcast(S2CPacket::ElementRemoved { element_id: client_id });
 
         log::info!("client {client_id} disconnected");
     }
 
     fn on_client_packet(&mut self, _state: &mut GameState, client_id: ClientId, packet: C2SPacket) {
         match packet {
-            C2SPacket::ClientHello {
-                client_name,
-                capabilities,
-            } => {
+            C2SPacket::ClientHello { client_name, capabilities } => {
                 log::info!("client {client_id} hello: {client_name} / {capabilities:?}");
-            }
+            },
             C2SPacket::BindingAssigned { binding_id } => {
                 log::info!("client {client_id} binding {binding_id} acknowledged");
-            }
+            },
             C2SPacket::InputValue { binding_id, value } => {
                 let pressed = value >= 0.5;
                 let player = self.players.entry(client_id).or_insert(PlayerState {
@@ -203,9 +169,9 @@ impl Game for RedSquareGame {
                     2 => input.down = pressed,
                     3 => input.left = pressed,
                     4 => input.right = pressed,
-                    _ => {}
+                    _ => {},
                 }
-            }
+            },
         }
     }
 
@@ -240,17 +206,10 @@ impl Game for RedSquareGame {
         }
         self.last_world_send = now;
 
-        let snapshots: Vec<(ClientId, ElementState)> = self
-            .players
-            .iter()
-            .map(|(id, p)| (*id, p.element))
-            .collect();
+        let snapshots: Vec<(ClientId, ElementState)> =
+            self.players.iter().map(|(id, p)| (*id, p.element)).collect();
         for (element_id, e) in snapshots {
-            state.broadcast(S2CPacket::ElementMoved {
-                element_id,
-                x: e.x,
-                y: e.y,
-            });
+            state.broadcast(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
         }
     }
 }

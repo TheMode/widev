@@ -21,9 +21,7 @@ pub struct GameState {
 
 impl GameState {
     pub fn new() -> Self {
-        Self {
-            clients: HashMap::new(),
-        }
+        Self { clients: HashMap::new() }
     }
 
     pub fn connect_client(&mut self, client_id: ClientId) {
@@ -71,9 +69,7 @@ impl GameState {
         packet: S2CPacket,
     ) {
         if let Some(client) = self.clients.get_mut(&client_id) {
-            client
-                .stream_outbox
-                .push_back(StreamPacket { stream_id, packet });
+            client.stream_outbox.push_back(StreamPacket { stream_id, packet });
         }
     }
 

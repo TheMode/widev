@@ -27,9 +27,7 @@ impl QuicClient {
     pub(super) fn connect(server_addr: SocketAddr) -> Result<Self> {
         log::info!("connecting to server {server_addr}...");
         let socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-        socket
-            .set_nonblocking(true)
-            .context("failed to set UDP socket non-blocking")?;
+        socket.set_nonblocking(true).context("failed to set UDP socket non-blocking")?;
 
         let local_addr = socket.local_addr().context("failed to get local addr")?;
         log::info!("local UDP endpoint: {local_addr}");
@@ -40,14 +38,9 @@ impl QuicClient {
         rand::thread_rng().fill_bytes(&mut scid);
         let scid = quiche::ConnectionId::from_ref(&scid);
 
-        let conn = quiche::connect(
-            Some("widev.local"),
-            &scid,
-            local_addr,
-            server_addr,
-            &mut config,
-        )
-        .context("failed to create QUIC connection")?;
+        let conn =
+            quiche::connect(Some("widev.local"), &scid, local_addr, server_addr, &mut config)
+                .context("failed to create QUIC connection")?;
         log::info!("QUIC connection object created, starting handshake...");
 
         let mut client = Self {
@@ -90,10 +83,7 @@ impl QuicClient {
                 continue;
             }
 
-            let recv_info = RecvInfo {
-                from,
-                to: self.local_addr,
-            };
+            let recv_info = RecvInfo { from, to: self.local_addr };
 
             if let Err(err) = self.conn.recv(&mut self.recv_buf[..len], recv_info) {
                 if err != quiche::Error::Done {
@@ -125,7 +115,7 @@ impl QuicClient {
                             self.stream_recv_buffers.remove(&stream_id);
                             break;
                         }
-                    }
+                    },
                     Err(quiche::Error::Done) => break,
                     Err(_) => break,
                 }
@@ -154,7 +144,7 @@ impl QuicClient {
                     self.socket
                         .send_to(&self.send_buf[..len], send_info.to)
                         .context("socket send_to failed")?;
-                }
+                },
                 Err(quiche::Error::Done) => break,
                 Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
             }
@@ -178,9 +168,7 @@ impl Drop for QuicClient {
 fn build_client_quic_config() -> Result<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.verify_peer(false);
-    config
-        .set_application_protos(&[b"widev-poc-quic"])
-        .context("failed setting ALPN")?;
+    config.set_application_protos(&[b"widev-poc-quic"]).context("failed setting ALPN")?;
     config.set_max_idle_timeout(10_000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);

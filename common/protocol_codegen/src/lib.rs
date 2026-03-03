@@ -89,10 +89,7 @@ impl CodegenBackend for RustBackend {
         let mut out = String::new();
 
         for typedef_def in &schema.typedefs {
-            out.push_str(&format!(
-                "pub type {} = {};\n",
-                typedef_def.name, typedef_def.ty
-            ));
+            out.push_str(&format!("pub type {} = {};\n", typedef_def.name, typedef_def.ty));
         }
         if !schema.typedefs.is_empty() {
             out.push('\n');
@@ -170,10 +167,7 @@ fn format_bitmask(bitmask: &BitmaskDef) -> String {
         "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n",
     );
     out.push_str("#[repr(transparent)]\n");
-    out.push_str(&format!(
-        "pub struct {}(pub {});\n",
-        bitmask.name, bitmask.ty
-    ));
+    out.push_str(&format!("pub struct {}(pub {});\n", bitmask.name, bitmask.ty));
     out.push_str(&format!("impl {} {{\n", bitmask.name));
     out.push_str(&format!("    pub const NONE: Self = Self(0);\n"));
     for flag in &bitmask.flags {
@@ -200,10 +194,7 @@ fn format_bitmask(bitmask: &BitmaskDef) -> String {
     out.push_str("    }\n");
     out.push_str("}\n\n");
 
-    out.push_str(&format!(
-        "impl std::ops::BitOrAssign for {} {{\n",
-        bitmask.name
-    ));
+    out.push_str(&format!("impl std::ops::BitOrAssign for {} {{\n", bitmask.name));
     out.push_str("    fn bitor_assign(&mut self, rhs: Self) {\n");
     out.push_str("        self.0 |= rhs.0;\n");
     out.push_str("    }\n");
