@@ -167,21 +167,8 @@ impl Game for RedSquareGame {
         let dt_seconds = dt.as_secs_f32();
         for player in self.players.values_mut() {
             let input = player.input;
-
-            let mut dx = 0.0;
-            let mut dy = 0.0;
-            if input.left {
-                dx -= 1.0;
-            }
-            if input.right {
-                dx += 1.0;
-            }
-            if input.up {
-                dy -= 1.0;
-            }
-            if input.down {
-                dy += 1.0;
-            }
+            let dx = (input.right as i8 - input.left as i8) as f32;
+            let dy = (input.down as i8 - input.up as i8) as f32;
 
             player.element.x =
                 (player.element.x + dx * PLAYER_SPEED * dt_seconds).clamp(0.0, GAME_WIDTH);
@@ -189,12 +176,12 @@ impl Game for RedSquareGame {
                 (player.element.y + dy * PLAYER_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT);
         }
 
-        let snapshots: Vec<(ClientId, ElementState)> =
-            self.players.iter().map(|(id, p)| (*id, p.element)).collect();
         let mut bundle = PacketBundle::new(PacketMeta { optional: true, stream_id: None });
-        for (element_id, e) in snapshots {
-            bundle.push(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
-        }
+        bundle.extend(self.players.iter().map(|(element_id, player)| S2CPacket::ElementMoved {
+            element_id: *element_id,
+            x: player.element.x,
+            y: player.element.y,
+        }));
         if !bundle.packets.is_empty() {
             state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
         }
