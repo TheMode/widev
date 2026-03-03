@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::game::Game;
-use crate::packets::{C2SPacket, S2CPacket};
+use crate::packets::{C2SPacket, InputType, S2CPacket};
 
 const GAME_WIDTH: f32 = 800.0;
 const GAME_HEIGHT: f32 = 600.0;
@@ -95,22 +95,22 @@ impl Game for RedSquareGame {
             S2CPacket::BindingDeclare {
                 binding_id: 1,
                 identifier: "move_up".to_string(),
-                input_type: "toggle".to_string(),
+                input_type: InputType::Toggle,
             },
             S2CPacket::BindingDeclare {
                 binding_id: 2,
                 identifier: "move_down".to_string(),
-                input_type: "toggle".to_string(),
+                input_type: InputType::Toggle,
             },
             S2CPacket::BindingDeclare {
                 binding_id: 3,
                 identifier: "move_left".to_string(),
-                input_type: "toggle".to_string(),
+                input_type: InputType::Toggle,
             },
             S2CPacket::BindingDeclare {
                 binding_id: 4,
                 identifier: "move_right".to_string(),
-                input_type: "toggle".to_string(),
+                input_type: InputType::Toggle,
             },
         ]
     }

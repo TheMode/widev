@@ -19,11 +19,11 @@ pub(super) fn run(game: &mut ClientGame) -> Result<()> {
         if let Some(prompt) = game.binding_prompt() {
             let prompt_title = match prompt.suggestion {
                 Some(key) => format!(
-                    "Bind {} [{}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
+                    "Bind {} [{:?}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
                     prompt.identifier, prompt.input_type, key
                 ),
                 None => format!(
-                    "Bind {} [{}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
+                    "Bind {} [{:?}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
                     prompt.identifier, prompt.input_type
                 ),
             };

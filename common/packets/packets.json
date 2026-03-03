@@ -1,4 +1,10 @@
 {
+  "enums": [
+    {
+      "name": "InputType",
+      "variants": ["Toggle", "Axis1D", "Joystick2D"]
+    }
+  ],
   "c2s": [
     {
       "name": "ClientHello",
@@ -40,7 +46,7 @@
       "fields": [
         { "name": "binding_id", "type": "u16" },
         { "name": "identifier", "type": "String" },
-        { "name": "input_type", "type": "String" }
+        { "name": "input_type", "type": "InputType" }
       ]
     },
     {

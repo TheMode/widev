@@ -27,14 +27,14 @@ pub(super) struct RenderState {
 
 pub(super) struct BindingPromptState {
     pub(super) identifier: String,
-    pub(super) input_type: String,
+    pub(super) input_type: protocol::InputType,
     pub(super) suggestion: Option<Key>,
 }
 
 struct BindingDefinition {
     id: u16,
     identifier: String,
-    input_type: String,
+    input_type: protocol::InputType,
 }
 
 struct BindingAssignment {
@@ -226,7 +226,7 @@ impl ClientGame {
                 identifier,
                 input_type,
             } => {
-                println!("binding request: {identifier} ({input_type})");
+                println!("binding request: {identifier} ({input_type:?})");
 
                 if let Some(cert_fp) = &self.server_cert_fingerprint {
                     if let Some(saved_key) = self.binding_store.get_key(cert_fp, &identifier) {

@@ -6,8 +6,16 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Schema {
+    #[serde(default)]
+    pub enums: Vec<EnumDef>,
     pub c2s: Vec<PacketDef>,
     pub s2c: Vec<PacketDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +60,16 @@ pub struct RustBackend;
 impl CodegenBackend for RustBackend {
     fn generate(&self, schema: &Schema) -> Result<String> {
         let mut out = String::new();
+
+        for enum_def in &schema.enums {
+            out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n");
+            out.push_str(&format!("pub enum {} {{\n", enum_def.name));
+            for variant in &enum_def.variants {
+                out.push_str(&format!("    {},\n", variant));
+            }
+            out.push_str("}\n\n");
+        }
+
         out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
         out.push_str("pub enum C2SPacket {\n");
         for packet in &schema.c2s {
