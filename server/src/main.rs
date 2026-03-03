@@ -8,34 +8,15 @@ use clap::Parser;
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
 
-mod packets {
-    include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
-}
+mod game;
+mod games;
+#[allow(dead_code)]
+mod packets;
 
-use packets::{decode_c2s, encode_s2c, C2SPacket, S2CPacket};
+use game::Game;
+use packets::{decode_c2s, encode_s2c, S2CPacket};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const GAME_WIDTH: f32 = 800.0;
-const GAME_HEIGHT: f32 = 600.0;
-const PLAYER_SPEED: f32 = 220.0;
-
-#[derive(Default, Debug, Clone, Copy)]
-struct InputState {
-    up: bool,
-    down: bool,
-    left: bool,
-    right: bool,
-}
-
-struct Session {
-    conn: Connection,
-    client_addr: SocketAddr,
-    input: InputState,
-    pos_x: f32,
-    pos_y: f32,
-    last_world_send: Instant,
-    sent_bootstrap: bool,
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "widev-server")]
@@ -43,6 +24,13 @@ struct Args {
     /// Server bind address (IP:PORT)
     #[arg(default_value = "127.0.0.1:4433")]
     bind: SocketAddr,
+}
+
+struct Session {
+    conn: Connection,
+    client_addr: SocketAddr,
+    game: Box<dyn Game>,
+    sent_bootstrap: bool,
 }
 
 fn main() -> Result<()> {
@@ -90,7 +78,6 @@ fn main() -> Result<()> {
     config.enable_dgram(true, 64, 64);
     config.verify_peer(false);
 
-    let server_start = Instant::now();
     let mut recv_buf = [0u8; 65_535];
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut app_buf = [0u8; 4096];
@@ -131,10 +118,7 @@ fn main() -> Result<()> {
                 session = Some(Session {
                     conn,
                     client_addr: from,
-                    input: InputState::default(),
-                    pos_x: GAME_WIDTH * 0.5,
-                    pos_y: GAME_HEIGHT * 0.5,
-                    last_world_send: Instant::now(),
+                    game: games::default_game(Instant::now()),
                     sent_bootstrap: false,
                 });
             }
@@ -165,23 +149,14 @@ fn main() -> Result<()> {
                     pump_app_packets(active, &mut app_buf);
 
                     if !active.sent_bootstrap {
-                        send_bootstrap(active);
+                        let packets = active.game.collect_bootstrap_packets();
+                        send_game_packets(active, packets);
                         active.sent_bootstrap = true;
                     }
 
-                    simulate(active, dt.as_secs_f32());
-
-                    if now.duration_since(active.last_world_send) >= Duration::from_millis(33) {
-                        let packet = S2CPacket::WorldState {
-                            server_time_ms: server_start.elapsed().as_millis() as u64,
-                            x: active.pos_x,
-                            y: active.pos_y,
-                        };
-                        if let Ok(bytes) = encode_s2c(&packet) {
-                            let _ = active.conn.dgram_send(&bytes);
-                        }
-                        active.last_world_send = now;
-                    }
+                    active.game.on_tick(now, dt);
+                    let packets = active.game.collect_tick_packets(now);
+                    send_game_packets(active, packets);
                 }
 
                 flush_quic(&socket, active, &mut send_buf)?;
@@ -212,28 +187,7 @@ fn pump_app_packets(active: &mut Session, app_buf: &mut [u8]) {
         match active.conn.dgram_recv(app_buf) {
             Ok(len) => {
                 if let Ok(packet) = decode_c2s(&app_buf[..len]) {
-                    match packet {
-                        C2SPacket::ClientHello {
-                            client_name,
-                            capabilities,
-                        } => {
-                            println!("client hello: {client_name} / {capabilities:?}");
-                        }
-                        C2SPacket::InputState {
-                            up,
-                            down,
-                            left,
-                            right,
-                            ..
-                        } => {
-                            active.input = InputState {
-                                up,
-                                down,
-                                left,
-                                right,
-                            };
-                        }
-                    }
+                    active.game.on_client_packet(packet);
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -242,41 +196,12 @@ fn pump_app_packets(active: &mut Session, app_buf: &mut [u8]) {
     }
 }
 
-fn send_bootstrap(active: &mut Session) {
-    let hello = S2CPacket::ServerHello { tick_rate_hz: 60 };
-    let manifest = S2CPacket::AssetManifest {
-        player_color_rgba: [255, 0, 0, 255],
-        player_size: 32,
-    };
-
-    if let Ok(bytes) = encode_s2c(&hello) {
-        let _ = active.conn.dgram_send(&bytes);
+fn send_game_packets(active: &mut Session, packets: Vec<S2CPacket>) {
+    for packet in packets {
+        if let Ok(bytes) = encode_s2c(&packet) {
+            let _ = active.conn.dgram_send(&bytes);
+        }
     }
-
-    if let Ok(bytes) = encode_s2c(&manifest) {
-        let _ = active.conn.dgram_send(&bytes);
-    }
-}
-
-fn simulate(active: &mut Session, dt: f32) {
-    let mut dx = 0.0;
-    let mut dy = 0.0;
-
-    if active.input.left {
-        dx -= 1.0;
-    }
-    if active.input.right {
-        dx += 1.0;
-    }
-    if active.input.up {
-        dy -= 1.0;
-    }
-    if active.input.down {
-        dy += 1.0;
-    }
-
-    active.pos_x = (active.pos_x + dx * PLAYER_SPEED * dt).clamp(0.0, GAME_WIDTH);
-    active.pos_y = (active.pos_y + dy * PLAYER_SPEED * dt).clamp(0.0, GAME_HEIGHT);
 }
 
 fn flush_quic(socket: &UdpSocket, active: &mut Session, send_buf: &mut [u8]) -> Result<()> {
