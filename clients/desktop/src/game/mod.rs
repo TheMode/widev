@@ -140,7 +140,7 @@ impl ClientGame {
         let current = self.pending_bindings.front()?;
         Some(BindingPromptState {
             identifier: current.identifier.clone(),
-            input_type: current.input_type.clone(),
+            input_type: current.input_type,
             suggestion: self.binding_suggestion,
         })
     }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -92,15 +92,7 @@ fn main() -> Result<()> {
             };
 
             if let Some(session) = sessions.iter_mut().find(|s| s.client_addr == from) {
-                let recv_info = RecvInfo {
-                    from,
-                    to: local_addr,
-                };
-                if let Err(err) = session.conn.recv(&mut recv_buf[..len], recv_info) {
-                    if err != quiche::Error::Done {
-                        log::warn!("conn.recv failed: {err:?}");
-                    }
-                }
+                recv_on_session(session, &mut recv_buf[..len], from, local_addr, "conn.recv");
                 continue;
             }
 
@@ -124,13 +116,23 @@ fn main() -> Result<()> {
             let client_id = next_client_id;
             next_client_id = next_client_id.wrapping_add(1).max(1);
 
-            sessions.push(Session {
+            let mut session = Session {
                 client_id,
                 conn,
                 client_addr: from,
                 pending_stream_writes: HashMap::new(),
                 stream_recv_buffers: HashMap::new(),
-            });
+            };
+
+            recv_on_session(
+                &mut session,
+                &mut recv_buf[..len],
+                from,
+                local_addr,
+                "conn.recv after accept",
+            );
+
+            sessions.push(session);
             game_state.connect_client(client_id);
             game.on_client_connected(&mut game_state, client_id);
             log::info!("accepted connection from {from} as client {client_id}");
@@ -249,6 +251,24 @@ fn pump_app_packets(
     }
 }
 
+fn recv_on_session(
+    session: &mut Session,
+    buf: &mut [u8],
+    from: SocketAddr,
+    local_addr: SocketAddr,
+    context: &str,
+) {
+    let recv_info = RecvInfo {
+        from,
+        to: local_addr,
+    };
+    if let Err(err) = session.conn.recv(buf, recv_info) {
+        if err != quiche::Error::Done {
+            log::warn!("{context} failed: {err:?}");
+        }
+    }
+}
+
 fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
     for packet in packets {
         if let Ok(bytes) = encode_s2c(&packet) {
@@ -339,8 +359,8 @@ fn flush_quic(socket: &UdpSocket, session: &mut Session, send_buf: &mut [u8]) ->
 fn build_server_quic_config(
     cert_path_str: &str,
     key_path_str: &str,
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config
