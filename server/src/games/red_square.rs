@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game};
 use crate::game_state::GameState;
 use crate::packets::{
-    C2SPacket, InputType, PredictionKind, S2CPacket, StreamID, TransformPredictionMask,
+    C2SPacket, InputType, PacketBundle, PacketMessage, PacketMeta, PacketTarget, PredictionKind,
+    S2CPacket, StreamID, TransformPredictionMask,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -52,45 +53,32 @@ impl RedSquareGame {
         };
         let stream_id = player.control_stream_id;
 
-        state.send_packet_on_stream(
-            client_id,
-            stream_id,
-            S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
-        );
-        state.send_packet_on_stream(
-            client_id,
-            stream_id,
-            S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
-        );
-        state.send_packet_on_stream(
-            client_id,
-            stream_id,
-            S2CPacket::SetTransformPrediction {
-                element_id: client_id,
-                enabled: true,
-                affected_mask: TransformPredictionMask::TRANSLATION,
-                kind: PredictionKind::Interpolation,
-            },
-        );
-        state.send_packet_on_stream(
-            client_id,
-            stream_id,
-            S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
+        let mut bundle = PacketBundle::with_meta(
+            PacketMeta { optional: false, stream_id: Some(stream_id) },
+            vec![
+                S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
+                S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
+                S2CPacket::SetTransformPrediction {
+                    element_id: client_id,
+                    enabled: true,
+                    affected_mask: TransformPredictionMask::TRANSLATION,
+                    kind: PredictionKind::Interpolation,
+                },
+                S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
+            ],
         );
 
         for (binding_id, identifier) in
             [(1, "move_up"), (2, "move_down"), (3, "move_left"), (4, "move_right")]
         {
-            state.send_packet_on_stream(
-                client_id,
-                stream_id,
-                S2CPacket::BindingDeclare {
-                    binding_id,
-                    identifier: identifier.to_string(),
-                    input_type: InputType::Toggle,
-                },
-            );
+            bundle.push(S2CPacket::BindingDeclare {
+                binding_id,
+                identifier: identifier.to_string(),
+                input_type: InputType::Toggle,
+            });
         }
+
+        state.send(PacketTarget::Client(client_id), PacketMessage::Bundle(bundle));
     }
 }
 
@@ -107,31 +95,30 @@ impl Game for RedSquareGame {
 
         let snapshots: Vec<(ClientId, ElementState)> =
             self.players.iter().map(|(id, p)| (*id, p.element)).collect();
+        let mut snapshot_bundle = PacketBundle::default();
         for (element_id, e) in snapshots {
-            state.enqueue_for(client_id, S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
-            state.enqueue_for(
-                client_id,
-                S2CPacket::SetTransformPrediction {
-                    element_id,
-                    enabled: true,
-                    affected_mask: TransformPredictionMask::TRANSLATION,
-                    kind: PredictionKind::Interpolation,
-                },
-            );
+            snapshot_bundle.push(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
+            snapshot_bundle.push(S2CPacket::SetTransformPrediction {
+                element_id,
+                enabled: true,
+                affected_mask: TransformPredictionMask::TRANSLATION,
+                kind: PredictionKind::Interpolation,
+            });
+        }
+        if !snapshot_bundle.packets.is_empty() {
+            state.send(PacketTarget::Client(client_id), PacketMessage::Bundle(snapshot_bundle));
         }
 
         let element = self.players.get(&client_id).map(|p| p.element).unwrap_or(element);
-        state.broadcast(S2CPacket::ElementMoved {
-            element_id: client_id,
-            x: element.x,
-            y: element.y,
-        });
-        state.broadcast(S2CPacket::SetTransformPrediction {
+        let mut bundle = PacketBundle::default();
+        bundle.push(S2CPacket::ElementMoved { element_id: client_id, x: element.x, y: element.y });
+        bundle.push(S2CPacket::SetTransformPrediction {
             element_id: client_id,
             enabled: true,
             affected_mask: TransformPredictionMask::TRANSLATION,
             kind: PredictionKind::Interpolation,
         });
+        state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
 
         log::info!("client {client_id} connected");
     }
@@ -139,7 +126,10 @@ impl Game for RedSquareGame {
     fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId) {
         self.players.remove(&client_id);
 
-        state.broadcast(S2CPacket::ElementRemoved { element_id: client_id });
+        state.send(
+            PacketTarget::Broadcast,
+            PacketMessage::Packet(S2CPacket::ElementRemoved { element_id: client_id }),
+        );
 
         log::info!("client {client_id} disconnected");
     }
@@ -199,8 +189,12 @@ impl Game for RedSquareGame {
 
         let snapshots: Vec<(ClientId, ElementState)> =
             self.players.iter().map(|(id, p)| (*id, p.element)).collect();
+        let mut bundle = PacketBundle::new(PacketMeta { optional: true, stream_id: None });
         for (element_id, e) in snapshots {
-            state.broadcast(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
+            bundle.push(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
+        }
+        if !bundle.packets.is_empty() {
+            state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
         }
     }
 }

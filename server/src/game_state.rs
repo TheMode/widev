@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use crate::game::ClientId;
-use crate::packets::{S2CPacket, StreamID};
+use crate::packets::{PacketBundle, PacketMessage, PacketTarget, S2CPacket, StreamID};
 
 #[derive(Clone)]
 pub struct StreamPacket {
@@ -22,6 +22,8 @@ pub struct GameState {
 }
 
 impl GameState {
+    const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
+
     pub fn new(ticks_per_second: u16) -> Self {
         Self { clients: HashMap::new(), ticks_per_second: ticks_per_second.max(1) }
     }
@@ -53,15 +55,33 @@ impl GameState {
         self.clients.keys().copied().collect()
     }
 
-    pub fn enqueue_for(&mut self, client_id: ClientId, packet: S2CPacket) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.datagram_outbox.push_back(packet);
-        }
-    }
+    pub fn send(&mut self, target: PacketTarget, message: PacketMessage) {
+        let bundle = match message {
+            PacketMessage::Packet(packet) => PacketBundle::single(packet),
+            PacketMessage::Bundle(bundle) => bundle,
+        };
+        let target_clients: Vec<ClientId> = match target {
+            PacketTarget::Client(client_id) => vec![client_id],
+            PacketTarget::Broadcast => self.connected_clients(),
+        };
 
-    pub fn broadcast(&mut self, packet: S2CPacket) {
-        for client_id in self.connected_clients() {
-            self.enqueue_for(client_id, packet.clone());
+        for client_id in target_clients {
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+
+            for packet in &bundle.packets {
+                let meta = packet.meta.or(bundle.meta).unwrap_or_default();
+                if meta.optional {
+                    client.datagram_outbox.push_back(packet.packet.clone());
+                    continue;
+                }
+
+                let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+                client
+                    .stream_outbox
+                    .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
+            }
         }
     }
 
@@ -70,17 +90,6 @@ impl GameState {
         let stream_id = client.next_server_uni_stream_id;
         client.next_server_uni_stream_id = client.next_server_uni_stream_id.wrapping_add(4);
         Some(stream_id)
-    }
-
-    pub fn send_packet_on_stream(
-        &mut self,
-        client_id: ClientId,
-        stream_id: StreamID,
-        packet: S2CPacket,
-    ) {
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.stream_outbox.push_back(StreamPacket { stream_id, packet });
-        }
     }
 
     pub fn drain_datagrams_for(&mut self, client_id: ClientId) -> Vec<S2CPacket> {
