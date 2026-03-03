@@ -30,6 +30,12 @@ pub(super) struct RenderState {
 }
 
 #[derive(Clone, Copy, Default)]
+struct Vec2f {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Clone, Copy, Default)]
 pub(super) struct SurfaceState {
     pub(super) dimension_lock: Option<(u32, u32)>,
     pub(super) aspect_ratio_lock: Option<(u32, u32)>,
@@ -39,15 +45,11 @@ pub(super) struct SurfaceState {
 #[derive(Clone, Copy)]
 struct ElementState {
     visible: bool,
-    last_authoritative_x: f32,
-    last_authoritative_y: f32,
+    last_authoritative: Vec2f,
     last_authoritative_at: Instant,
-    target_x: f32,
-    target_y: f32,
-    draw_x: f32,
-    draw_y: f32,
-    velocity_x: f32,
-    velocity_y: f32,
+    target: Vec2f,
+    draw: Vec2f,
+    velocity: Vec2f,
     prediction: PredictionConfig,
 }
 
@@ -152,23 +154,22 @@ impl ClientGame {
         for element in self.elements.values_mut() {
             let prediction = element.prediction;
             if !prediction.affects_translation() {
-                element.draw_x = element.target_x;
-                element.draw_y = element.target_y;
+                element.draw = element.target;
                 continue;
             }
 
             match prediction.kind {
                 protocol::PredictionKind::Interpolation => {
-                    element.draw_x += (element.target_x - element.draw_x) * LERP_ALPHA;
-                    element.draw_y += (element.target_y - element.draw_y) * LERP_ALPHA;
+                    element.draw.x += (element.target.x - element.draw.x) * LERP_ALPHA;
+                    element.draw.y += (element.target.y - element.draw.y) * LERP_ALPHA;
                 },
                 protocol::PredictionKind::Extrapolation => {
-                    let predicted_x = element.draw_x + element.velocity_x * FIXED_FRAME_DT_SECONDS;
-                    let predicted_y = element.draw_y + element.velocity_y * FIXED_FRAME_DT_SECONDS;
-                    element.draw_x = predicted_x
-                        + (element.target_x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
-                    element.draw_y = predicted_y
-                        + (element.target_y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
+                    let predicted_x = element.draw.x + element.velocity.x * FIXED_FRAME_DT_SECONDS;
+                    let predicted_y = element.draw.y + element.velocity.y * FIXED_FRAME_DT_SECONDS;
+                    element.draw.x = predicted_x
+                        + (element.target.x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
+                    element.draw.y = predicted_y
+                        + (element.target.y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
                 },
             }
         }
@@ -218,8 +219,8 @@ impl ClientGame {
             .values()
             .filter(|e| e.visible)
             .map(|e| RenderState {
-                x: e.draw_x,
-                y: e.draw_y,
+                x: e.draw.x,
+                y: e.draw.y,
                 width: self.draw_size as f32,
                 height: self.draw_size as f32,
                 color: rgba_to_u32(self.draw_color_rgba),
@@ -352,15 +353,11 @@ impl ClientGame {
                 let now = Instant::now();
                 self.elements.entry(element_id).or_insert(ElementState {
                     visible: false,
-                    last_authoritative_x: 0.0,
-                    last_authoritative_y: 0.0,
+                    last_authoritative: Vec2f::default(),
                     last_authoritative_at: now,
-                    target_x: 0.0,
-                    target_y: 0.0,
-                    draw_x: 0.0,
-                    draw_y: 0.0,
-                    velocity_x: 0.0,
-                    velocity_y: 0.0,
+                    target: Vec2f::default(),
+                    draw: Vec2f::default(),
+                    velocity: Vec2f::default(),
                     prediction: self
                         .pending_prediction
                         .remove(&element_id)
@@ -372,15 +369,12 @@ impl ClientGame {
                     log::debug!("ignored ElementMove for unknown element_id={element_id}");
                     return Ok(());
                 };
+                let position = Vec2f { x, y };
                 if !element.visible {
-                    element.last_authoritative_x = x;
-                    element.last_authoritative_y = y;
-                    element.target_x = x;
-                    element.target_y = y;
-                    element.draw_x = x;
-                    element.draw_y = y;
-                    element.velocity_x = 0.0;
-                    element.velocity_y = 0.0;
+                    element.last_authoritative = position;
+                    element.target = position;
+                    element.draw = position;
+                    element.velocity = Vec2f::default();
                     element.last_authoritative_at = Instant::now();
                     element.visible = true;
                     return Ok(());
@@ -390,13 +384,11 @@ impl ClientGame {
                     .duration_since(element.last_authoritative_at)
                     .as_secs_f32()
                     .max(f32::EPSILON);
-                element.velocity_x = (x - element.last_authoritative_x) / dt_seconds;
-                element.velocity_y = (y - element.last_authoritative_y) / dt_seconds;
-                element.last_authoritative_x = x;
-                element.last_authoritative_y = y;
+                element.velocity.x = (position.x - element.last_authoritative.x) / dt_seconds;
+                element.velocity.y = (position.y - element.last_authoritative.y) / dt_seconds;
+                element.last_authoritative = position;
                 element.last_authoritative_at = now;
-                element.target_x = x;
-                element.target_y = y;
+                element.target = position;
                 element.visible = true;
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
