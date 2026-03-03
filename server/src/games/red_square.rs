@@ -46,18 +46,19 @@ impl Game for RedSquareGame {
             } => {
                 println!("client hello: {client_name} / {capabilities:?}");
             }
-            C2SPacket::InputState {
-                seq,
-                up,
-                down,
-                left,
-                right,
-            } => {
-                self.last_input_seq = seq;
-                self.up = up;
-                self.down = down;
-                self.left = left;
-                self.right = right;
+            C2SPacket::BindingAssigned { binding_id } => {
+                println!("binding {binding_id} acknowledged by client");
+            }
+            C2SPacket::InputValue { binding_id, value } => {
+                let pressed = value >= 0.5;
+                self.last_input_seq = self.last_input_seq.wrapping_add(1);
+                match binding_id {
+                    1 => self.up = pressed,
+                    2 => self.down = pressed,
+                    3 => self.left = pressed,
+                    4 => self.right = pressed,
+                    _ => {}
+                }
             }
         }
     }
@@ -90,6 +91,26 @@ impl Game for RedSquareGame {
             S2CPacket::AssetManifest {
                 player_color_rgba: [255, 0, 0, 255],
                 player_size: 32,
+            },
+            S2CPacket::BindingDeclare {
+                binding_id: 1,
+                identifier: "move_up".to_string(),
+                input_type: "toggle".to_string(),
+            },
+            S2CPacket::BindingDeclare {
+                binding_id: 2,
+                identifier: "move_down".to_string(),
+                input_type: "toggle".to_string(),
+            },
+            S2CPacket::BindingDeclare {
+                binding_id: 3,
+                identifier: "move_left".to_string(),
+                input_type: "toggle".to_string(),
+            },
+            S2CPacket::BindingDeclare {
+                binding_id: 4,
+                identifier: "move_right".to_string(),
+                input_type: "toggle".to_string(),
             },
         ]
     }

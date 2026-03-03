@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Window, WindowOptions};
 
-use super::{ClientGame, InputState};
+use super::ClientGame;
 
 const WIDTH: usize = 800;
 const HEIGHT: usize = 600;
@@ -13,15 +13,43 @@ pub(super) fn run(game: &mut ClientGame) -> Result<()> {
 
     let mut buffer = vec![0x101010u32; WIDTH * HEIGHT];
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        let input = InputState {
-            up: window.is_key_down(Key::W),
-            down: window.is_key_down(Key::S),
-            left: window.is_key_down(Key::A),
-            right: window.is_key_down(Key::D),
-        };
+    while window.is_open() {
+        game.tick_network()?;
 
-        game.tick(input)?;
+        if let Some(prompt) = game.binding_prompt() {
+            let prompt_title = match prompt.suggestion {
+                Some(key) => format!(
+                    "Bind {} [{}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
+                    prompt.identifier, prompt.input_type, key
+                ),
+                None => format!(
+                    "Bind {} [{}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
+                    prompt.identifier, prompt.input_type
+                ),
+            };
+            window.set_title(&prompt_title);
+
+            for key in window.get_keys_pressed(KeyRepeat::No) {
+                if matches!(key, Key::Enter | Key::Backspace | Key::Escape) {
+                    continue;
+                }
+                game.suggest_binding_key(key);
+            }
+
+            if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
+                game.confirm_binding()?;
+            }
+            if window.is_key_pressed(Key::Backspace, KeyRepeat::No) {
+                game.skip_binding();
+            }
+        } else {
+            window.set_title("widev desktop POC");
+            game.send_bound_inputs(|key| window.is_key_down(key))?;
+        }
+
+        if window.is_key_down(Key::Escape) {
+            break;
+        }
 
         clear(&mut buffer, 0x101010);
         let state = game.render_state();

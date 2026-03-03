@@ -6,13 +6,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Schema {
-    pub packets: Vec<PacketDef>,
+    pub c2s: Vec<PacketDef>,
+    pub s2c: Vec<PacketDef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PacketDef {
     pub name: String,
-    pub direction: Direction,
     pub fields: Vec<FieldDef>,
 }
 
@@ -21,28 +21,6 @@ pub struct FieldDef {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Direction {
-    C2S,
-    S2C,
-}
-
-impl<'de> Deserialize<'de> for Direction {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "c2s" => Ok(Self::C2S),
-            "s2c" => Ok(Self::S2C),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown direction '{other}', expected c2s or s2c"
-            ))),
-        }
-    }
 }
 
 pub trait CodegenBackend {
@@ -73,28 +51,17 @@ pub struct RustBackend;
 
 impl CodegenBackend for RustBackend {
     fn generate(&self, schema: &Schema) -> Result<String> {
-        let c2s: Vec<_> = schema
-            .packets
-            .iter()
-            .filter(|p| matches!(p.direction, Direction::C2S))
-            .collect();
-        let s2c: Vec<_> = schema
-            .packets
-            .iter()
-            .filter(|p| matches!(p.direction, Direction::S2C))
-            .collect();
-
         let mut out = String::new();
         out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
         out.push_str("pub enum C2SPacket {\n");
-        for packet in c2s {
+        for packet in &schema.c2s {
             out.push_str(&format_variant(packet));
         }
         out.push_str("}\n\n");
 
         out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
         out.push_str("pub enum S2CPacket {\n");
-        for packet in s2c {
+        for packet in &schema.s2c {
             out.push_str(&format_variant(packet));
         }
         out.push_str("}\n\n");

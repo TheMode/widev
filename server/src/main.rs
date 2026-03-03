@@ -17,6 +17,8 @@ use game::Game;
 use packets::{decode_c2s, encode_s2c, S2CPacket};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const TICK_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "widev-server")]
@@ -57,26 +59,7 @@ fn main() -> Result<()> {
         .to_str()
         .context("private key path is not valid UTF-8")?;
 
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    config
-        .load_cert_chain_from_pem_file(cert_path_str)
-        .with_context(|| format!("failed to load {}", cert_path.display()))?;
-    config
-        .load_priv_key_from_pem_file(key_path_str)
-        .with_context(|| format!("failed to load {}", key_path.display()))?;
-    config
-        .set_application_protos(&[b"widev-poc-quic"])
-        .context("failed setting ALPN")?;
-    config.set_max_idle_timeout(10_000);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_streams_bidi(16);
-    config.set_initial_max_streams_uni(16);
-    config.enable_dgram(true, 64, 64);
-    config.verify_peer(false);
+    let mut config = build_server_quic_config(cert_path_str, key_path_str, &cert_path, &key_path)?;
 
     let mut recv_buf = [0u8; 65_535];
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
@@ -84,7 +67,6 @@ fn main() -> Result<()> {
 
     let mut session: Option<Session> = None;
     let mut last_tick = Instant::now();
-    let tick = Duration::from_millis(16);
 
     loop {
         loop {
@@ -143,7 +125,7 @@ fn main() -> Result<()> {
 
         let now = Instant::now();
         let dt = now.duration_since(last_tick);
-        if dt >= tick {
+        if dt >= TICK_INTERVAL {
             if let Some(active) = session.as_mut() {
                 if active.conn.is_established() {
                     pump_app_packets(active, &mut app_buf);
@@ -178,8 +160,37 @@ fn main() -> Result<()> {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(IDLE_SLEEP);
     }
+}
+
+fn build_server_quic_config(
+    cert_path_str: &str,
+    key_path_str: &str,
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+) -> Result<quiche::Config> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    config
+        .load_cert_chain_from_pem_file(cert_path_str)
+        .with_context(|| format!("failed to load {}", cert_path.display()))?;
+    config
+        .load_priv_key_from_pem_file(key_path_str)
+        .with_context(|| format!("failed to load {}", key_path.display()))?;
+    config
+        .set_application_protos(&[b"widev-poc-quic"])
+        .context("failed setting ALPN")?;
+    config.set_max_idle_timeout(10_000);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_streams_bidi(16);
+    config.set_initial_max_streams_uni(16);
+    config.enable_dgram(true, 64, 64);
+    config.verify_peer(false);
+    Ok(config)
 }
 
 fn pump_app_packets(active: &mut Session, app_buf: &mut [u8]) {

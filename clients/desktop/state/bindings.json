@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "fd90b14e4724da347dac29665806aeb5edd243087dc197d7391a49b3591121ec": {
+      "bindings": {
+        "move_up": 32,
+        "move_left": 10,
+        "move_right": 13,
+        "move_down": 28
+      }
+    }
+  }
+}

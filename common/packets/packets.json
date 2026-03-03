@@ -1,42 +1,50 @@
 {
-  "packets": [
+  "c2s": [
     {
       "name": "ClientHello",
-      "direction": "c2s",
       "fields": [
         { "name": "client_name", "type": "String" },
         { "name": "capabilities", "type": "Vec<String>" }
       ]
     },
     {
-      "name": "InputState",
-      "direction": "c2s",
+      "name": "BindingAssigned",
       "fields": [
-        { "name": "seq", "type": "u32" },
-        { "name": "up", "type": "bool" },
-        { "name": "down", "type": "bool" },
-        { "name": "left", "type": "bool" },
-        { "name": "right", "type": "bool" }
+        { "name": "binding_id", "type": "u16" }
       ]
     },
     {
+      "name": "InputValue",
+      "fields": [
+        { "name": "binding_id", "type": "u16" },
+        { "name": "value", "type": "f32" }
+      ]
+    }
+  ],
+  "s2c": [
+    {
       "name": "ServerHello",
-      "direction": "s2c",
       "fields": [
         { "name": "tick_rate_hz", "type": "u16" }
       ]
     },
     {
       "name": "AssetManifest",
-      "direction": "s2c",
       "fields": [
         { "name": "player_color_rgba", "type": "[u8; 4]" },
         { "name": "player_size", "type": "u16" }
       ]
     },
     {
+      "name": "BindingDeclare",
+      "fields": [
+        { "name": "binding_id", "type": "u16" },
+        { "name": "identifier", "type": "String" },
+        { "name": "input_type", "type": "String" }
+      ]
+    },
+    {
       "name": "WorldState",
-      "direction": "s2c",
       "fields": [
         { "name": "server_time_ms", "type": "u64" },
         { "name": "x", "type": "f32" },

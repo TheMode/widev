@@ -75,6 +75,10 @@ impl QuicClient {
         self.server_addr
     }
 
+    pub(super) fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        self.conn.peer_cert().map(|bytes| bytes.to_vec())
+    }
+
     pub(super) fn poll(&mut self) -> Result<Vec<Vec<u8>>> {
         loop {
             let recv = self.socket.recv_from(&mut self.recv_buf);
