@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -15,7 +16,7 @@ mod games;
 mod packets;
 
 use game::{ClientId, Game};
-use game_state::GameState;
+use game_state::{GameState, StreamPacket};
 use packets::{decode_c2s, encode_s2c, S2CPacket};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -34,6 +35,13 @@ struct Session {
     client_id: ClientId,
     conn: Connection,
     client_addr: SocketAddr,
+    pending_stream_writes: HashMap<u64, VecDeque<PendingStreamWrite>>,
+    stream_recv_buffers: HashMap<u64, Vec<u8>>,
+}
+
+struct PendingStreamWrite {
+    data: Vec<u8>,
+    offset: usize,
 }
 
 fn main() -> Result<()> {
@@ -118,6 +126,8 @@ fn main() -> Result<()> {
                 client_id,
                 conn,
                 client_addr: from,
+                pending_stream_writes: HashMap::new(),
+                stream_recv_buffers: HashMap::new(),
             });
             game_state.connect_client(client_id);
             game.on_client_connected(&mut game_state, client_id);
@@ -138,11 +148,15 @@ fn main() -> Result<()> {
             let mut disconnected_ids: Vec<ClientId> = Vec::new();
             sessions.retain_mut(|session| {
                 if session.conn.is_established() {
-                    let packets = game_state.drain_packets_for(session.client_id);
+                    let packets = game_state.drain_datagrams_for(session.client_id);
                     send_game_packets(session, packets);
+                    let stream_packets = game_state.drain_stream_packets_for(session.client_id);
+                    queue_stream_packets(session, stream_packets);
                 }
 
-                if flush_quic(&socket, session, &mut send_buf).is_err() || session.conn.is_closed()
+                if flush_stream_writes(session).is_err()
+                    || flush_quic(&socket, session, &mut send_buf).is_err()
+                    || session.conn.is_closed()
                 {
                     disconnected_ids.push(session.client_id);
                     return false;
@@ -188,6 +202,28 @@ fn pump_app_packets(
             Err(_) => break,
         }
     }
+
+    for stream_id in session.conn.readable() {
+        loop {
+            match session.conn.stream_recv(stream_id, app_buf) {
+                Ok((len, fin)) => {
+                    let recv_buf = session.stream_recv_buffers.entry(stream_id).or_default();
+                    recv_buf.extend_from_slice(&app_buf[..len]);
+                    while let Some(frame) = pop_frame(recv_buf) {
+                        if let Ok(packet) = decode_c2s(&frame) {
+                            game.on_client_packet(state, session.client_id, packet);
+                        }
+                    }
+                    if fin {
+                        session.stream_recv_buffers.remove(&stream_id);
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
@@ -196,6 +232,71 @@ fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
             let _ = session.conn.dgram_send(&bytes);
         }
     }
+}
+
+fn queue_stream_packets(session: &mut Session, packets: Vec<StreamPacket>) {
+    for stream_packet in packets {
+        if let Ok(payload) = encode_s2c(&stream_packet.packet) {
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&payload);
+
+            session
+                .pending_stream_writes
+                .entry(stream_packet.stream_id)
+                .or_default()
+                .push_back(PendingStreamWrite {
+                    data: framed,
+                    offset: 0,
+                });
+        }
+    }
+}
+
+fn flush_stream_writes(session: &mut Session) -> Result<()> {
+    let stream_ids: Vec<u64> = session.pending_stream_writes.keys().copied().collect();
+    for stream_id in stream_ids {
+        let Some(queue) = session.pending_stream_writes.get_mut(&stream_id) else {
+            continue;
+        };
+
+        while let Some(chunk) = queue.front_mut() {
+            match session
+                .conn
+                .stream_send(stream_id, &chunk.data[chunk.offset..], false)
+            {
+                Ok(written) => {
+                    chunk.offset += written;
+                    if chunk.offset >= chunk.data.len() {
+                        queue.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(err) => return Err(anyhow::anyhow!("stream_send failed: {err:?}")),
+            }
+        }
+
+        if queue.is_empty() {
+            session.pending_stream_writes.remove(&stream_id);
+        }
+    }
+
+    Ok(())
+}
+
+fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    if buffer.len() < 4 + len {
+        return None;
+    }
+    let payload = buffer[4..4 + len].to_vec();
+    buffer.drain(..4 + len);
+    Some(payload)
 }
 
 fn flush_quic(socket: &UdpSocket, session: &mut Session, send_buf: &mut [u8]) -> Result<()> {
@@ -234,6 +335,7 @@ fn build_server_quic_config(
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
     config.enable_dgram(true, 64, 64);

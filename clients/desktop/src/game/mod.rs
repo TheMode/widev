@@ -102,7 +102,12 @@ impl ClientGame {
             }
         }
 
-        for bytes in incoming {
+        for bytes in incoming.datagrams {
+            if let Ok(packet) = protocol::decode_s2c(&bytes) {
+                self.handle_server_packet(packet)?;
+            }
+        }
+        for bytes in incoming.streams {
             if let Ok(packet) = protocol::decode_s2c(&bytes) {
                 self.handle_server_packet(packet)?;
             }
