@@ -3,7 +3,9 @@ use std::time::{Duration, Instant};
 
 use crate::game::{ClientId, Game};
 use crate::game_state::GameState;
-use crate::packets::{C2SPacket, InputType, PredictionKind, S2CPacket, TransformPredictionMask};
+use crate::packets::{
+    C2SPacket, InputType, PredictionKind, S2CPacket, StreamID, TransformPredictionMask,
+};
 
 const GAME_WIDTH: f32 = 800.0;
 const GAME_HEIGHT: f32 = 600.0;
@@ -26,7 +28,7 @@ struct ElementState {
 struct PlayerState {
     input: PlayerInput,
     element: ElementState,
-    control_stream_id: u64,
+    control_stream_id: StreamID,
 }
 
 pub struct RedSquareGame {

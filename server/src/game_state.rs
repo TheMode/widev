@@ -1,18 +1,18 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::game::ClientId;
-use crate::packets::S2CPacket;
+use crate::packets::{S2CPacket, StreamID};
 
 #[derive(Clone)]
 pub struct StreamPacket {
-    pub stream_id: u64,
+    pub stream_id: StreamID,
     pub packet: S2CPacket,
 }
 
 struct ClientState {
     datagram_outbox: VecDeque<S2CPacket>,
     stream_outbox: VecDeque<StreamPacket>,
-    next_server_uni_stream_id: u64,
+    next_server_uni_stream_id: StreamID,
 }
 
 pub struct GameState {
@@ -55,7 +55,7 @@ impl GameState {
         }
     }
 
-    pub fn create_stream(&mut self, client_id: ClientId) -> Option<u64> {
+    pub fn create_stream(&mut self, client_id: ClientId) -> Option<StreamID> {
         let client = self.clients.get_mut(&client_id)?;
         let stream_id = client.next_server_uni_stream_id;
         client.next_server_uni_stream_id = client.next_server_uni_stream_id.wrapping_add(4);
@@ -65,7 +65,7 @@ impl GameState {
     pub fn send_packet_on_stream(
         &mut self,
         client_id: ClientId,
-        stream_id: u64,
+        stream_id: StreamID,
         packet: S2CPacket,
     ) {
         if let Some(client) = self.clients.get_mut(&client_id) {
