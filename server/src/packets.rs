@@ -57,6 +57,14 @@ impl PacketBundle {
         self.packets.push(PacketWithMeta { packet, meta: None });
     }
 
+    pub fn extend<I>(&mut self, packets: I)
+    where
+        I: IntoIterator<Item = S2CPacket>,
+    {
+        self.packets
+            .extend(packets.into_iter().map(|packet| PacketWithMeta { packet, meta: None }));
+    }
+
     pub fn push_with_meta(&mut self, packet: S2CPacket, meta: PacketMeta) {
         self.packets.push(PacketWithMeta { packet, meta: Some(meta) });
     }

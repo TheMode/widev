@@ -68,15 +68,15 @@ impl RedSquareGame {
             ],
         );
 
-        for (binding_id, identifier) in
+        let binding_packets =
             [(1, "move_up"), (2, "move_down"), (3, "move_left"), (4, "move_right")]
-        {
-            bundle.push(S2CPacket::BindingDeclare {
-                binding_id,
-                identifier: identifier.to_string(),
-                input_type: InputType::Toggle,
-            });
-        }
+                .into_iter()
+                .map(|(binding_id, identifier)| S2CPacket::BindingDeclare {
+                    binding_id,
+                    identifier: identifier.to_string(),
+                    input_type: InputType::Toggle,
+                });
+        bundle.extend(binding_packets);
 
         state.send(PacketTarget::Client(client_id), PacketMessage::Bundle(bundle));
     }
@@ -111,13 +111,15 @@ impl Game for RedSquareGame {
 
         let element = self.players.get(&client_id).map(|p| p.element).unwrap_or(element);
         let mut bundle = PacketBundle::default();
-        bundle.push(S2CPacket::ElementMoved { element_id: client_id, x: element.x, y: element.y });
-        bundle.push(S2CPacket::SetTransformPrediction {
-            element_id: client_id,
-            enabled: true,
-            affected_mask: TransformPredictionMask::TRANSLATION,
-            kind: PredictionKind::Interpolation,
-        });
+        bundle.extend([
+            S2CPacket::ElementMoved { element_id: client_id, x: element.x, y: element.y },
+            S2CPacket::SetTransformPrediction {
+                element_id: client_id,
+                enabled: true,
+                affected_mask: TransformPredictionMask::TRANSLATION,
+                kind: PredictionKind::Interpolation,
+            },
+        ]);
         state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
 
         log::info!("client {client_id} connected");
