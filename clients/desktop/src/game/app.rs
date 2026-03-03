@@ -1,91 +1,175 @@
-use anyhow::{Context, Result};
-use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use std::collections::HashSet;
+use std::sync::Arc;
 
+use anyhow::{Context, Result};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::Window;
+
+use super::renderer::Renderer;
 use super::ClientGame;
 
-const WIDTH: usize = 800;
-const HEIGHT: usize = 600;
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 600;
 
-pub(super) fn run(game: &mut ClientGame) -> Result<()> {
-    let mut window = Window::new(game.game_name(), WIDTH, HEIGHT, WindowOptions::default())
-        .context("failed to create desktop window")?;
-    window.set_target_fps(60);
+pub(super) fn run(game: ClientGame) -> Result<()> {
+    let event_loop = EventLoop::new().context("failed to create event loop")?;
+    let mut app = App::new(game);
+    event_loop.run_app(&mut app).context("event loop failed")
+}
 
-    let mut buffer = vec![0x101010u32; WIDTH * HEIGHT];
+struct App {
+    game: ClientGame,
+    window: Option<Arc<Window>>,
+    renderer: Option<Renderer>,
+    pressed_keys: HashSet<KeyCode>,
+    just_pressed: Vec<KeyCode>,
+}
 
-    while window.is_open() {
-        game.tick_network()?;
+impl App {
+    fn new(game: ClientGame) -> Self {
+        Self {
+            game,
+            window: None,
+            renderer: None,
+            pressed_keys: HashSet::new(),
+            just_pressed: Vec::new(),
+        }
+    }
 
-        if let Some(prompt) = game.binding_prompt() {
+    fn tick_frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let Some(window) = self.window.as_ref() else {
+            return Ok(());
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+
+        self.game.tick_network()?;
+
+        if let Some(prompt) = self.game.binding_prompt() {
             let prompt_title = match prompt.suggestion {
                 Some(key) => format!(
                     "{} - Bind {} [{:?}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
-                    game.game_name(), prompt.identifier, prompt.input_type, key
+                    self.game.game_name(),
+                    prompt.identifier,
+                    prompt.input_type,
+                    key
                 ),
                 None => format!(
                     "{} - Bind {} [{:?}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
-                    game.game_name(), prompt.identifier, prompt.input_type
+                    self.game.game_name(),
+                    prompt.identifier,
+                    prompt.input_type
                 ),
             };
             window.set_title(&prompt_title);
 
-            for key in window.get_keys_pressed(KeyRepeat::No) {
-                if matches!(key, Key::Enter | Key::Backspace | Key::Escape) {
+            for code in self.just_pressed.iter().copied() {
+                if matches!(code, KeyCode::Enter | KeyCode::Backspace | KeyCode::Escape) {
                     continue;
                 }
-                game.suggest_binding_key(key);
+                self.game.suggest_binding_key(code);
             }
-
-            if window.is_key_pressed(Key::Enter, KeyRepeat::No) {
-                game.confirm_binding()?;
+            if self.just_pressed.contains(&KeyCode::Enter) {
+                self.game.confirm_binding()?;
             }
-            if window.is_key_pressed(Key::Backspace, KeyRepeat::No) {
-                game.skip_binding();
+            if self.just_pressed.contains(&KeyCode::Backspace) {
+                self.game.skip_binding();
             }
         } else {
-            window.set_title(game.game_name());
-            game.send_bound_inputs(|key| window.is_key_down(key))?;
+            window.set_title(self.game.game_name());
+            self.game.send_bound_inputs(|code| self.pressed_keys.contains(&code))?;
         }
 
-        if window.is_key_down(Key::Escape) {
-            break;
+        if self.pressed_keys.contains(&KeyCode::Escape) {
+            event_loop.exit();
+            return Ok(());
         }
 
-        clear(&mut buffer, 0x101010);
-        for state in game.render_states() {
-            let _ = state.element_id;
-            draw_square(
-                &mut buffer,
-                state.x as i32,
-                state.y as i32,
-                state.size as i32,
-                state.color,
-            );
+        let states = self.game.render_states();
+        renderer.render(&states)?;
+        self.just_pressed.clear();
+        Ok(())
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
         }
 
-        window
-            .update_with_buffer(&buffer, WIDTH, HEIGHT)
-            .context("failed to update frame buffer")?;
+        let window_attributes = Window::default_attributes()
+            .with_title(self.game.game_name().to_string())
+            .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as f64));
+
+        let window = match event_loop.create_window(window_attributes) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                log::error!("failed to create desktop window: {err:#}");
+                event_loop.exit();
+                return;
+            },
+        };
+
+        let renderer = match pollster::block_on(Renderer::new(window.clone())) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                log::error!("failed to initialize renderer: {err:#}");
+                event_loop.exit();
+                return;
+            },
+        };
+
+        self.window = Some(window);
+        self.renderer = Some(renderer);
     }
 
-    Ok(())
-}
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
 
-fn clear(buf: &mut [u32], color: u32) {
-    buf.fill(color);
-}
-
-fn draw_square(buf: &mut [u32], x: i32, y: i32, size: i32, color: u32) {
-    let half = size / 2;
-    let x_min = (x - half).max(0);
-    let y_min = (y - half).max(0);
-    let x_max = (x + half).min(WIDTH as i32 - 1);
-    let y_max = (y + half).min(HEIGHT as i32 - 1);
-
-    for yy in y_min..=y_max {
-        for xx in x_min..=x_max {
-            let idx = yy as usize * WIDTH + xx as usize;
-            buf[idx] = color;
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.resize(size);
+                }
+            },
+            WindowEvent::RedrawRequested => {
+                if let Err(err) = self.tick_frame(event_loop) {
+                    log::error!("client frame error: {err:#}");
+                    event_loop.exit();
+                }
+            },
+            WindowEvent::KeyboardInput { event, .. } => {
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                match event.state {
+                    ElementState::Pressed => {
+                        if !event.repeat && self.pressed_keys.insert(code) {
+                            self.just_pressed.push(code);
+                        }
+                    },
+                    ElementState::Released => {
+                        self.pressed_keys.remove(&code);
+                    },
+                }
+            },
+            _ => {},
         }
     }
 }

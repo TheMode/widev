@@ -10,12 +10,15 @@ quiche = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
-minifb = "0.27"
 clap = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+winit = "0.30.12"
+wgpu = "27.0.1"
+pollster = "0.4.0"
+bytemuck = { version = "1.24.0", features = ["derive"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

@@ -60,23 +60,32 @@ impl GameState {
             PacketMessage::Packet(packet) => PacketBundle::single(packet),
             PacketMessage::Bundle(bundle) => bundle,
         };
-        let target_clients: Vec<ClientId> = match target {
-            PacketTarget::Client(client_id) => vec![client_id],
-            PacketTarget::Broadcast => self.connected_clients(),
-        };
+        if let PacketTarget::Client(client_id) = target {
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                return;
+            };
+            for packet in bundle.packets {
+                let meta = packet.meta.or(bundle.meta).unwrap_or_default();
+                if meta.optional {
+                    client.datagram_outbox.push_back(packet.packet);
+                    continue;
+                }
+                let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+                client.stream_outbox.push_back(StreamPacket { stream_id, packet: packet.packet });
+            }
+            return;
+        }
 
-        for client_id in target_clients {
+        for client_id in self.connected_clients() {
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
-
             for packet in &bundle.packets {
                 let meta = packet.meta.or(bundle.meta).unwrap_or_default();
                 if meta.optional {
                     client.datagram_outbox.push_back(packet.packet.clone());
                     continue;
                 }
-
                 let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
                 client
                     .stream_outbox

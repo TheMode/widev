@@ -3,14 +3,15 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use anyhow::Result;
-use minifb::Key;
 use sha2::{Digest, Sha256};
+use winit::keyboard::KeyCode;
 
 mod app;
-mod input_path_minifb;
+mod input_path_winit;
 mod network;
 mod persistence;
 mod protocol;
+mod renderer;
 
 const INPUT_RESEND_EVERY_FRAMES: u16 = 8;
 const LERP_ALPHA: f32 = 0.35;
@@ -23,7 +24,6 @@ pub struct GameConfig {
 
 #[derive(Clone, Copy)]
 pub(super) struct RenderState {
-    pub(super) element_id: u32,
     pub(super) x: f32,
     pub(super) y: f32,
     pub(super) size: u16,
@@ -33,7 +33,7 @@ pub(super) struct RenderState {
 pub(super) struct BindingPromptState {
     pub(super) identifier: String,
     pub(super) input_type: protocol::InputType,
-    pub(super) suggestion: Option<Key>,
+    pub(super) suggestion: Option<KeyCode>,
 }
 
 struct BindingDefinition {
@@ -44,7 +44,7 @@ struct BindingDefinition {
 
 struct BindingAssignment {
     id: u16,
-    key: Key,
+    key: KeyCode,
     last_value: f32,
     frames_since_send: u16,
 }
@@ -95,7 +95,7 @@ pub(super) struct ClientGame {
     elements: HashMap<u32, ElementState>,
     game_name: String,
     pending_bindings: VecDeque<BindingDefinition>,
-    binding_suggestion: Option<Key>,
+    binding_suggestion: Option<KeyCode>,
     active_bindings: Vec<BindingAssignment>,
     binding_store: persistence::BindingStore,
     default_prediction: PredictionConfig,
@@ -200,7 +200,7 @@ impl ClientGame {
         })
     }
 
-    pub(super) fn suggest_binding_key(&mut self, key: Key) {
+    pub(super) fn suggest_binding_key(&mut self, key: KeyCode) {
         self.binding_suggestion = Some(key);
     }
 
@@ -212,7 +212,7 @@ impl ClientGame {
         let Some(key) = self.binding_suggestion.take() else {
             return Ok(());
         };
-        let input_path = input_path_minifb::input_path_from_key(key);
+        let input_path = input_path_winit::input_path_from_key(key);
 
         self.send_binding_ack(definition.id)?;
 
@@ -240,7 +240,7 @@ impl ClientGame {
 
     pub(super) fn send_bound_inputs<F>(&mut self, mut is_down: F) -> Result<()>
     where
-        F: FnMut(Key) -> bool,
+        F: FnMut(KeyCode) -> bool,
     {
         if !self.net.is_established() {
             return Ok(());
@@ -271,9 +271,8 @@ impl ClientGame {
 
     pub(super) fn render_states(&self) -> Vec<RenderState> {
         self.elements
-            .iter()
-            .map(|(element_id, e)| RenderState {
-                element_id: *element_id,
+            .values()
+            .map(|e| RenderState {
                 x: e.draw_x,
                 y: e.draw_y,
                 size: self.draw_size,
@@ -325,7 +324,7 @@ impl ClientGame {
                     if let Some(saved_path) =
                         self.binding_store.get_binding_path(cert_fp, &identifier)
                     {
-                        if let Some(saved_key) = input_path_minifb::key_from_input_path(&saved_path)
+                        if let Some(saved_key) = input_path_winit::key_from_input_path(&saved_path)
                         {
                             self.send_binding_ack(binding_id)?;
                             self.activate_binding(binding_id, saved_key);
@@ -399,7 +398,7 @@ impl ClientGame {
         Ok(())
     }
 
-    fn activate_binding(&mut self, id: u16, key: Key) {
+    fn activate_binding(&mut self, id: u16, key: KeyCode) {
         self.active_bindings.push(BindingAssignment {
             id,
             key,
@@ -410,8 +409,8 @@ impl ClientGame {
 }
 
 pub fn run(config: GameConfig) -> Result<()> {
-    let mut game = ClientGame::new(config.server_addr)?;
-    app::run(&mut game)
+    let game = ClientGame::new(config.server_addr)?;
+    app::run(game)
 }
 
 fn rgba_to_u32([r, g, b, _a]: [u8; 4]) -> u32 {

@@ -2,10 +2,10 @@
   "servers": {
     "fd90b14e4724da347dac29665806aeb5edd243087dc197d7391a49b3591121ec": {
       "bindings": {
-        "move_left": "keyboard.A",
-        "move_up": "keyboard.W",
-        "move_down": "keyboard.S",
-        "move_right": "keyboard.D"
+        "move_right": "keyboard.KeyD",
+        "move_up": "keyboard.KeyW",
+        "move_down": "keyboard.KeyS",
+        "move_left": "keyboard.KeyA"
       }
     }
   }
