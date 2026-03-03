@@ -6,6 +6,7 @@ use minifb::Key;
 use sha2::{Digest, Sha256};
 
 mod app;
+mod input_path_minifb;
 mod network;
 mod persistence;
 mod protocol;
@@ -144,12 +145,16 @@ impl ClientGame {
         let Some(key) = self.binding_suggestion.take() else {
             return Ok(());
         };
+        let input_path = input_path_minifb::input_path_from_key(key);
 
         self.send_binding_ack(definition.id)?;
 
         if let Some(cert_fp) = &self.server_cert_fingerprint {
-            self.binding_store
-                .set_key(cert_fp, &definition.identifier, key);
+            self.binding_store.set_binding_path(
+                cert_fp,
+                &definition.identifier,
+                input_path.clone(),
+            );
             self.binding_store.save()?;
         }
 
@@ -229,11 +234,24 @@ impl ClientGame {
                 println!("binding request: {identifier} ({input_type:?})");
 
                 if let Some(cert_fp) = &self.server_cert_fingerprint {
-                    if let Some(saved_key) = self.binding_store.get_key(cert_fp, &identifier) {
-                        self.send_binding_ack(binding_id)?;
-                        self.activate_binding(binding_id, saved_key);
-                        println!("restored '{}' -> {:?}", identifier, saved_key);
-                        return Ok(());
+                    if let Some(saved_path) =
+                        self.binding_store.get_binding_path(cert_fp, &identifier)
+                    {
+                        if let Some(saved_key) = input_path_minifb::key_from_input_path(&saved_path)
+                        {
+                            self.send_binding_ack(binding_id)?;
+                            self.activate_binding(binding_id, saved_key);
+                            println!(
+                                "restored '{}' -> {:?} ({saved_path})",
+                                identifier, saved_key
+                            );
+                            return Ok(());
+                        }
+
+                        println!(
+                            "cached binding for '{}' exists but is not compatible with this backend: {}",
+                            identifier, saved_path
+                        );
                     }
                 }
 
