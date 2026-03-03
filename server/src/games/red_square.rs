@@ -85,7 +85,6 @@ impl RedSquareGame {
 
 impl Game for RedSquareGame {
     fn on_client_connected(&mut self, state: &mut GameState, client_id: ClientId) {
-        state.connect_client(client_id);
         self.inputs.insert(client_id, PlayerInput::default());
 
         let element = Self::spawn_element(client_id);
@@ -116,7 +115,6 @@ impl Game for RedSquareGame {
     }
 
     fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId) {
-        state.disconnect_client(client_id);
         self.inputs.remove(&client_id);
         self.elements.remove(&client_id);
 

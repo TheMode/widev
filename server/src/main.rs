@@ -119,6 +119,7 @@ fn main() -> Result<()> {
                 conn,
                 client_addr: from,
             });
+            game_state.connect_client(client_id);
             game.on_client_connected(&mut game_state, client_id);
             println!("accepted connection from {from} as client {client_id}");
         }
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
 
             for client_id in disconnected_ids {
                 game.on_client_disconnected(&mut game_state, client_id);
+                game_state.disconnect_client(client_id);
             }
 
             last_tick = now;
