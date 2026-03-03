@@ -1,8 +1,28 @@
 {
+  "typedefs": [
+    {
+      "name": "ElementId",
+      "type": "u32"
+    }
+  ],
   "enums": [
     {
       "name": "InputType",
       "variants": ["Toggle", "Axis1D", "Joystick2D"]
+    },
+    {
+      "name": "PredictionKind",
+      "variants": ["Interpolation", "Extrapolation"]
+    }
+  ],
+  "bitmasks": [
+    {
+      "name": "TransformPredictionMask",
+      "type": "u8",
+      "flags": [
+        { "name": "Translation", "value": 1 },
+        { "name": "Rotation", "value": 2 }
+      ]
     }
   ],
   "c2s": [
@@ -54,6 +74,16 @@
       ]
     },
     {
+      "name": "SetTransformPrediction",
+      "description": "Enable/disable transform prediction and configure affected components and mode.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "enabled", "type": "bool" },
+        { "name": "affected_mask", "type": "TransformPredictionMask" },
+        { "name": "kind", "type": "PredictionKind" }
+      ]
+    },
+    {
       "name": "BindingDeclare",
       "description": "Server-declared input binding definition that the client must map.",
       "fields": [
@@ -66,7 +96,7 @@
       "name": "ElementMoved",
       "description": "Authoritative transform update for a uniquely identified element.",
       "fields": [
-        { "name": "element_id", "type": "u32" },
+        { "name": "element_id", "type": "ElementId" },
         { "name": "x", "type": "f32" },
         { "name": "y", "type": "f32" }
       ]
@@ -75,7 +105,7 @@
       "name": "ElementRemoved",
       "description": "Notification that a uniquely identified element should be removed.",
       "fields": [
-        { "name": "element_id", "type": "u32" }
+        { "name": "element_id", "type": "ElementId" }
       ]
     }
   ]

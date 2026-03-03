@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use anyhow::Result;
 use minifb::Key;
@@ -13,6 +14,8 @@ mod protocol;
 
 const INPUT_RESEND_EVERY_FRAMES: u16 = 8;
 const LERP_ALPHA: f32 = 0.35;
+const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
+const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
 
 pub struct GameConfig {
     pub server_addr: SocketAddr,
@@ -48,10 +51,42 @@ struct BindingAssignment {
 
 #[derive(Clone, Copy)]
 struct ElementState {
+    last_authoritative_x: f32,
+    last_authoritative_y: f32,
+    last_authoritative_at: Instant,
     target_x: f32,
     target_y: f32,
     draw_x: f32,
     draw_y: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    prediction: PredictionConfig,
+}
+
+#[derive(Clone, Copy)]
+struct PredictionConfig {
+    enabled: bool,
+    affected_mask: protocol::TransformPredictionMask,
+    kind: protocol::PredictionKind,
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            affected_mask: protocol::TransformPredictionMask::TRANSLATION,
+            kind: protocol::PredictionKind::Interpolation,
+        }
+    }
+}
+
+impl PredictionConfig {
+    fn affects_translation(self) -> bool {
+        self.enabled
+            && self
+                .affected_mask
+                .contains(protocol::TransformPredictionMask::TRANSLATION)
+    }
 }
 
 pub(super) struct ClientGame {
@@ -66,6 +101,8 @@ pub(super) struct ClientGame {
     binding_suggestion: Option<Key>,
     active_bindings: Vec<BindingAssignment>,
     binding_store: persistence::BindingStore,
+    default_prediction: PredictionConfig,
+    pending_prediction: HashMap<u32, PredictionConfig>,
 }
 
 impl ClientGame {
@@ -82,6 +119,8 @@ impl ClientGame {
             binding_suggestion: None,
             active_bindings: Vec::new(),
             binding_store: persistence::BindingStore::load_default()?,
+            default_prediction: PredictionConfig::default(),
+            pending_prediction: HashMap::new(),
         })
     }
 
@@ -129,8 +168,27 @@ impl ClientGame {
         }
 
         for element in self.elements.values_mut() {
-            element.draw_x += (element.target_x - element.draw_x) * LERP_ALPHA;
-            element.draw_y += (element.target_y - element.draw_y) * LERP_ALPHA;
+            let prediction = element.prediction;
+            if !prediction.affects_translation() {
+                element.draw_x = element.target_x;
+                element.draw_y = element.target_y;
+                continue;
+            }
+
+            match prediction.kind {
+                protocol::PredictionKind::Interpolation => {
+                    element.draw_x += (element.target_x - element.draw_x) * LERP_ALPHA;
+                    element.draw_y += (element.target_y - element.draw_y) * LERP_ALPHA;
+                }
+                protocol::PredictionKind::Extrapolation => {
+                    let predicted_x = element.draw_x + element.velocity_x * FIXED_FRAME_DT_SECONDS;
+                    let predicted_y = element.draw_y + element.velocity_y * FIXED_FRAME_DT_SECONDS;
+                    element.draw_x = predicted_x
+                        + (element.target_x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
+                    element.draw_y = predicted_y
+                        + (element.target_y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
+                }
+            }
         }
 
         Ok(())
@@ -249,6 +307,30 @@ impl ClientGame {
             protocol::S2CPacket::SetGameName { name } => {
                 self.game_name = name;
             }
+            protocol::S2CPacket::SetTransformPrediction {
+                element_id,
+                enabled,
+                affected_mask,
+                kind,
+            } => {
+                let config = PredictionConfig {
+                    enabled,
+                    affected_mask,
+                    kind,
+                };
+                if let Some(element) = self.elements.get_mut(&element_id) {
+                    element.prediction = config;
+                } else {
+                    self.pending_prediction.insert(element_id, config);
+                }
+                log::info!(
+                    "transform prediction for element {}: enabled={}, affected_mask={:#010b}, kind={:?}",
+                    element_id,
+                    enabled,
+                    affected_mask.bits(),
+                    kind
+                );
+            }
             protocol::S2CPacket::BindingDeclare {
                 binding_id,
                 identifier,
@@ -286,17 +368,37 @@ impl ClientGame {
                 });
             }
             protocol::S2CPacket::ElementMoved { element_id, x, y } => {
+                let now = Instant::now();
                 let element = self.elements.entry(element_id).or_insert(ElementState {
+                    last_authoritative_x: x,
+                    last_authoritative_y: y,
+                    last_authoritative_at: now,
                     target_x: x,
                     target_y: y,
                     draw_x: x,
                     draw_y: y,
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                    prediction: self
+                        .pending_prediction
+                        .remove(&element_id)
+                        .unwrap_or(self.default_prediction),
                 });
+                let dt_seconds = now
+                    .duration_since(element.last_authoritative_at)
+                    .as_secs_f32()
+                    .max(f32::EPSILON);
+                element.velocity_x = (x - element.last_authoritative_x) / dt_seconds;
+                element.velocity_y = (y - element.last_authoritative_y) / dt_seconds;
+                element.last_authoritative_x = x;
+                element.last_authoritative_y = y;
+                element.last_authoritative_at = now;
                 element.target_x = x;
                 element.target_y = y;
             }
             protocol::S2CPacket::ElementRemoved { element_id } => {
                 self.elements.remove(&element_id);
+                self.pending_prediction.remove(&element_id);
             }
         }
 

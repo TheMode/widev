@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::game::{ClientId, Game};
 use crate::game_state::GameState;
-use crate::packets::{C2SPacket, InputType, S2CPacket};
+use crate::packets::{C2SPacket, InputType, PredictionKind, S2CPacket, TransformPredictionMask};
 
 const GAME_WIDTH: f32 = 800.0;
 const GAME_HEIGHT: f32 = 600.0;
@@ -74,6 +74,16 @@ impl RedSquareGame {
         state.send_packet_on_stream(
             client_id,
             stream_id,
+            S2CPacket::SetTransformPrediction {
+                element_id: client_id,
+                enabled: true,
+                affected_mask: TransformPredictionMask::TRANSLATION,
+                kind: PredictionKind::Interpolation,
+            },
+        );
+        state.send_packet_on_stream(
+            client_id,
+            stream_id,
             S2CPacket::AssetManifest {
                 player_color_rgba: [255, 0, 0, 255],
                 player_size: 32,
@@ -128,6 +138,15 @@ impl Game for RedSquareGame {
                     y: e.y,
                 },
             );
+            state.enqueue_for(
+                client_id,
+                S2CPacket::SetTransformPrediction {
+                    element_id,
+                    enabled: true,
+                    affected_mask: TransformPredictionMask::TRANSLATION,
+                    kind: PredictionKind::Interpolation,
+                },
+            );
         }
 
         let element = self
@@ -139,6 +158,12 @@ impl Game for RedSquareGame {
             element_id: client_id,
             x: element.x,
             y: element.y,
+        });
+        state.broadcast(S2CPacket::SetTransformPrediction {
+            element_id: client_id,
+            enabled: true,
+            affected_mask: TransformPredictionMask::TRANSLATION,
+            kind: PredictionKind::Interpolation,
         });
 
         log::info!("client {client_id} connected");

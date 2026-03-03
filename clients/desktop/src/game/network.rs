@@ -162,6 +162,17 @@ impl QuicClient {
 
         Ok(())
     }
+
+    fn close_best_effort(&mut self) {
+        let _ = self.conn.close(true, 0x00, b"client shutdown");
+        let _ = self.flush_outgoing();
+    }
+}
+
+impl Drop for QuicClient {
+    fn drop(&mut self) {
+        self.close_best_effort();
+    }
 }
 
 fn build_client_quic_config() -> Result<quiche::Config> {

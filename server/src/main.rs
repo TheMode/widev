@@ -151,12 +151,7 @@ fn main() -> Result<()> {
 
             let mut disconnected_ids: Vec<ClientId> = Vec::new();
             sessions.retain_mut(|session| {
-                if session.conn.is_established() {
-                    let packets = game_state.drain_datagrams_for(session.client_id);
-                    send_game_packets(session, packets);
-                    let stream_packets = game_state.drain_stream_packets_for(session.client_id);
-                    queue_stream_packets(session, stream_packets);
-                }
+                drain_game_outbox_for_session(session, &mut game_state);
 
                 if flush_stream_writes(session).is_err()
                     || flush_quic(&socket, session, &mut send_buf).is_err()
@@ -170,8 +165,12 @@ fn main() -> Result<()> {
             });
 
             for client_id in disconnected_ids {
-                game.on_client_disconnected(&mut game_state, client_id);
                 game_state.disconnect_client(client_id);
+                game.on_client_disconnected(&mut game_state, client_id);
+            }
+
+            for session in &mut sessions {
+                drain_game_outbox_for_session(session, &mut game_state);
             }
 
             last_tick = now;
@@ -192,9 +191,8 @@ fn main() -> Result<()> {
 fn init_logging() {
     use std::io::Write;
 
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    );
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     builder
         .format(|buf, record| {
             let ts = buf.timestamp_millis();
@@ -205,7 +203,15 @@ fn init_logging() {
                 log::Level::Debug => ("\x1b[90m", "\x1b[0m"),
                 log::Level::Trace => ("\x1b[90m", "\x1b[0m"),
             };
-            writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
+            writeln!(
+                buf,
+                "[{} {}{}{}] {}",
+                ts,
+                c0,
+                record.level(),
+                c1,
+                record.args()
+            )
         })
         .init();
 }
@@ -275,6 +281,17 @@ fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
             let _ = session.conn.dgram_send(&bytes);
         }
     }
+}
+
+fn drain_game_outbox_for_session(session: &mut Session, game_state: &mut GameState) {
+    if !session.conn.is_established() {
+        return;
+    }
+
+    let packets = game_state.drain_datagrams_for(session.client_id);
+    send_game_packets(session, packets);
+    let stream_packets = game_state.drain_stream_packets_for(session.client_id);
+    queue_stream_packets(session, stream_packets);
 }
 
 fn queue_stream_packets(session: &mut Session, packets: Vec<StreamPacket>) {

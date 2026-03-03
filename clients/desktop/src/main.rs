@@ -25,9 +25,8 @@ fn main() -> Result<()> {
 fn init_logging() {
     use std::io::Write;
 
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    );
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     builder
         .format(|buf, record| {
             let ts = buf.timestamp_millis();
@@ -38,7 +37,15 @@ fn init_logging() {
                 log::Level::Debug => ("\x1b[90m", "\x1b[0m"),
                 log::Level::Trace => ("\x1b[90m", "\x1b[0m"),
             };
-            writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
+            writeln!(
+                buf,
+                "[{} {}{}{}] {}",
+                ts,
+                c0,
+                record.level(),
+                c1,
+                record.args()
+            )
         })
         .init();
 }
