@@ -38,6 +38,7 @@ pub(super) struct SurfaceState {
 
 #[derive(Clone, Copy)]
 struct ElementState {
+    visible: bool,
     last_authoritative_x: f32,
     last_authoritative_y: f32,
     last_authoritative_at: Instant,
@@ -215,6 +216,7 @@ impl ClientGame {
     pub(super) fn render_states(&self) -> Vec<RenderState> {
         self.elements
             .values()
+            .filter(|e| e.visible)
             .map(|e| RenderState {
                 x: e.draw_x,
                 y: e.draw_y,
@@ -346,16 +348,17 @@ impl ClientGame {
                     DeclareBindingOutcome::Pending => {},
                 }
             },
-            protocol::S2CPacket::ElementMove { element_id, x, y } => {
+            protocol::S2CPacket::ElementAdd { element_id } => {
                 let now = Instant::now();
-                let element = self.elements.entry(element_id).or_insert(ElementState {
-                    last_authoritative_x: x,
-                    last_authoritative_y: y,
+                self.elements.entry(element_id).or_insert(ElementState {
+                    visible: false,
+                    last_authoritative_x: 0.0,
+                    last_authoritative_y: 0.0,
                     last_authoritative_at: now,
-                    target_x: x,
-                    target_y: y,
-                    draw_x: x,
-                    draw_y: y,
+                    target_x: 0.0,
+                    target_y: 0.0,
+                    draw_x: 0.0,
+                    draw_y: 0.0,
                     velocity_x: 0.0,
                     velocity_y: 0.0,
                     prediction: self
@@ -363,6 +366,26 @@ impl ClientGame {
                         .remove(&element_id)
                         .unwrap_or(self.default_prediction),
                 });
+            },
+            protocol::S2CPacket::ElementMove { element_id, x, y } => {
+                let Some(element) = self.elements.get_mut(&element_id) else {
+                    log::debug!("ignored ElementMove for unknown element_id={element_id}");
+                    return Ok(());
+                };
+                if !element.visible {
+                    element.last_authoritative_x = x;
+                    element.last_authoritative_y = y;
+                    element.target_x = x;
+                    element.target_y = y;
+                    element.draw_x = x;
+                    element.draw_y = y;
+                    element.velocity_x = 0.0;
+                    element.velocity_y = 0.0;
+                    element.last_authoritative_at = Instant::now();
+                    element.visible = true;
+                    return Ok(());
+                }
+                let now = Instant::now();
                 let dt_seconds = now
                     .duration_since(element.last_authoritative_at)
                     .as_secs_f32()
@@ -374,6 +397,7 @@ impl ClientGame {
                 element.last_authoritative_at = now;
                 element.target_x = x;
                 element.target_y = y;
+                element.visible = true;
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
                 self.elements.remove(&element_id);

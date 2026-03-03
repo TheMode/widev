@@ -133,6 +133,13 @@
       ]
     },
     {
+      "name": "ElementAdd",
+      "description": "Register a uniquely identified element.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" }
+      ]
+    },
+    {
       "name": "ElementMove",
       "description": "Authoritative transform update for a uniquely identified element.",
       "fields": [
