@@ -55,7 +55,7 @@ impl RedSquareGame {
         state.send_packet_on_stream(
             client_id,
             stream_id,
-            S2CPacket::ServerHello { tick_rate_hz: 60 },
+            S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
         );
         state.send_packet_on_stream(
             client_id,

@@ -20,7 +20,6 @@ use game_state::{GameState, StreamPacket};
 use packets::{decode_c2s, encode_s2c, S2CPacket};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const TICK_INTERVAL: Duration = Duration::from_millis(16);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Parser)]
@@ -72,7 +71,7 @@ fn main() -> Result<()> {
 
     let mut sessions: Vec<Session> = Vec::new();
     let mut next_client_id: ClientId = 1;
-    let mut game_state = GameState::new();
+    let mut game_state = GameState::new(60);
     let mut game = games::default_game(Instant::now(), &mut game_state);
     let mut last_tick = Instant::now();
 
@@ -134,7 +133,7 @@ fn main() -> Result<()> {
 
         let now = Instant::now();
         let dt = now.duration_since(last_tick);
-        if dt >= TICK_INTERVAL {
+        if dt >= game_state.tick_interval() {
             for session in &mut sessions {
                 if session.conn.is_established() {
                     pump_app_packets(session, &mut app_buf, game.as_mut(), &mut game_state);

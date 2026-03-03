@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use crate::game::ClientId;
 use crate::packets::{S2CPacket, StreamID};
@@ -17,11 +18,20 @@ struct ClientState {
 
 pub struct GameState {
     clients: HashMap<ClientId, ClientState>,
+    ticks_per_second: u16,
 }
 
 impl GameState {
-    pub fn new() -> Self {
-        Self { clients: HashMap::new() }
+    pub fn new(ticks_per_second: u16) -> Self {
+        Self { clients: HashMap::new(), ticks_per_second: ticks_per_second.max(1) }
+    }
+
+    pub fn ticks_per_second(&self) -> u16 {
+        self.ticks_per_second
+    }
+
+    pub fn tick_interval(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.ticks_per_second as f64)
     }
 
     pub fn connect_client(&mut self, client_id: ClientId) {
