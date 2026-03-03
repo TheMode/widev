@@ -160,6 +160,16 @@ impl Game for RedSquareGame {
                     _ => {},
                 }
             },
+            C2SPacket::SurfaceList { surfaces } => {
+                log::info!("client {client_id} surfaces: {surfaces:?}");
+            },
+            C2SPacket::SurfaceResized { surface_id, width, height } => {
+                log::info!(
+                    "client {client_id} surface {surface_id} resized to {}x{}",
+                    width,
+                    height
+                );
+            },
         }
     }
 

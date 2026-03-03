@@ -14,6 +14,7 @@ use super::ClientGame;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+const MAIN_SURFACE_ID: u32 = 1;
 
 pub(super) fn run(game: ClientGame) -> Result<()> {
     let event_loop = EventLoop::new().context("failed to create event loop")?;
@@ -27,6 +28,8 @@ struct App {
     renderer: Option<Renderer>,
     pressed_keys: HashSet<KeyCode>,
     just_pressed: Vec<KeyCode>,
+    surface_list_sent: bool,
+    last_reported_surface_size: Option<(u32, u32)>,
 }
 
 impl App {
@@ -37,6 +40,8 @@ impl App {
             renderer: None,
             pressed_keys: HashSet::new(),
             just_pressed: Vec::new(),
+            surface_list_sent: false,
+            last_reported_surface_size: None,
         }
     }
 
@@ -49,6 +54,17 @@ impl App {
         };
 
         self.game.tick_network()?;
+        if self.game.is_connected() && !self.surface_list_sent {
+            let size = window.inner_size();
+            self.game.send_surface_list(vec![(
+                MAIN_SURFACE_ID,
+                "main".to_string(),
+                size.width,
+                size.height,
+            )])?;
+            self.surface_list_sent = true;
+            self.last_reported_surface_size = Some((size.width, size.height));
+        }
 
         if let Some(prompt) = self.game.binding_prompt() {
             let prompt_title = match prompt.suggestion {
@@ -146,6 +162,18 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
+                }
+                if self.game.is_connected() {
+                    let next_size = (size.width, size.height);
+                    if self.last_reported_surface_size != Some(next_size) {
+                        if let Err(err) =
+                            self.game.send_surface_resized(MAIN_SURFACE_ID, size.width, size.height)
+                        {
+                            log::warn!("failed to send surface resize: {err:#}");
+                        } else {
+                            self.last_reported_surface_size = Some(next_size);
+                        }
+                    }
                 }
             },
             WindowEvent::RedrawRequested => {

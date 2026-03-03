@@ -169,7 +169,7 @@ fn format_bitmask(bitmask: &BitmaskDef) -> String {
     out.push_str("#[repr(transparent)]\n");
     out.push_str(&format!("pub struct {}(pub {});\n", bitmask.name, bitmask.ty));
     out.push_str(&format!("impl {} {{\n", bitmask.name));
-    out.push_str(&format!("    pub const NONE: Self = Self(0);\n"));
+    out.push_str("    pub const NONE: Self = Self(0);\n");
     for flag in &bitmask.flags {
         out.push_str(&format!(
             "    pub const {}: Self = Self({});\n",

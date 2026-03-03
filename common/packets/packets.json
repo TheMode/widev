@@ -3,6 +3,10 @@
     {
       "name": "ElementId",
       "type": "u32"
+    },
+    {
+      "name": "SurfaceId",
+      "type": "u32"
     }
   ],
   "enums": [
@@ -47,6 +51,22 @@
       "fields": [
         { "name": "binding_id", "type": "u16" },
         { "name": "value", "type": "f32" }
+      ]
+    },
+    {
+      "name": "SurfaceList",
+      "description": "List of currently available client surfaces (id, name, width, height).",
+      "fields": [
+        { "name": "surfaces", "type": "Vec<(SurfaceId, String, u32, u32)>" }
+      ]
+    },
+    {
+      "name": "SurfaceResized",
+      "description": "Notification that a client surface changed size.",
+      "fields": [
+        { "name": "surface_id", "type": "SurfaceId" },
+        { "name": "width", "type": "u32" },
+        { "name": "height", "type": "u32" }
       ]
     }
   ],

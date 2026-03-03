@@ -157,6 +157,7 @@ impl ClientGame {
                     "prediction.lerp".to_string(),
                     "input.dynamic_bindings".to_string(),
                     "input.persist_by_cert".to_string(),
+                    "render.surfaces".to_string(),
                 ],
             };
             self.send_c2s(hello)?;
@@ -283,6 +284,32 @@ impl ClientGame {
 
     pub(super) fn game_name(&self) -> &str {
         &self.game_name
+    }
+
+    pub(super) fn is_connected(&self) -> bool {
+        self.net.is_established()
+    }
+
+    pub(super) fn send_surface_list(
+        &mut self,
+        surfaces: Vec<(protocol::SurfaceId, String, u32, u32)>,
+    ) -> Result<()> {
+        if !self.net.is_established() {
+            return Ok(());
+        }
+        self.send_c2s(protocol::C2SPacket::SurfaceList { surfaces })
+    }
+
+    pub(super) fn send_surface_resized(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if !self.net.is_established() {
+            return Ok(());
+        }
+        self.send_c2s(protocol::C2SPacket::SurfaceResized { surface_id, width, height })
     }
 
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
