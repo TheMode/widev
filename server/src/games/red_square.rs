@@ -58,6 +58,11 @@ impl RedSquareGame {
             vec![
                 S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
                 S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
+                S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
+                S2CPacket::SurfaceClearBackground {
+                    surface_id: 1,
+                    color: [0.18, 0.02, 250.0, 1.0],
+                },
                 S2CPacket::SetTransformPrediction {
                     element_id: client_id,
                     enabled: true,

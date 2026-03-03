@@ -7,6 +7,10 @@
     {
       "name": "SurfaceId",
       "type": "u32"
+    },
+    {
+      "name": "Color",
+      "type": "[f32; 4]"
     }
   ],
   "enums": [
@@ -91,6 +95,32 @@
       "description": "Display name of the game/session for client UI.",
       "fields": [
         { "name": "name", "type": "String" }
+      ]
+    },
+    {
+      "name": "SurfaceLockDimensions",
+      "description": "Lock a surface to a specific width and height.",
+      "fields": [
+        { "name": "surface_id", "type": "SurfaceId" },
+        { "name": "width", "type": "u32" },
+        { "name": "height", "type": "u32" }
+      ]
+    },
+    {
+      "name": "SurfaceLockAspectRatio",
+      "description": "Lock a surface to a specific aspect ratio (numerator/denominator).",
+      "fields": [
+        { "name": "surface_id", "type": "SurfaceId" },
+        { "name": "numerator", "type": "u32" },
+        { "name": "denominator", "type": "u32" }
+      ]
+    },
+    {
+      "name": "SurfaceClearBackground",
+      "description": "Set a surface clear background color in OKLCH (L, C, H_degrees, alpha).",
+      "fields": [
+        { "name": "surface_id", "type": "SurfaceId" },
+        { "name": "color", "type": "Color" }
       ]
     },
     {

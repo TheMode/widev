@@ -46,12 +46,12 @@ impl App {
     }
 
     fn tick_frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let Some(window) = self.window.as_ref() else {
+        let Some(window) = self.window.clone() else {
             return Ok(());
         };
-        let Some(renderer) = self.renderer.as_mut() else {
+        if self.renderer.is_none() {
             return Ok(());
-        };
+        }
 
         self.game.tick_network()?;
         if self.game.is_connected() && !self.surface_list_sent {
@@ -64,6 +64,14 @@ impl App {
             )])?;
             self.surface_list_sent = true;
             self.last_reported_surface_size = Some((size.width, size.height));
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            let surface = self.game.surface_state(MAIN_SURFACE_ID);
+            renderer.set_surface_constraints(
+                surface.dimension_lock,
+                surface.aspect_ratio_lock,
+                surface.clear_background,
+            );
         }
 
         if let Some(prompt) = self.game.binding_prompt() {
@@ -107,7 +115,9 @@ impl App {
         }
 
         let states = self.game.render_states();
-        renderer.render(&states)?;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.render(&states)?;
+        }
         self.just_pressed.clear();
         Ok(())
     }
@@ -143,12 +153,14 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
 
     fn window_event(
@@ -180,6 +192,10 @@ impl ApplicationHandler for App {
                 if let Err(err) = self.tick_frame(event_loop) {
                     log::error!("client frame error: {err:#}");
                     event_loop.exit();
+                    return;
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             },
             WindowEvent::KeyboardInput { event, .. } => {

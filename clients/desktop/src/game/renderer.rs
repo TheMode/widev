@@ -10,7 +10,7 @@ use super::RenderState;
 
 const SHADER_SOURCE: &str = r#"
 struct Screen {
-    size: vec2<f32>,
+    virtual_size: vec2<f32>,
     _pad: vec2<f32>,
 };
 
@@ -33,8 +33,8 @@ struct VsOut {
 fn vs_main(input: VsIn) -> VsOut {
     let world = input.center + input.unit_pos * input.size;
     let ndc = vec2<f32>(
-        (world.x / screen.size.x) * 2.0 - 1.0,
-        1.0 - (world.y / screen.size.y) * 2.0
+        (world.x / screen.virtual_size.x) * 2.0 - 1.0,
+        1.0 - (world.y / screen.virtual_size.y) * 2.0
     );
 
     var out: VsOut;
@@ -67,7 +67,7 @@ struct InstanceRaw {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ScreenUniform {
-    size: [f32; 2],
+    virtual_size: [f32; 2],
     _pad: [f32; 2],
 }
 
@@ -94,6 +94,9 @@ pub(super) struct Renderer {
     instance_staging: Vec<InstanceRaw>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    virtual_dimension_lock: Option<(u32, u32)>,
+    aspect_ratio_lock: Option<(u32, u32)>,
+    clear_color: wgpu::Color,
 }
 
 impl Renderer {
@@ -151,8 +154,10 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
         });
 
-        let uniform =
-            ScreenUniform { size: [config.width as f32, config.height as f32], _pad: [0.0, 0.0] };
+        let uniform = ScreenUniform {
+            virtual_size: [config.width as f32, config.height as f32],
+            _pad: [0.0, 0.0],
+        };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("screen-uniform"),
             contents: bytemuck::bytes_of(&uniform),
@@ -273,6 +278,9 @@ impl Renderer {
             instance_staging: Vec::new(),
             uniform_buffer,
             uniform_bind_group,
+            virtual_dimension_lock: None,
+            aspect_ratio_lock: None,
+            clear_color: wgpu::Color::BLACK,
         })
     }
 
@@ -285,12 +293,26 @@ impl Renderer {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
+        self.write_screen_uniform();
+    }
 
-        let uniform = ScreenUniform {
-            size: [new_size.width as f32, new_size.height as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    pub(super) fn set_surface_constraints(
+        &mut self,
+        dimension_lock: Option<(u32, u32)>,
+        aspect_ratio_lock: Option<(u32, u32)>,
+        clear_background_oklch: Option<[f32; 4]>,
+    ) {
+        if let Some(color) = clear_background_oklch {
+            self.clear_color = oklch_to_clear_color(color);
+        }
+        if self.virtual_dimension_lock == dimension_lock
+            && self.aspect_ratio_lock == aspect_ratio_lock
+        {
+            return;
+        }
+        self.virtual_dimension_lock = dimension_lock;
+        self.aspect_ratio_lock = aspect_ratio_lock;
+        self.write_screen_uniform();
     }
 
     pub(super) fn render(&mut self, render_states: &[RenderState]) -> Result<()> {
@@ -311,6 +333,7 @@ impl Renderer {
             },
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (vp_x, vp_y, vp_w, vp_h) = self.compute_viewport();
 
         let mut encoder = self
             .device
@@ -323,12 +346,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.063,
-                            g: 0.063,
-                            b: 0.063,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -342,6 +360,8 @@ impl Renderer {
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
             pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..render_states.len() as u32);
         }
 
@@ -380,6 +400,58 @@ impl Renderer {
             bytemuck::cast_slice(&self.instance_staging),
         );
     }
+
+    fn write_screen_uniform(&mut self) {
+        let (virtual_width, virtual_height) = self.compute_virtual_size();
+        let uniform = ScreenUniform {
+            virtual_size: [virtual_width as f32, virtual_height as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    fn compute_virtual_size(&self) -> (u32, u32) {
+        if let Some((width, height)) = self.virtual_dimension_lock {
+            if width > 0 && height > 0 {
+                return (width, height);
+            }
+        }
+        if let Some((numerator, denominator)) = self.aspect_ratio_lock {
+            if numerator > 0 && denominator > 0 {
+                return enforce_aspect(
+                    self.config.width.max(1),
+                    self.config.height.max(1),
+                    numerator,
+                    denominator,
+                );
+            }
+        }
+        (self.config.width.max(1), self.config.height.max(1))
+    }
+
+    fn compute_viewport(&self) -> (u32, u32, u32, u32) {
+        let surface_w = self.config.width.max(1);
+        let surface_h = self.config.height.max(1);
+        let (virtual_w, virtual_h) = self.compute_virtual_size();
+
+        let surface_ratio = surface_w as f64 / surface_h as f64;
+        let virtual_ratio = virtual_w as f64 / virtual_h as f64;
+        if (surface_ratio - virtual_ratio).abs() < f64::EPSILON {
+            return (0, 0, surface_w, surface_h);
+        }
+
+        if surface_ratio > virtual_ratio {
+            let vp_h = surface_h;
+            let vp_w = ((vp_h as f64) * virtual_ratio).round().max(1.0) as u32;
+            let vp_x = (surface_w.saturating_sub(vp_w)) / 2;
+            (vp_x, 0, vp_w, vp_h)
+        } else {
+            let vp_w = surface_w;
+            let vp_h = ((vp_w as f64) / virtual_ratio).round().max(1.0) as u32;
+            let vp_y = (surface_h.saturating_sub(vp_h)) / 2;
+            (0, vp_y, vp_w, vp_h)
+        }
+    }
 }
 
 fn unpack_color(rgb: u32) -> [f32; 4] {
@@ -387,4 +459,40 @@ fn unpack_color(rgb: u32) -> [f32; 4] {
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
     let b = (rgb & 0xff) as f32 / 255.0;
     [r, g, b, 1.0]
+}
+
+fn enforce_aspect(width: u32, height: u32, numerator: u32, denominator: u32) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let target_height = ((width as u64 * denominator as u64) / numerator as u64).max(1) as u32;
+    let target_width = ((height as u64 * numerator as u64) / denominator as u64).max(1) as u32;
+    let delta_h = (target_height as i64 - height as i64).abs();
+    let delta_w = (target_width as i64 - width as i64).abs();
+    if delta_h <= delta_w {
+        (width, target_height)
+    } else {
+        (target_width, height)
+    }
+}
+
+fn oklch_to_clear_color([l, c, h_deg, alpha]: [f32; 4]) -> wgpu::Color {
+    let l = l.clamp(0.0, 1.0) as f64;
+    let c = c.max(0.0) as f64;
+    let hue = (h_deg as f64).to_radians();
+    let a = c * hue.cos();
+    let b = c * hue.sin();
+
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    let r = (4.076_741_662_1 * l3 - 3.307_711_591_3 * m3 + 0.230_969_929_2 * s3).clamp(0.0, 1.0);
+    let g = (-1.268_438_004_6 * l3 + 2.609_757_401_1 * m3 - 0.341_319_396_5 * s3).clamp(0.0, 1.0);
+    let b = (-0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701 * s3).clamp(0.0, 1.0);
+
+    wgpu::Color { r, g, b, a: alpha.clamp(0.0, 1.0) as f64 }
 }

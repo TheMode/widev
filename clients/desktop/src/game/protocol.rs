@@ -4,7 +4,7 @@ mod packets {
 }
 
 pub(super) use packets::{
-    C2SPacket, InputType, PredictionKind, S2CPacket, SurfaceId, TransformPredictionMask,
+    C2SPacket, Color, InputType, PredictionKind, S2CPacket, SurfaceId, TransformPredictionMask,
 };
 
 pub(super) fn encode_c2s(packet: &C2SPacket) -> Result<Vec<u8>, bincode::Error> {

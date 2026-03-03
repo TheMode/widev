@@ -36,6 +36,13 @@ pub(super) struct BindingPromptState {
     pub(super) suggestion: Option<KeyCode>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct SurfaceState {
+    pub(super) dimension_lock: Option<(u32, u32)>,
+    pub(super) aspect_ratio_lock: Option<(u32, u32)>,
+    pub(super) clear_background: Option<protocol::Color>,
+}
+
 struct BindingDefinition {
     id: u16,
     identifier: String,
@@ -100,6 +107,7 @@ pub(super) struct ClientGame {
     binding_store: persistence::BindingStore,
     default_prediction: PredictionConfig,
     pending_prediction: HashMap<u32, PredictionConfig>,
+    surfaces: HashMap<protocol::SurfaceId, SurfaceState>,
 }
 
 impl ClientGame {
@@ -118,6 +126,7 @@ impl ClientGame {
             binding_store: persistence::BindingStore::load_default()?,
             default_prediction: PredictionConfig::default(),
             pending_prediction: HashMap::new(),
+            surfaces: HashMap::new(),
         })
     }
 
@@ -312,6 +321,10 @@ impl ClientGame {
         self.send_c2s(protocol::C2SPacket::SurfaceResized { surface_id, width, height })
     }
 
+    pub(super) fn surface_state(&self, surface_id: protocol::SurfaceId) -> SurfaceState {
+        self.surfaces.get(&surface_id).copied().unwrap_or_default()
+    }
+
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
@@ -323,6 +336,41 @@ impl ClientGame {
             },
             protocol::S2CPacket::SetGameName { name } => {
                 self.game_name = name;
+            },
+            protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
+                let state = self.surfaces.entry(surface_id).or_default();
+                if width == 0 || height == 0 {
+                    state.dimension_lock = None;
+                    log::info!("surface {surface_id} dimension lock removed");
+                } else {
+                    state.dimension_lock = Some((width, height));
+                    log::info!("surface {surface_id} dimension lock: {}x{}", width, height);
+                }
+            },
+            protocol::S2CPacket::SurfaceLockAspectRatio { surface_id, numerator, denominator } => {
+                let state = self.surfaces.entry(surface_id).or_default();
+                if numerator == 0 || denominator == 0 {
+                    state.aspect_ratio_lock = None;
+                    log::info!("surface {surface_id} aspect-ratio lock removed");
+                } else {
+                    state.aspect_ratio_lock = Some((numerator, denominator));
+                    log::info!(
+                        "surface {surface_id} aspect-ratio lock: {}/{}",
+                        numerator,
+                        denominator
+                    );
+                }
+            },
+            protocol::S2CPacket::SurfaceClearBackground { surface_id, color } => {
+                let state = self.surfaces.entry(surface_id).or_default();
+                state.clear_background = Some(color);
+                log::info!(
+                    "surface {surface_id} background clear color (oklch): [{:.3}, {:.3}, {:.2}, {:.3}]",
+                    color[0],
+                    color[1],
+                    color[2],
+                    color[3]
+                );
             },
             protocol::S2CPacket::SetTransformPrediction {
                 element_id,
