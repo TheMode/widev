@@ -52,14 +52,16 @@ pub(super) fn run(game: &mut ClientGame) -> Result<()> {
         }
 
         clear(&mut buffer, 0x101010);
-        let state = game.render_state();
-        draw_square(
-            &mut buffer,
-            state.x as i32,
-            state.y as i32,
-            state.size as i32,
-            state.color,
-        );
+        for state in game.render_states() {
+            let _ = state.element_id;
+            draw_square(
+                &mut buffer,
+                state.x as i32,
+                state.y as i32,
+                state.size as i32,
+                state.color,
+            );
+        }
 
         window
             .update_with_buffer(&buffer, WIDTH, HEIGHT)

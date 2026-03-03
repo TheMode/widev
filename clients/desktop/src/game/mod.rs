@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 use anyhow::Result;
@@ -20,6 +20,7 @@ pub struct GameConfig {
 
 #[derive(Clone, Copy)]
 pub(super) struct RenderState {
+    pub(super) element_id: u32,
     pub(super) x: f32,
     pub(super) y: f32,
     pub(super) size: u16,
@@ -45,16 +46,21 @@ struct BindingAssignment {
     frames_since_send: u16,
 }
 
-pub(super) struct ClientGame {
-    net: network::QuicClient,
-    sent_hello: bool,
-    server_cert_fingerprint: Option<String>,
+#[derive(Clone, Copy)]
+struct ElementState {
     target_x: f32,
     target_y: f32,
     draw_x: f32,
     draw_y: f32,
+}
+
+pub(super) struct ClientGame {
+    net: network::QuicClient,
+    sent_hello: bool,
+    server_cert_fingerprint: Option<String>,
     draw_size: u16,
     draw_color_rgba: [u8; 4],
+    elements: HashMap<u32, ElementState>,
     game_name: String,
     pending_bindings: VecDeque<BindingDefinition>,
     binding_suggestion: Option<Key>,
@@ -68,12 +74,9 @@ impl ClientGame {
             net: network::QuicClient::connect(server_addr)?,
             sent_hello: false,
             server_cert_fingerprint: None,
-            target_x: 400.0,
-            target_y: 300.0,
-            draw_x: 400.0,
-            draw_y: 300.0,
             draw_size: 32,
             draw_color_rgba: [255, 0, 0, 255],
+            elements: HashMap::new(),
             game_name: "widev desktop POC".to_string(),
             pending_bindings: VecDeque::new(),
             binding_suggestion: None,
@@ -120,8 +123,10 @@ impl ClientGame {
             println!("connected to server {}", self.net.server_addr());
         }
 
-        self.draw_x += (self.target_x - self.draw_x) * LERP_ALPHA;
-        self.draw_y += (self.target_y - self.draw_y) * LERP_ALPHA;
+        for element in self.elements.values_mut() {
+            element.draw_x += (element.target_x - element.draw_x) * LERP_ALPHA;
+            element.draw_y += (element.target_y - element.draw_y) * LERP_ALPHA;
+        }
 
         Ok(())
     }
@@ -207,13 +212,17 @@ impl ClientGame {
         Ok(())
     }
 
-    pub(super) fn render_state(&self) -> RenderState {
-        RenderState {
-            x: self.draw_x,
-            y: self.draw_y,
-            size: self.draw_size,
-            color: rgba_to_u32(self.draw_color_rgba),
-        }
+    pub(super) fn render_states(&self) -> Vec<RenderState> {
+        self.elements
+            .iter()
+            .map(|(element_id, e)| RenderState {
+                element_id: *element_id,
+                x: e.draw_x,
+                y: e.draw_y,
+                size: self.draw_size,
+                color: rgba_to_u32(self.draw_color_rgba),
+            })
+            .collect()
     }
 
     pub(super) fn game_name(&self) -> &str {
@@ -270,9 +279,18 @@ impl ClientGame {
                     input_type,
                 });
             }
-            protocol::S2CPacket::WorldState { x, y, .. } => {
-                self.target_x = x;
-                self.target_y = y;
+            protocol::S2CPacket::ElementMoved { element_id, x, y } => {
+                let element = self.elements.entry(element_id).or_insert(ElementState {
+                    target_x: x,
+                    target_y: y,
+                    draw_x: x,
+                    draw_y: y,
+                });
+                element.target_x = x;
+                element.target_y = y;
+            }
+            protocol::S2CPacket::ElementRemoved { element_id } => {
+                self.elements.remove(&element_id);
             }
         }
 

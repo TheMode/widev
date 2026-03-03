@@ -9,11 +9,13 @@ use quiche::{Connection, RecvInfo};
 use rand::RngCore;
 
 mod game;
+mod game_state;
 mod games;
 #[allow(dead_code)]
 mod packets;
 
-use game::Game;
+use game::{ClientId, Game};
+use game_state::GameState;
 use packets::{decode_c2s, encode_s2c, S2CPacket};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -29,10 +31,9 @@ struct Args {
 }
 
 struct Session {
+    client_id: ClientId,
     conn: Connection,
     client_addr: SocketAddr,
-    game: Box<dyn Game>,
-    sent_bootstrap: bool,
 }
 
 fn main() -> Result<()> {
@@ -65,7 +66,10 @@ fn main() -> Result<()> {
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut app_buf = [0u8; 4096];
 
-    let mut session: Option<Session> = None;
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut next_client_id: ClientId = 1;
+    let mut game_state = GameState::new();
+    let mut game = games::default_game(Instant::now(), &mut game_state);
     let mut last_tick = Instant::now();
 
     loop {
@@ -77,91 +81,133 @@ fn main() -> Result<()> {
                 Err(err) => return Err(err).context("socket recv_from failed"),
             };
 
-            if session.is_none() {
-                let mut pkt_buf = recv_buf[..len].to_vec();
-                let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-
-                if hdr.ty != quiche::Type::Initial {
-                    continue;
-                }
-
-                let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-                rand::thread_rng().fill_bytes(&mut scid);
-                let scid = quiche::ConnectionId::from_ref(&scid);
-
-                let conn = quiche::accept(&scid, None, local_addr, from, &mut config)
-                    .context("failed to accept incoming QUIC connection")?;
-
-                println!("accepted connection from {from}");
-
-                session = Some(Session {
-                    conn,
-                    client_addr: from,
-                    game: games::default_game(Instant::now()),
-                    sent_bootstrap: false,
-                });
-            }
-
-            if let Some(active) = session.as_mut() {
-                if from != active.client_addr {
-                    continue;
-                }
-
+            if let Some(session) = sessions.iter_mut().find(|s| s.client_addr == from) {
                 let recv_info = RecvInfo {
                     from,
                     to: local_addr,
                 };
-
-                if let Err(err) = active.conn.recv(&mut recv_buf[..len], recv_info) {
+                if let Err(err) = session.conn.recv(&mut recv_buf[..len], recv_info) {
                     if err != quiche::Error::Done {
                         eprintln!("conn.recv failed: {err:?}");
                     }
                 }
+                continue;
             }
+
+            let mut pkt_buf = recv_buf[..len].to_vec();
+            let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            if hdr.ty != quiche::Type::Initial {
+                continue;
+            }
+
+            let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+            rand::thread_rng().fill_bytes(&mut scid);
+            let scid = quiche::ConnectionId::from_ref(&scid);
+
+            let conn = quiche::accept(&scid, None, local_addr, from, &mut config)
+                .context("failed to accept incoming QUIC connection")?;
+
+            let client_id = next_client_id;
+            next_client_id = next_client_id.wrapping_add(1).max(1);
+
+            sessions.push(Session {
+                client_id,
+                conn,
+                client_addr: from,
+            });
+            game.on_client_connected(&mut game_state, client_id);
+            println!("accepted connection from {from} as client {client_id}");
         }
 
         let now = Instant::now();
         let dt = now.duration_since(last_tick);
         if dt >= TICK_INTERVAL {
-            if let Some(active) = session.as_mut() {
-                if active.conn.is_established() {
-                    pump_app_packets(active, &mut app_buf);
+            for session in &mut sessions {
+                if session.conn.is_established() {
+                    pump_app_packets(session, &mut app_buf, game.as_mut(), &mut game_state);
+                }
+            }
 
-                    if !active.sent_bootstrap {
-                        let packets = active.game.collect_bootstrap_packets();
-                        send_game_packets(active, packets);
-                        active.sent_bootstrap = true;
-                    }
+            game.on_tick(&mut game_state, now, dt);
 
-                    active.game.on_tick(now, dt);
-                    let packets = active.game.collect_tick_packets(now);
-                    send_game_packets(active, packets);
+            let mut disconnected_ids: Vec<ClientId> = Vec::new();
+            sessions.retain_mut(|session| {
+                if session.conn.is_established() {
+                    let packets = game_state.drain_packets_for(session.client_id);
+                    send_game_packets(session, packets);
                 }
 
-                flush_quic(&socket, active, &mut send_buf)?;
-
-                if active.conn.is_closed() {
-                    println!("client disconnected");
-                    session = None;
+                if flush_quic(&socket, session, &mut send_buf).is_err() || session.conn.is_closed()
+                {
+                    disconnected_ids.push(session.client_id);
+                    return false;
                 }
+
+                true
+            });
+
+            for client_id in disconnected_ids {
+                game.on_client_disconnected(&mut game_state, client_id);
             }
 
             last_tick = now;
         }
 
-        if let Some(active) = session.as_mut() {
-            if let Some(timeout) = active.conn.timeout() {
+        for session in &mut sessions {
+            if let Some(timeout) = session.conn.timeout() {
                 if timeout.is_zero() {
-                    active.conn.on_timeout();
+                    session.conn.on_timeout();
                 }
             }
         }
 
         std::thread::sleep(IDLE_SLEEP);
     }
+}
+
+fn pump_app_packets(
+    session: &mut Session,
+    app_buf: &mut [u8],
+    game: &mut dyn Game,
+    state: &mut GameState,
+) {
+    loop {
+        match session.conn.dgram_recv(app_buf) {
+            Ok(len) => {
+                if let Ok(packet) = decode_c2s(&app_buf[..len]) {
+                    game.on_client_packet(state, session.client_id, packet);
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
+    for packet in packets {
+        if let Ok(bytes) = encode_s2c(&packet) {
+            let _ = session.conn.dgram_send(&bytes);
+        }
+    }
+}
+
+fn flush_quic(socket: &UdpSocket, session: &mut Session, send_buf: &mut [u8]) -> Result<()> {
+    loop {
+        match session.conn.send(send_buf) {
+            Ok((len, send_info)) => {
+                socket.send_to(&send_buf[..len], send_info.to)?;
+            }
+            Err(quiche::Error::Done) => break,
+            Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
+        }
+    }
+
+    Ok(())
 }
 
 fn build_server_quic_config(
@@ -191,42 +237,6 @@ fn build_server_quic_config(
     config.enable_dgram(true, 64, 64);
     config.verify_peer(false);
     Ok(config)
-}
-
-fn pump_app_packets(active: &mut Session, app_buf: &mut [u8]) {
-    loop {
-        match active.conn.dgram_recv(app_buf) {
-            Ok(len) => {
-                if let Ok(packet) = decode_c2s(&app_buf[..len]) {
-                    active.game.on_client_packet(packet);
-                }
-            }
-            Err(quiche::Error::Done) => break,
-            Err(_) => break,
-        }
-    }
-}
-
-fn send_game_packets(active: &mut Session, packets: Vec<S2CPacket>) {
-    for packet in packets {
-        if let Ok(bytes) = encode_s2c(&packet) {
-            let _ = active.conn.dgram_send(&bytes);
-        }
-    }
-}
-
-fn flush_quic(socket: &UdpSocket, active: &mut Session, send_buf: &mut [u8]) -> Result<()> {
-    loop {
-        match active.conn.send(send_buf) {
-            Ok((len, send_info)) => {
-                let _ = socket.send_to(&send_buf[..len], send_info.to)?;
-            }
-            Err(quiche::Error::Done) => break,
-            Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
-        }
-    }
-
-    Ok(())
 }
 
 fn ensure_dev_certs(cert_dir: &PathBuf) -> Result<()> {
