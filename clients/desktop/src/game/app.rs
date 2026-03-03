@@ -1,14 +1,13 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
+use super::bindings::InputCapture;
 use super::renderer::Renderer;
 use super::ClientGame;
 
@@ -26,10 +25,10 @@ struct App {
     game: ClientGame,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    pressed_keys: HashSet<KeyCode>,
-    just_pressed: Vec<KeyCode>,
+    input_capture: InputCapture,
     surface_list_sent: bool,
     last_reported_surface_size: Option<(u32, u32)>,
+    last_prompt_signature: Option<String>,
 }
 
 impl App {
@@ -38,10 +37,10 @@ impl App {
             game,
             window: None,
             renderer: None,
-            pressed_keys: HashSet::new(),
-            just_pressed: Vec::new(),
+            input_capture: InputCapture::new(),
             surface_list_sent: false,
             last_reported_surface_size: None,
+            last_prompt_signature: None,
         }
     }
 
@@ -53,6 +52,7 @@ impl App {
             return Ok(());
         }
 
+        self.input_capture.poll_gamepads();
         self.game.tick_network()?;
         if self.game.is_connected() && !self.surface_list_sent {
             let size = window.inner_size();
@@ -74,52 +74,63 @@ impl App {
             );
         }
 
-        if let Some(prompt) = self.game.binding_prompt() {
-            let prompt_title = match prompt.suggestion {
-                Some(key) => format!(
-                    "{} - Bind {} [{:?}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
-                    self.game.game_name(),
-                    prompt.identifier,
-                    prompt.input_type,
-                    key
-                ),
-                None => format!(
-                    "{} - Bind {} [{:?}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
-                    self.game.game_name(),
-                    prompt.identifier,
-                    prompt.input_type
-                ),
-            };
-            window.set_title(&prompt_title);
+        let mut overlay_states = Vec::new();
+        if self.game.binding_prompt().is_some() {
+            window.set_title(&format!("{} - Input Bindings", self.game.game_name()));
 
-            for code in self.just_pressed.iter().copied() {
-                if matches!(code, KeyCode::Enter | KeyCode::Backspace | KeyCode::Escape) {
-                    continue;
-                }
-                self.game.suggest_binding_key(code);
+            for action in self.input_capture.binding_actions() {
+                self.game.apply_binding_ui_action(action)?;
             }
-            if self.just_pressed.contains(&KeyCode::Enter) {
-                self.game.confirm_binding()?;
-            }
-            if self.just_pressed.contains(&KeyCode::Backspace) {
-                self.game.skip_binding();
-            }
+
+            self.update_binding_overlay_and_logs(&mut overlay_states);
         } else {
+            self.last_prompt_signature = None;
             window.set_title(self.game.game_name());
-            self.game.send_bound_inputs(|code| self.pressed_keys.contains(&code))?;
+            let input_capture = &self.input_capture;
+            self.game.send_bound_inputs(|path| input_capture.read_binding_value(path))?;
         }
 
-        if self.pressed_keys.contains(&KeyCode::Escape) {
+        if self.input_capture.is_exit_requested() {
             event_loop.exit();
             return Ok(());
         }
 
-        let states = self.game.render_states();
+        let mut states = self.game.render_states();
+        states.extend(overlay_states);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render(&states)?;
         }
-        self.just_pressed.clear();
+
+        self.input_capture.end_frame();
         Ok(())
+    }
+
+    fn update_binding_overlay_and_logs(&mut self, overlay_states: &mut Vec<super::RenderState>) {
+        let Some(prompt) = self.game.binding_prompt() else {
+            self.last_prompt_signature = None;
+            return;
+        };
+
+        if let Some(renderer) = self.renderer.as_ref() {
+            *overlay_states = renderer.build_binding_overlay(&prompt);
+        }
+
+        let signature = format!(
+            "{}:{:?}:{}:{:?}",
+            prompt.identifier, prompt.input_type, prompt.any_device_scope, prompt.suggestion
+        );
+        if self.last_prompt_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+
+        log::info!("binding prompt: {} [{:?}]", prompt.identifier, prompt.input_type);
+        for line in prompt.log_sections() {
+            log::info!("  {line}");
+        }
+        if let Some(suggestion) = prompt.suggestion {
+            log::info!("  captured: {}", suggestion.with_device_scope(prompt.any_device_scope));
+        }
+        self.last_prompt_signature = Some(signature);
     }
 }
 
@@ -163,12 +174,23 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
 
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        self.input_capture.consume_device_event(device_id, event);
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        self.input_capture.consume_window_event(&event);
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -196,21 +218,6 @@ impl ApplicationHandler for App {
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
-                }
-            },
-            WindowEvent::KeyboardInput { event, .. } => {
-                let PhysicalKey::Code(code) = event.physical_key else {
-                    return;
-                };
-                match event.state {
-                    ElementState::Pressed => {
-                        if !event.repeat && self.pressed_keys.insert(code) {
-                            self.just_pressed.push(code);
-                        }
-                    },
-                    ElementState::Released => {
-                        self.pressed_keys.remove(&code);
-                    },
                 }
             },
             _ => {},

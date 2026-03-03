@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use taffy::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use super::bindings::BindingPromptState;
 use super::RenderState;
 
 const SHADER_SOURCE: &str = r#"
@@ -20,7 +22,7 @@ var<uniform> screen: Screen;
 struct VsIn {
     @location(0) unit_pos: vec2<f32>,
     @location(1) center: vec2<f32>,
-    @location(2) size: f32,
+    @location(2) size: vec2<f32>,
     @location(3) color: vec4<f32>,
 };
 
@@ -59,8 +61,7 @@ struct Vertex {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct InstanceRaw {
     center: [f32; 2],
-    size: f32,
-    _pad: f32,
+    size: [f32; 2],
     color: [f32; 4],
 }
 
@@ -219,7 +220,7 @@ impl Renderer {
                             wgpu::VertexAttribute {
                                 offset: 8,
                                 shader_location: 2,
-                                format: wgpu::VertexFormat::Float32,
+                                format: wgpu::VertexFormat::Float32x2,
                             },
                             wgpu::VertexAttribute {
                                 offset: 16,
@@ -370,6 +371,286 @@ impl Renderer {
         Ok(())
     }
 
+    pub(super) fn build_binding_overlay(&self, prompt: &BindingPromptState) -> Vec<RenderState> {
+        let mut states = Vec::new();
+        let (virtual_w, virtual_h) = self.compute_virtual_size();
+        let vw = virtual_w as f32;
+        let vh = virtual_h as f32;
+
+        let panel_w = (vw * 0.86).clamp(540.0, (vw - 24.0).max(540.0));
+        let panel_h = (vh * 0.84).clamp(420.0, (vh - 24.0).max(420.0));
+        let panel_x = vw * 0.5;
+        let panel_y = vh * 0.5;
+        let panel_left = panel_x - panel_w * 0.5;
+        let panel_top = panel_y - panel_h * 0.5;
+        let ui_scale = (panel_w / 760.0).clamp(1.0, 2.0).round();
+        let pad = 20.0 * ui_scale;
+        let gap = 14.0 * ui_scale;
+        let header_h = 56.0 * ui_scale;
+        let action_h = 72.0 * ui_scale;
+        let row2_h = 84.0 * ui_scale;
+        let controls_h = 68.0 * ui_scale;
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let (Ok(header), Ok(action), Ok(left_card), Ok(right_card), Ok(controls), Ok(sources)) = (
+            taffy.new_leaf(Style {
+                size: Size { width: percent(1.0), height: length(header_h) },
+                ..Default::default()
+            }),
+            taffy.new_leaf(Style {
+                size: Size { width: percent(1.0), height: length(action_h) },
+                ..Default::default()
+            }),
+            taffy.new_leaf(Style {
+                flex_grow: 1.0,
+                flex_basis: length(0.0),
+                size: Size { width: auto(), height: percent(1.0) },
+                ..Default::default()
+            }),
+            taffy.new_leaf(Style {
+                flex_grow: 1.0,
+                flex_basis: length(0.0),
+                size: Size { width: auto(), height: percent(1.0) },
+                ..Default::default()
+            }),
+            taffy.new_leaf(Style {
+                size: Size { width: percent(1.0), height: length(controls_h) },
+                ..Default::default()
+            }),
+            taffy.new_leaf(Style {
+                flex_grow: 1.0,
+                min_size: Size { width: auto(), height: length(70.0 * ui_scale) },
+                ..Default::default()
+            }),
+        ) else {
+            return states;
+        };
+        let Ok(row2) = taffy.new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                gap: Size { width: length(gap), height: length(0.0) },
+                size: Size { width: percent(1.0), height: length(row2_h) },
+                ..Default::default()
+            },
+            &[left_card, right_card],
+        ) else {
+            return states;
+        };
+        let Ok(root) = taffy.new_with_children(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size { width: length(panel_w), height: length(panel_h) },
+                padding: Rect {
+                    left: length(pad),
+                    right: length(pad),
+                    top: length(pad),
+                    bottom: length(pad),
+                },
+                gap: Size { width: length(0.0), height: length(gap) },
+                ..Default::default()
+            },
+            &[header, action, row2, controls, sources],
+        ) else {
+            return states;
+        };
+        if taffy
+            .compute_layout(
+                root,
+                Size {
+                    width: AvailableSpace::Definite(panel_w),
+                    height: AvailableSpace::Definite(panel_h),
+                },
+            )
+            .is_err()
+        {
+            return states;
+        }
+
+        let get_rect = |node| {
+            let layout = taffy.layout(node).ok()?;
+            let left = panel_left + layout.location.x;
+            let top = panel_top + layout.location.y;
+            Some((left, top, layout.size.width, layout.size.height))
+        };
+        let Some((header_left, header_top, header_w, header_h)) = get_rect(header) else {
+            return states;
+        };
+        let Some((action_left, action_top, action_w, action_h)) = get_rect(action) else {
+            return states;
+        };
+        let Some((row2_left, row2_top, _row2_w, _row2_h)) = get_rect(row2) else {
+            return states;
+        };
+        let left_layout = match taffy.layout(left_card) {
+            Ok(layout) => layout,
+            Err(_) => return states,
+        };
+        let right_layout = match taffy.layout(right_card) {
+            Ok(layout) => layout,
+            Err(_) => return states,
+        };
+        let left_left = row2_left + left_layout.location.x;
+        let left_top = row2_top + left_layout.location.y;
+        let left_w = left_layout.size.width;
+        let left_h = left_layout.size.height;
+        let right_left = row2_left + right_layout.location.x;
+        let right_top = row2_top + right_layout.location.y;
+        let right_w = right_layout.size.width;
+        let right_h = right_layout.size.height;
+        if right_w <= 0.0 || right_h <= 0.0 {
+            return states;
+        }
+        let Some((controls_left, controls_top, controls_w, controls_h)) = get_rect(controls) else {
+            return states;
+        };
+        let Some((sources_left, sources_top, sources_w, sources_h)) = get_rect(sources) else {
+            return states;
+        };
+
+        push_rect(&mut states, panel_x, panel_y, panel_w, panel_h, 0x070b12);
+        draw_border(&mut states, panel_left, panel_top, panel_w, panel_h, 0x2b3f5f);
+        push_rect(
+            &mut states,
+            header_left + header_w * 0.5,
+            header_top + header_h * 0.5,
+            header_w,
+            header_h,
+            0x142033,
+        );
+        draw_text_line(
+            &mut states,
+            header_left + 12.0 * ui_scale,
+            header_top + 14.0 * ui_scale,
+            "Input Binding",
+            header_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xe2e8f0,
+        );
+
+        for (l, t, w, h) in [
+            (action_left, action_top, action_w, action_h),
+            (left_left, left_top, left_w, left_h),
+            (right_left, right_top, right_w, right_h),
+            (controls_left, controls_top, controls_w, controls_h),
+            (sources_left, sources_top, sources_w, sources_h),
+        ] {
+            push_rect(&mut states, l + w * 0.5, t + h * 0.5, w, h, 0x0f1727);
+            draw_border(&mut states, l, t, w, h, 0x334155);
+        }
+
+        draw_text_line(
+            &mut states,
+            action_left + 12.0 * ui_scale,
+            action_top + 12.0 * ui_scale,
+            &format!("Action: {}", prompt.identifier),
+            action_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xbfdbfe,
+        );
+        draw_text_line(
+            &mut states,
+            action_left + 12.0 * ui_scale,
+            action_top + 36.0 * ui_scale,
+            &format!("Input Type: {:?}", prompt.input_type),
+            action_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0x93c5fd,
+        );
+
+        let scope_label = if prompt.any_device_scope { "Any Device (*)" } else { "Exact Device" };
+        let captured = prompt
+            .suggestion
+            .as_ref()
+            .map(|path| path.with_device_scope(prompt.any_device_scope).to_string())
+            .unwrap_or_else(|| "No input captured".to_string());
+        draw_text_line(
+            &mut states,
+            left_left + 12.0 * ui_scale,
+            left_top + 10.0 * ui_scale,
+            "Device Scope",
+            left_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xf8fafc,
+        );
+        draw_text_line(
+            &mut states,
+            left_left + 12.0 * ui_scale,
+            left_top + 36.0 * ui_scale,
+            scope_label,
+            left_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xfde68a,
+        );
+        draw_text_line(
+            &mut states,
+            right_left + 12.0 * ui_scale,
+            right_top + 10.0 * ui_scale,
+            "Captured Input",
+            right_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xf8fafc,
+        );
+        draw_text_line(
+            &mut states,
+            right_left + 12.0 * ui_scale,
+            right_top + 36.0 * ui_scale,
+            &captured,
+            right_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0x86efac,
+        );
+
+        draw_text_line(
+            &mut states,
+            controls_left + 12.0 * ui_scale,
+            controls_top + 10.0 * ui_scale,
+            "Controls",
+            controls_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xf8fafc,
+        );
+        draw_text_line(
+            &mut states,
+            controls_left + 12.0 * ui_scale,
+            controls_top + 36.0 * ui_scale,
+            "Enter confirm | Backspace skip | Tab toggle scope | Esc exit",
+            controls_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xfde68a,
+        );
+
+        draw_text_line(
+            &mut states,
+            sources_left + 12.0 * ui_scale,
+            sources_top + 10.0 * ui_scale,
+            "Supported Inputs",
+            sources_w - 24.0 * ui_scale,
+            2.0 * ui_scale,
+            0xf8fafc,
+        );
+        let mut y = sources_top + 36.0 * ui_scale;
+        let max_y = sources_top + sources_h - 16.0 * ui_scale;
+        let line_h = 16.0 * ui_scale;
+        for line in friendly_supported_lines(prompt) {
+            if y > max_y {
+                break;
+            }
+            draw_text_line(
+                &mut states,
+                sources_left + 12.0 * ui_scale,
+                y,
+                &format!("- {line}"),
+                sources_w - 24.0 * ui_scale,
+                2.0 * ui_scale,
+                0xcbd5e1,
+            );
+            y += line_h;
+        }
+
+        states
+    }
+
     fn ensure_instance_capacity(&mut self, required: usize) {
         if required <= self.instance_capacity {
             return;
@@ -390,8 +671,7 @@ impl Renderer {
         self.instance_staging.clear();
         self.instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
             center: [state.x, state.y],
-            size: state.size as f32,
-            _pad: 0.0,
+            size: [state.width, state.height],
             color: unpack_color(state.color),
         }));
         self.queue.write_buffer(
@@ -495,4 +775,150 @@ fn oklch_to_clear_color([l, c, h_deg, alpha]: [f32; 4]) -> wgpu::Color {
     let b = (-0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701 * s3).clamp(0.0, 1.0);
 
     wgpu::Color { r, g, b, a: alpha.clamp(0.0, 1.0) as f64 }
+}
+
+fn push_rect(states: &mut Vec<RenderState>, x: f32, y: f32, width: f32, height: f32, color: u32) {
+    let sx = x.round();
+    let sy = y.round();
+    let sw = width.max(1.0).round();
+    let sh = height.max(1.0).round();
+    states.push(RenderState { x: sx, y: sy, width: sw, height: sh, color });
+}
+
+fn draw_border(
+    states: &mut Vec<RenderState>,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    color: u32,
+) {
+    let t = 2.0;
+    push_rect(states, left + width * 0.5, top + t * 0.5, width, t, color);
+    push_rect(states, left + width * 0.5, top + height - t * 0.5, width, t, color);
+    push_rect(states, left + t * 0.5, top + height * 0.5, t, height, color);
+    push_rect(states, left + width - t * 0.5, top + height * 0.5, t, height, color);
+}
+
+fn draw_text_line(
+    states: &mut Vec<RenderState>,
+    x: f32,
+    y: f32,
+    text: &str,
+    max_width: f32,
+    scale: f32,
+    color: u32,
+) {
+    let snapped_scale = scale.max(1.0).round();
+    let text = text.to_ascii_uppercase();
+    let char_w = 6.0 * snapped_scale;
+    let max_chars = (max_width / char_w).floor().max(1.0) as usize;
+    let total_chars = text.chars().count();
+    let clipped = if total_chars > max_chars {
+        let take = max_chars.saturating_sub(3);
+        let mut out: String = text.chars().take(take).collect();
+        out.push_str("...");
+        out
+    } else {
+        text
+    };
+    draw_text(states, x.round(), y.round(), &clipped, snapped_scale, color);
+}
+
+fn draw_text(states: &mut Vec<RenderState>, x: f32, y: f32, text: &str, scale: f32, color: u32) {
+    let mut cursor_x = x;
+    for ch in text.chars() {
+        if let Some(rows) = glyph_rows(ch) {
+            for (row, pattern) in rows.iter().enumerate() {
+                for col in 0..5 {
+                    if (pattern >> (4 - col)) & 1 == 1 {
+                        let px = cursor_x + col as f32 * scale;
+                        let py = y + row as f32 * scale;
+                        push_rect(states, px + scale * 0.5, py + scale * 0.5, scale, scale, color);
+                    }
+                }
+            }
+        }
+        cursor_x += 6.0 * scale;
+    }
+}
+
+fn glyph_rows(ch: char) -> Option<[u8; 7]> {
+    match ch {
+        'A' => Some([0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+        'B' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
+        'C' => Some([0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]),
+        'D' => Some([0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]),
+        'E' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
+        'F' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000]),
+        'G' => Some([0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110]),
+        'H' => Some([0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+        'I' => Some([0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+        'J' => Some([0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110]),
+        'K' => Some([0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
+        'L' => Some([0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
+        'M' => Some([0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001]),
+        'N' => Some([0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001]),
+        'O' => Some([0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+        'P' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
+        'Q' => Some([0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101]),
+        'R' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
+        'S' => Some([0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
+        'T' => Some([0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+        'U' => Some([0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+        'V' => Some([0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
+        'W' => Some([0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010]),
+        'X' => Some([0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001]),
+        'Y' => Some([0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100]),
+        'Z' => Some([0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111]),
+        '0' => Some([0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]),
+        '1' => Some([0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+        '2' => Some([0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
+        '3' => Some([0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110]),
+        '4' => Some([0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]),
+        '5' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110]),
+        '6' => Some([0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
+        '7' => Some([0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]),
+        '8' => Some([0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]),
+        '9' => Some([0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110]),
+        ' ' => Some([0, 0, 0, 0, 0, 0, 0]),
+        ':' => Some([0, 0b00100, 0, 0, 0b00100, 0, 0]),
+        '-' => Some([0, 0, 0, 0b11111, 0, 0, 0]),
+        '_' => Some([0, 0, 0, 0, 0, 0, 0b11111]),
+        '/' => Some([0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0]),
+        '*' => Some([0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0]),
+        '(' => Some([0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010]),
+        ')' => Some([0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000]),
+        '[' => Some([0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110]),
+        ']' => Some([0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110]),
+        '|' => Some([0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+        '.' => Some([0, 0, 0, 0, 0, 0b00100, 0]),
+        '>' => Some([0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000]),
+        '<' => Some([0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001]),
+        ',' => Some([0, 0, 0, 0, 0b00100, 0b00100, 0b01000]),
+        '=' => Some([0, 0b11111, 0, 0b11111, 0, 0, 0]),
+        '?' => Some([0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100]),
+        '!' => Some([0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100]),
+        _ => None,
+    }
+}
+
+fn friendly_supported_lines(prompt: &BindingPromptState) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("Input type: {:?}", prompt.input_type));
+    lines.push(format!(
+        "Device scope: {}",
+        if prompt.any_device_scope { "Any device (*)" } else { "Exact device only" }
+    ));
+    if prompt.allows_toggle {
+        lines.push("Keyboard keys, mouse buttons, and gamepad buttons".to_string());
+    }
+    if prompt.allows_axis {
+        lines.push("Mouse wheel/motion and gamepad analog axes".to_string());
+    }
+    if prompt.joystick_scalar_fallback {
+        lines.push("2D joysticks currently send scalar values (protocol limitation)".to_string());
+    }
+    lines.push("Use Tab to switch between exact device and wildcard (*)".to_string());
+    lines
 }

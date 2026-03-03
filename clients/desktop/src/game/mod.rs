@@ -1,19 +1,17 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use anyhow::Result;
+use bindings::{BindingPromptState, DeclareBindingOutcome};
 use sha2::{Digest, Sha256};
-use winit::keyboard::KeyCode;
-
 mod app;
-mod input_path_winit;
+mod bindings;
 mod network;
 mod persistence;
 mod protocol;
 mod renderer;
 
-const INPUT_RESEND_EVERY_FRAMES: u16 = 8;
 const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
@@ -26,14 +24,9 @@ pub struct GameConfig {
 pub(super) struct RenderState {
     pub(super) x: f32,
     pub(super) y: f32,
-    pub(super) size: u16,
+    pub(super) width: f32,
+    pub(super) height: f32,
     pub(super) color: u32,
-}
-
-pub(super) struct BindingPromptState {
-    pub(super) identifier: String,
-    pub(super) input_type: protocol::InputType,
-    pub(super) suggestion: Option<KeyCode>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -41,19 +34,6 @@ pub(super) struct SurfaceState {
     pub(super) dimension_lock: Option<(u32, u32)>,
     pub(super) aspect_ratio_lock: Option<(u32, u32)>,
     pub(super) clear_background: Option<protocol::Color>,
-}
-
-struct BindingDefinition {
-    id: u16,
-    identifier: String,
-    input_type: protocol::InputType,
-}
-
-struct BindingAssignment {
-    id: u16,
-    key: KeyCode,
-    last_value: f32,
-    frames_since_send: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -101,10 +81,7 @@ pub(super) struct ClientGame {
     draw_color_rgba: [u8; 4],
     elements: HashMap<u32, ElementState>,
     game_name: String,
-    pending_bindings: VecDeque<BindingDefinition>,
-    binding_suggestion: Option<KeyCode>,
-    active_bindings: Vec<BindingAssignment>,
-    binding_store: persistence::BindingStore,
+    bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
     pending_prediction: HashMap<u32, PredictionConfig>,
     surfaces: HashMap<protocol::SurfaceId, SurfaceState>,
@@ -120,10 +97,7 @@ impl ClientGame {
             draw_color_rgba: [255, 0, 0, 255],
             elements: HashMap::new(),
             game_name: "widev desktop POC".to_string(),
-            pending_bindings: VecDeque::new(),
-            binding_suggestion: None,
-            active_bindings: Vec::new(),
-            binding_store: persistence::BindingStore::load_default()?,
+            bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
             pending_prediction: HashMap::new(),
             surfaces: HashMap::new(),
@@ -138,7 +112,7 @@ impl ClientGame {
                 let fp = fingerprint_hex(&cert_der);
                 self.server_cert_fingerprint = Some(fp.clone());
                 log::info!("connected cert fingerprint: {fp}");
-                let cached = self.binding_store.binding_count(&fp);
+                let cached = self.bindings.binding_count(&fp);
                 if cached == 0 {
                     log::info!("no cached bindings for this server cert");
                 } else {
@@ -201,79 +175,38 @@ impl ClientGame {
         Ok(())
     }
 
-    pub(super) fn binding_prompt(&self) -> Option<BindingPromptState> {
-        let current = self.pending_bindings.front()?;
-        Some(BindingPromptState {
-            identifier: current.identifier.clone(),
-            input_type: current.input_type,
-            suggestion: self.binding_suggestion,
-        })
+    pub(in crate::game) fn binding_prompt(&self) -> Option<BindingPromptState> {
+        self.bindings.binding_prompt()
     }
 
-    pub(super) fn suggest_binding_key(&mut self, key: KeyCode) {
-        self.binding_suggestion = Some(key);
-    }
-
-    pub(super) fn confirm_binding(&mut self) -> Result<()> {
-        let Some(definition) = self.pending_bindings.pop_front() else {
-            return Ok(());
-        };
-
-        let Some(key) = self.binding_suggestion.take() else {
-            return Ok(());
-        };
-        let input_path = input_path_winit::input_path_from_key(key);
-
-        self.send_binding_ack(definition.id)?;
-
-        if let Some(cert_fp) = &self.server_cert_fingerprint {
-            self.binding_store.set_binding_path(
-                cert_fp,
-                &definition.identifier,
-                input_path.clone(),
-            );
-            self.binding_store.save()?;
+    pub(in crate::game) fn apply_binding_ui_action(
+        &mut self,
+        action: bindings::UiAction,
+    ) -> Result<()> {
+        match action {
+            bindings::UiAction::Confirm => {
+                if let Some(confirmed) =
+                    self.bindings.confirm_binding(self.server_cert_fingerprint.as_deref())?
+                {
+                    self.send_binding_ack(confirmed.binding_id)?;
+                    log::info!("assigned '{}' -> {}", confirmed.identifier, confirmed.input);
+                }
+            },
+            other => self.bindings.apply_ui_action(other),
         }
-
-        self.activate_binding(definition.id, key);
-
-        log::info!("assigned '{}' -> {:?}", definition.identifier, key);
         Ok(())
     }
 
-    pub(super) fn skip_binding(&mut self) {
-        if let Some(definition) = self.pending_bindings.pop_front() {
-            log::info!("skipped binding '{}'", definition.identifier);
-        }
-        self.binding_suggestion = None;
-    }
-
-    pub(super) fn send_bound_inputs<F>(&mut self, mut is_down: F) -> Result<()>
+    pub(in crate::game) fn send_bound_inputs<F>(&mut self, read_value: F) -> Result<()>
     where
-        F: FnMut(KeyCode) -> bool,
+        F: FnMut(&bindings::InputPath) -> f32,
     {
         if !self.net.is_established() {
             return Ok(());
         }
 
-        let mut outgoing = Vec::new();
-        for binding in &mut self.active_bindings {
-            binding.frames_since_send = binding.frames_since_send.saturating_add(1);
-            let value = if is_down(binding.key) { 1.0 } else { 0.0 };
-            let changed = (value - binding.last_value).abs() >= f32::EPSILON;
-            let should_resend = binding.frames_since_send >= INPUT_RESEND_EVERY_FRAMES;
-            if !changed && !should_resend {
-                continue;
-            }
-
-            binding.last_value = value;
-            binding.frames_since_send = 0;
-
-            outgoing.push(protocol::C2SPacket::InputValue { binding_id: binding.id, value });
-        }
-
-        for packet in outgoing {
-            self.send_c2s(packet)?;
+        for (binding_id, value) in self.bindings.sample_values(read_value) {
+            self.send_c2s(protocol::C2SPacket::InputValue { binding_id, value })?;
         }
 
         Ok(())
@@ -285,7 +218,8 @@ impl ClientGame {
             .map(|e| RenderState {
                 x: e.draw_x,
                 y: e.draw_y,
-                size: self.draw_size,
+                width: self.draw_size as f32,
+                height: self.draw_size as f32,
                 color: rgba_to_u32(self.draw_color_rgba),
             })
             .collect()
@@ -394,35 +328,23 @@ impl ClientGame {
             },
             protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
                 log::info!("binding request: {identifier} ({input_type:?})");
-
-                if let Some(cert_fp) = &self.server_cert_fingerprint {
-                    if let Some(saved_path) =
-                        self.binding_store.get_binding_path(cert_fp, &identifier)
-                    {
-                        if let Some(saved_key) = input_path_winit::key_from_input_path(&saved_path)
-                        {
-                            self.send_binding_ack(binding_id)?;
-                            self.activate_binding(binding_id, saved_key);
-                            log::info!(
-                                "restored '{}' -> {:?} ({saved_path})",
-                                identifier,
-                                saved_key
-                            );
-                            return Ok(());
-                        }
-
-                        log::info!(
-                            "cached binding for '{}' exists but is not compatible with this backend: {}",
-                            identifier, saved_path
-                        );
-                    }
-                }
-
-                self.pending_bindings.push_back(BindingDefinition {
-                    id: binding_id,
+                match self.bindings.declare_binding(
+                    self.server_cert_fingerprint.as_deref(),
+                    binding_id,
                     identifier,
                     input_type,
-                });
+                ) {
+                    DeclareBindingOutcome::Restored {
+                        binding_id,
+                        input,
+                        saved_path,
+                        identifier,
+                    } => {
+                        self.send_binding_ack(binding_id)?;
+                        log::info!("restored '{}' -> {} ({saved_path})", identifier, input);
+                    },
+                    DeclareBindingOutcome::Pending => {},
+                }
             },
             protocol::S2CPacket::ElementMoved { element_id, x, y } => {
                 let now = Instant::now();
@@ -471,15 +393,6 @@ impl ClientGame {
             self.net.send_datagram(&bytes)?;
         }
         Ok(())
-    }
-
-    fn activate_binding(&mut self, id: u16, key: KeyCode) {
-        self.active_bindings.push(BindingAssignment {
-            id,
-            key,
-            last_value: 0.0,
-            frames_since_send: 0,
-        });
     }
 }
 
