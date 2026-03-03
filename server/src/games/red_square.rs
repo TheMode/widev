@@ -33,17 +33,11 @@ struct PlayerState {
 
 pub struct RedSquareGame {
     players: HashMap<ClientId, PlayerState>,
-    last_world_send: Instant,
-    world_send_interval: Duration,
 }
 
 impl RedSquareGame {
-    pub fn new(started_at: Instant, _state: &mut GameState) -> Self {
-        Self {
-            players: HashMap::new(),
-            last_world_send: started_at,
-            world_send_interval: Duration::from_millis(33),
-        }
+    pub fn new(_started_at: Instant, _state: &mut GameState) -> Self {
+        Self { players: HashMap::new() }
     }
 
     fn spawn_element(client_id: ClientId) -> ElementState {
@@ -177,7 +171,7 @@ impl Game for RedSquareGame {
         }
     }
 
-    fn on_tick(&mut self, state: &mut GameState, now: Instant, dt: Duration) {
+    fn on_tick(&mut self, state: &mut GameState, _now: Instant, dt: Duration) {
         let dt_seconds = dt.as_secs_f32();
         for player in self.players.values_mut() {
             let input = player.input;
@@ -202,11 +196,6 @@ impl Game for RedSquareGame {
             player.element.y =
                 (player.element.y + dy * PLAYER_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT);
         }
-
-        if now.duration_since(self.last_world_send) < self.world_send_interval {
-            return;
-        }
-        self.last_world_send = now;
 
         let snapshots: Vec<(ClientId, ElementState)> =
             self.players.iter().map(|(id, p)| (*id, p.element)).collect();
