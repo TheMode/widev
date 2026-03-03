@@ -63,7 +63,7 @@ impl RedSquareGame {
                     surface_id: 1,
                     color: [0.18, 0.02, 250.0, 1.0],
                 },
-                S2CPacket::SetTransformPrediction {
+                S2CPacket::ElementSetTransformPrediction {
                     element_id: client_id,
                     enabled: true,
                     affected_mask: TransformPredictionMask::TRANSLATION,
@@ -103,7 +103,7 @@ impl Game for RedSquareGame {
         let mut snapshot_bundle = PacketBundle::default();
         for (element_id, e) in snapshots {
             snapshot_bundle.push(S2CPacket::ElementMove { element_id, x: e.x, y: e.y });
-            snapshot_bundle.push(S2CPacket::SetTransformPrediction {
+            snapshot_bundle.push(S2CPacket::ElementSetTransformPrediction {
                 element_id,
                 enabled: true,
                 affected_mask: TransformPredictionMask::TRANSLATION,
@@ -118,7 +118,7 @@ impl Game for RedSquareGame {
         let mut bundle = PacketBundle::default();
         bundle.extend([
             S2CPacket::ElementMove { element_id: client_id, x: element.x, y: element.y },
-            S2CPacket::SetTransformPrediction {
+            S2CPacket::ElementSetTransformPrediction {
                 element_id: client_id,
                 enabled: true,
                 affected_mask: TransformPredictionMask::TRANSLATION,

@@ -124,16 +124,6 @@
       ]
     },
     {
-      "name": "SetTransformPrediction",
-      "description": "Enable/disable transform prediction and configure affected components and mode.",
-      "fields": [
-        { "name": "element_id", "type": "ElementId" },
-        { "name": "enabled", "type": "bool" },
-        { "name": "affected_mask", "type": "TransformPredictionMask" },
-        { "name": "kind", "type": "PredictionKind" }
-      ]
-    },
-    {
       "name": "BindingDeclare",
       "description": "Server-declared input binding definition that the client must map.",
       "fields": [
@@ -156,6 +146,16 @@
       "description": "Notification that a uniquely identified element should be removed.",
       "fields": [
         { "name": "element_id", "type": "ElementId" }
+      ]
+    },
+    {
+      "name": "ElementSetTransformPrediction",
+      "description": "Enable/disable transform prediction and configure affected components and mode.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "enabled", "type": "bool" },
+        { "name": "affected_mask", "type": "TransformPredictionMask" },
+        { "name": "kind", "type": "PredictionKind" }
       ]
     }
   ]

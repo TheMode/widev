@@ -306,7 +306,7 @@ impl ClientGame {
                     color[3]
                 );
             },
-            protocol::S2CPacket::SetTransformPrediction {
+            protocol::S2CPacket::ElementSetTransformPrediction {
                 element_id,
                 enabled,
                 affected_mask,
