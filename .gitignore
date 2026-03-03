@@ -1,0 +1,4 @@
+/target
+**/target
+/server/certs/*.crt
+/server/certs/*.key
