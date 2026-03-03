@@ -346,7 +346,7 @@ impl ClientGame {
                     DeclareBindingOutcome::Pending => {},
                 }
             },
-            protocol::S2CPacket::ElementMoved { element_id, x, y } => {
+            protocol::S2CPacket::ElementMove { element_id, x, y } => {
                 let now = Instant::now();
                 let element = self.elements.entry(element_id).or_insert(ElementState {
                     last_authoritative_x: x,
@@ -375,7 +375,7 @@ impl ClientGame {
                 element.target_x = x;
                 element.target_y = y;
             },
-            protocol::S2CPacket::ElementRemoved { element_id } => {
+            protocol::S2CPacket::ElementRemove { element_id } => {
                 self.elements.remove(&element_id);
                 self.pending_prediction.remove(&element_id);
             },

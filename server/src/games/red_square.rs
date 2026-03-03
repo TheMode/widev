@@ -102,7 +102,7 @@ impl Game for RedSquareGame {
             self.players.iter().map(|(id, p)| (*id, p.element)).collect();
         let mut snapshot_bundle = PacketBundle::default();
         for (element_id, e) in snapshots {
-            snapshot_bundle.push(S2CPacket::ElementMoved { element_id, x: e.x, y: e.y });
+            snapshot_bundle.push(S2CPacket::ElementMove { element_id, x: e.x, y: e.y });
             snapshot_bundle.push(S2CPacket::SetTransformPrediction {
                 element_id,
                 enabled: true,
@@ -117,7 +117,7 @@ impl Game for RedSquareGame {
         let element = self.players.get(&client_id).map(|p| p.element).unwrap_or(element);
         let mut bundle = PacketBundle::default();
         bundle.extend([
-            S2CPacket::ElementMoved { element_id: client_id, x: element.x, y: element.y },
+            S2CPacket::ElementMove { element_id: client_id, x: element.x, y: element.y },
             S2CPacket::SetTransformPrediction {
                 element_id: client_id,
                 enabled: true,
@@ -135,7 +135,7 @@ impl Game for RedSquareGame {
 
         state.send(
             PacketTarget::Broadcast,
-            PacketMessage::Packet(S2CPacket::ElementRemoved { element_id: client_id }),
+            PacketMessage::Packet(S2CPacket::ElementRemove { element_id: client_id }),
         );
 
         log::info!("client {client_id} disconnected");
@@ -192,7 +192,7 @@ impl Game for RedSquareGame {
         }
 
         let mut bundle = PacketBundle::new(PacketMeta { optional: true, stream_id: None });
-        bundle.extend(self.players.iter().map(|(element_id, player)| S2CPacket::ElementMoved {
+        bundle.extend(self.players.iter().map(|(element_id, player)| S2CPacket::ElementMove {
             element_id: *element_id,
             x: player.element.x,
             y: player.element.y,

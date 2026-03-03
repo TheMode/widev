@@ -143,7 +143,7 @@
       ]
     },
     {
-      "name": "ElementMoved",
+      "name": "ElementMove",
       "description": "Authoritative transform update for a uniquely identified element.",
       "fields": [
         { "name": "element_id", "type": "ElementId" },
@@ -152,7 +152,7 @@
       ]
     },
     {
-      "name": "ElementRemoved",
+      "name": "ElementRemove",
       "description": "Notification that a uniquely identified element should be removed.",
       "fields": [
         { "name": "element_id", "type": "ElementId" }
