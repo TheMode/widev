@@ -7,7 +7,7 @@ const WIDTH: usize = 800;
 const HEIGHT: usize = 600;
 
 pub(super) fn run(game: &mut ClientGame) -> Result<()> {
-    let mut window = Window::new("widev desktop POC", WIDTH, HEIGHT, WindowOptions::default())
+    let mut window = Window::new(game.game_name(), WIDTH, HEIGHT, WindowOptions::default())
         .context("failed to create desktop window")?;
     window.set_target_fps(60);
 
@@ -19,12 +19,12 @@ pub(super) fn run(game: &mut ClientGame) -> Result<()> {
         if let Some(prompt) = game.binding_prompt() {
             let prompt_title = match prompt.suggestion {
                 Some(key) => format!(
-                    "Bind {} [{:?}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
-                    prompt.identifier, prompt.input_type, key
+                    "{} - Bind {} [{:?}] - press Enter to confirm {:?}, Backspace to skip, Esc to quit",
+                    game.game_name(), prompt.identifier, prompt.input_type, key
                 ),
                 None => format!(
-                    "Bind {} [{:?}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
-                    prompt.identifier, prompt.input_type
+                    "{} - Bind {} [{:?}] - press a key, Enter to confirm, Backspace to skip, Esc to quit",
+                    game.game_name(), prompt.identifier, prompt.input_type
                 ),
             };
             window.set_title(&prompt_title);
@@ -43,7 +43,7 @@ pub(super) fn run(game: &mut ClientGame) -> Result<()> {
                 game.skip_binding();
             }
         } else {
-            window.set_title("widev desktop POC");
+            window.set_title(game.game_name());
             game.send_bound_inputs(|key| window.is_key_down(key))?;
         }
 

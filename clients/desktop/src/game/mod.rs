@@ -55,6 +55,7 @@ pub(super) struct ClientGame {
     draw_y: f32,
     draw_size: u16,
     draw_color_rgba: [u8; 4],
+    game_name: String,
     pending_bindings: VecDeque<BindingDefinition>,
     binding_suggestion: Option<Key>,
     active_bindings: Vec<BindingAssignment>,
@@ -73,6 +74,7 @@ impl ClientGame {
             draw_y: 300.0,
             draw_size: 32,
             draw_color_rgba: [255, 0, 0, 255],
+            game_name: "widev desktop POC".to_string(),
             pending_bindings: VecDeque::new(),
             binding_suggestion: None,
             active_bindings: Vec::new(),
@@ -214,6 +216,10 @@ impl ClientGame {
         }
     }
 
+    pub(super) fn game_name(&self) -> &str {
+        &self.game_name
+    }
+
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
@@ -225,6 +231,9 @@ impl ClientGame {
             } => {
                 self.draw_color_rgba = player_color_rgba;
                 self.draw_size = player_size;
+            }
+            protocol::S2CPacket::SetGameName { name } => {
+                self.game_name = name;
             }
             protocol::S2CPacket::BindingDeclare {
                 binding_id,

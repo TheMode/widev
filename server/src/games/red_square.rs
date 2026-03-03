@@ -88,6 +88,9 @@ impl Game for RedSquareGame {
     fn collect_bootstrap_packets(&mut self) -> Vec<S2CPacket> {
         vec![
             S2CPacket::ServerHello { tick_rate_hz: 60 },
+            S2CPacket::SetGameName {
+                name: "Red Square".to_string(),
+            },
             S2CPacket::AssetManifest {
                 player_color_rgba: [255, 0, 0, 255],
                 player_size: 32,

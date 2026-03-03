@@ -42,6 +42,12 @@
       ]
     },
     {
+      "name": "SetGameName",
+      "fields": [
+        { "name": "name", "type": "String" }
+      ]
+    },
+    {
       "name": "BindingDeclare",
       "fields": [
         { "name": "binding_id", "type": "u16" },
