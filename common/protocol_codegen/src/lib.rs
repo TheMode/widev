@@ -99,7 +99,9 @@ impl CodegenBackend for RustBackend {
         }
         out.push_str("}\n\n");
 
-        out.push_str("pub fn encode_c2s(packet: &C2SPacket) -> Result<Vec<u8>, bincode::Error> {\n");
+        out.push_str(
+            "pub fn encode_c2s(packet: &C2SPacket) -> Result<Vec<u8>, bincode::Error> {\n",
+        );
         out.push_str("    bincode::serialize(packet)\n");
         out.push_str("}\n\n");
 
@@ -107,7 +109,9 @@ impl CodegenBackend for RustBackend {
         out.push_str("    bincode::deserialize(bytes)\n");
         out.push_str("}\n\n");
 
-        out.push_str("pub fn encode_s2c(packet: &S2CPacket) -> Result<Vec<u8>, bincode::Error> {\n");
+        out.push_str(
+            "pub fn encode_s2c(packet: &S2CPacket) -> Result<Vec<u8>, bincode::Error> {\n",
+        );
         out.push_str("    bincode::serialize(packet)\n");
         out.push_str("}\n\n");
 

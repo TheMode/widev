@@ -11,6 +11,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 rcgen = { workspace = true }
+clap = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

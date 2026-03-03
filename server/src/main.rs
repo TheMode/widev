@@ -1,10 +1,10 @@
-use std::env;
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
 
@@ -37,13 +37,17 @@ struct Session {
     sent_bootstrap: bool,
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "widev-server")]
+struct Args {
+    /// Server bind address (IP:PORT)
+    #[arg(default_value = "127.0.0.1:4433")]
+    bind: SocketAddr,
+}
+
 fn main() -> Result<()> {
-    let bind_addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:4433".to_string());
-    let bind_addr: SocketAddr = bind_addr
-        .parse()
-        .with_context(|| format!("invalid bind address: {bind_addr}"))?;
+    let args = Args::parse();
+    let bind_addr = args.bind;
 
     let socket = UdpSocket::bind(bind_addr)
         .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
