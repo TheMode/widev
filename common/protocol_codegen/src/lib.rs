@@ -21,6 +21,8 @@ pub struct EnumDef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PacketDef {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub fields: Vec<FieldDef>,
 }
 

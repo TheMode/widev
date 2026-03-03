@@ -8,6 +8,7 @@
   "c2s": [
     {
       "name": "ClientHello",
+      "description": "Initial client metadata and advertised capabilities.",
       "fields": [
         { "name": "client_name", "type": "String" },
         { "name": "capabilities", "type": "Vec<String>" }
@@ -15,12 +16,14 @@
     },
     {
       "name": "BindingAssigned",
+      "description": "Client acknowledgement that a server binding has been mapped locally.",
       "fields": [
         { "name": "binding_id", "type": "u16" }
       ]
     },
     {
       "name": "InputValue",
+      "description": "Current input value for a declared binding identifier.",
       "fields": [
         { "name": "binding_id", "type": "u16" },
         { "name": "value", "type": "f32" }
@@ -30,12 +33,14 @@
   "s2c": [
     {
       "name": "ServerHello",
+      "description": "Basic server handshake information.",
       "fields": [
         { "name": "tick_rate_hz", "type": "u16" }
       ]
     },
     {
       "name": "AssetManifest",
+      "description": "Initial visual asset metadata for the current game session.",
       "fields": [
         { "name": "player_color_rgba", "type": "[u8; 4]" },
         { "name": "player_size", "type": "u16" }
@@ -43,12 +48,14 @@
     },
     {
       "name": "SetGameName",
+      "description": "Display name of the game/session for client UI.",
       "fields": [
         { "name": "name", "type": "String" }
       ]
     },
     {
       "name": "BindingDeclare",
+      "description": "Server-declared input binding definition that the client must map.",
       "fields": [
         { "name": "binding_id", "type": "u16" },
         { "name": "identifier", "type": "String" },
@@ -57,6 +64,7 @@
     },
     {
       "name": "WorldState",
+      "description": "Authoritative world snapshot for interpolation/rendering.",
       "fields": [
         { "name": "server_time_ms", "type": "u64" },
         { "name": "x", "type": "f32" },
