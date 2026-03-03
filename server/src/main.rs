@@ -45,6 +45,8 @@ struct PendingStreamWrite {
 }
 
 fn main() -> Result<()> {
+    init_logging();
+
     let args = Args::parse();
     let bind_addr = args.bind;
 
@@ -55,7 +57,7 @@ fn main() -> Result<()> {
         .context("failed to set UDP socket non-blocking")?;
 
     let local_addr = socket.local_addr().context("failed to read local addr")?;
-    println!("server listening on {local_addr}");
+    log::info!("server listening on {local_addr}");
 
     let cert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs");
     ensure_dev_certs(&cert_dir)?;
@@ -96,7 +98,7 @@ fn main() -> Result<()> {
                 };
                 if let Err(err) = session.conn.recv(&mut recv_buf[..len], recv_info) {
                     if err != quiche::Error::Done {
-                        eprintln!("conn.recv failed: {err:?}");
+                        log::warn!("conn.recv failed: {err:?}");
                     }
                 }
                 continue;
@@ -131,7 +133,7 @@ fn main() -> Result<()> {
             });
             game_state.connect_client(client_id);
             game.on_client_connected(&mut game_state, client_id);
-            println!("accepted connection from {from} as client {client_id}");
+            log::info!("accepted connection from {from} as client {client_id}");
         }
 
         let now = Instant::now();
@@ -183,6 +185,27 @@ fn main() -> Result<()> {
 
         std::thread::sleep(IDLE_SLEEP);
     }
+}
+
+fn init_logging() {
+    use std::io::Write;
+
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+    builder
+        .format(|buf, record| {
+            let ts = buf.timestamp_millis();
+            let (c0, c1) = match record.level() {
+                log::Level::Error => ("\x1b[31m", "\x1b[0m"),
+                log::Level::Warn => ("\x1b[33m", "\x1b[0m"),
+                log::Level::Info => ("\x1b[36m", "\x1b[0m"),
+                log::Level::Debug => ("\x1b[90m", "\x1b[0m"),
+                log::Level::Trace => ("\x1b[90m", "\x1b[0m"),
+            };
+            writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
+        })
+        .init();
 }
 
 fn pump_app_packets(
@@ -363,6 +386,6 @@ fn ensure_dev_certs(cert_dir: &PathBuf) -> Result<()> {
     fs::write(&key_path, key_pem)
         .with_context(|| format!("failed to write {}", key_path.display()))?;
 
-    println!("generated local dev certs in {}", cert_dir.display());
+    log::info!("generated local dev certs in {}", cert_dir.display());
     Ok(())
 }

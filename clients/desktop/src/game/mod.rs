@@ -92,12 +92,12 @@ impl ClientGame {
             if let Some(cert_der) = self.net.peer_cert_der() {
                 let fp = fingerprint_hex(&cert_der);
                 self.server_cert_fingerprint = Some(fp.clone());
-                println!("connected cert fingerprint: {fp}");
+                log::info!("connected cert fingerprint: {fp}");
                 let cached = self.binding_store.binding_count(&fp);
                 if cached == 0 {
-                    println!("no cached bindings for this server cert");
+                    log::info!("no cached bindings for this server cert");
                 } else {
-                    println!("found {cached} cached binding(s) for this server cert");
+                    log::info!("found {cached} cached binding(s) for this server cert");
                 }
             }
         }
@@ -125,7 +125,7 @@ impl ClientGame {
             };
             self.send_c2s(hello)?;
             self.sent_hello = true;
-            println!("connected to server {}", self.net.server_addr());
+            log::info!("connected to server {}", self.net.server_addr());
         }
 
         for element in self.elements.values_mut() {
@@ -172,13 +172,13 @@ impl ClientGame {
 
         self.activate_binding(definition.id, key);
 
-        println!("assigned '{}' -> {:?}", definition.identifier, key);
+        log::info!("assigned '{}' -> {:?}", definition.identifier, key);
         Ok(())
     }
 
     pub(super) fn skip_binding(&mut self) {
         if let Some(definition) = self.pending_bindings.pop_front() {
-            println!("skipped binding '{}'", definition.identifier);
+            log::info!("skipped binding '{}'", definition.identifier);
         }
         self.binding_suggestion = None;
     }
@@ -237,7 +237,7 @@ impl ClientGame {
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
-                println!("server tick rate: {tick_rate_hz}Hz");
+                log::info!("server tick rate: {tick_rate_hz}Hz");
             }
             protocol::S2CPacket::AssetManifest {
                 player_color_rgba,
@@ -254,7 +254,7 @@ impl ClientGame {
                 identifier,
                 input_type,
             } => {
-                println!("binding request: {identifier} ({input_type:?})");
+                log::info!("binding request: {identifier} ({input_type:?})");
 
                 if let Some(cert_fp) = &self.server_cert_fingerprint {
                     if let Some(saved_path) =
@@ -264,14 +264,15 @@ impl ClientGame {
                         {
                             self.send_binding_ack(binding_id)?;
                             self.activate_binding(binding_id, saved_key);
-                            println!(
+                            log::info!(
                                 "restored '{}' -> {:?} ({saved_path})",
-                                identifier, saved_key
+                                identifier,
+                                saved_key
                             );
                             return Ok(());
                         }
 
-                        println!(
+                        log::info!(
                             "cached binding for '{}' exists but is not compatible with this backend: {}",
                             identifier, saved_path
                         );

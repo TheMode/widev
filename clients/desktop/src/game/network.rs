@@ -25,12 +25,14 @@ pub(super) struct QuicClient {
 
 impl QuicClient {
     pub(super) fn connect(server_addr: SocketAddr) -> Result<Self> {
+        log::info!("connecting to server {server_addr}...");
         let socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
         socket
             .set_nonblocking(true)
             .context("failed to set UDP socket non-blocking")?;
 
         let local_addr = socket.local_addr().context("failed to get local addr")?;
+        log::info!("local UDP endpoint: {local_addr}");
 
         let mut config = build_client_quic_config()?;
 
@@ -46,6 +48,7 @@ impl QuicClient {
             &mut config,
         )
         .context("failed to create QUIC connection")?;
+        log::info!("QUIC connection object created, starting handshake...");
 
         let mut client = Self {
             socket,
@@ -94,7 +97,7 @@ impl QuicClient {
 
             if let Err(err) = self.conn.recv(&mut self.recv_buf[..len], recv_info) {
                 if err != quiche::Error::Done {
-                    eprintln!("client conn.recv error: {err:?}");
+                    log::warn!("client conn.recv error: {err:?}");
                 }
             }
         }

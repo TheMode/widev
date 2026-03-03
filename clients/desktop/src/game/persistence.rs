@@ -38,12 +38,12 @@ impl BindingStore {
         let data = match serde_json::from_str::<PersistedData>(&content) {
             Ok(data) => data,
             Err(err) => {
-                eprintln!(
+                log::warn!(
                     "failed to parse {}, resetting binding cache: {err}",
                     path.display()
                 );
                 if let Err(remove_err) = fs::remove_file(&path) {
-                    eprintln!(
+                    log::warn!(
                         "failed to delete corrupt bindings file {}: {remove_err}",
                         path.display()
                     );

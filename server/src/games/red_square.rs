@@ -141,7 +141,7 @@ impl Game for RedSquareGame {
             y: element.y,
         });
 
-        println!("client {client_id} connected");
+        log::info!("client {client_id} connected");
     }
 
     fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId) {
@@ -151,7 +151,7 @@ impl Game for RedSquareGame {
             element_id: client_id,
         });
 
-        println!("client {client_id} disconnected");
+        log::info!("client {client_id} disconnected");
     }
 
     fn on_client_packet(&mut self, _state: &mut GameState, client_id: ClientId, packet: C2SPacket) {
@@ -160,10 +160,10 @@ impl Game for RedSquareGame {
                 client_name,
                 capabilities,
             } => {
-                println!("client {client_id} hello: {client_name} / {capabilities:?}");
+                log::info!("client {client_id} hello: {client_name} / {capabilities:?}");
             }
             C2SPacket::BindingAssigned { binding_id } => {
-                println!("client {client_id} binding {binding_id} acknowledged");
+                log::info!("client {client_id} binding {binding_id} acknowledged");
             }
             C2SPacket::InputValue { binding_id, value } => {
                 let pressed = value >= 0.5;
