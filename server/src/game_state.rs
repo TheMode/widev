@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use crate::game::ClientId;
-use crate::packets::{PacketBundle, PacketPayload, PacketMeta, PacketTarget, S2CPacket, StreamID};
+use crate::packets::{PacketEnvelope, PacketMeta, PacketPayload, PacketTarget, S2CPacket, StreamID};
 
 #[derive(Clone)]
 pub struct StreamPacket {
@@ -51,22 +51,22 @@ impl GameState {
         self.clients.remove(&client_id);
     }
 
-    pub fn send(&mut self, target: PacketTarget, payload: PacketPayload) {
-        let bundle = match payload {
-            PacketPayload::Single(packet) => PacketBundle::single(packet),
+    pub fn send(&mut self, envelope: PacketEnvelope) {
+        let packets = match envelope.payload {
+            PacketPayload::Single(packet) => vec![packet],
             PacketPayload::Bundle(bundle) => bundle,
         };
-        let meta = bundle.meta.unwrap_or_default();
-        match target {
+        let meta = envelope.meta.unwrap_or_default();
+        match envelope.target {
             PacketTarget::Client(client_id) => {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return;
                 };
-                Self::enqueue_packets(client, bundle.packets, meta);
+                Self::enqueue_packets(client, packets, meta);
             },
             PacketTarget::Broadcast => {
                 for client in self.clients.values_mut() {
-                    Self::enqueue_packets(client, bundle.packets.iter().cloned(), meta);
+                    Self::enqueue_packets(client, packets.iter().cloned(), meta);
                 }
             },
             PacketTarget::BroadcastExcept(excluded_client_id) => {
@@ -74,7 +74,7 @@ impl GameState {
                     if client_id == excluded_client_id {
                         continue;
                     }
-                    Self::enqueue_packets(client, bundle.packets.iter().cloned(), meta);
+                    Self::enqueue_packets(client, packets.iter().cloned(), meta);
                 }
             },
         }

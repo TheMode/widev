@@ -10,11 +10,7 @@ pub struct PacketMeta {
     pub stream_id: Option<StreamID>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct PacketBundle {
-    pub meta: Option<PacketMeta>,
-    pub packets: Vec<S2CPacket>,
-}
+pub type PacketBundle = Vec<S2CPacket>;
 
 #[derive(Clone, Copy)]
 pub enum PacketTarget {
@@ -29,27 +25,9 @@ pub enum PacketPayload {
     Bundle(PacketBundle),
 }
 
-impl PacketBundle {
-    pub fn new(meta: PacketMeta) -> Self {
-        Self { meta: Some(meta), packets: Vec::new() }
-    }
-
-    pub fn single(packet: S2CPacket) -> Self {
-        Self { meta: None, packets: vec![packet] }
-    }
-
-    pub fn with_meta(meta: PacketMeta, packets: Vec<S2CPacket>) -> Self {
-        Self { meta: Some(meta), packets }
-    }
-
-    pub fn push(&mut self, packet: S2CPacket) {
-        self.packets.push(packet);
-    }
-
-    pub fn extend<I>(&mut self, packets: I)
-    where
-        I: IntoIterator<Item = S2CPacket>,
-    {
-        self.packets.extend(packets);
-    }
+#[derive(Clone)]
+pub struct PacketEnvelope {
+    pub target: PacketTarget,
+    pub payload: PacketPayload,
+    pub meta: Option<PacketMeta>,
 }

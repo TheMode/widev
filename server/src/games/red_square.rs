@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game};
 use crate::game_state::GameState;
 use crate::packets::{
-    C2SPacket, InputType, PacketBundle, PacketPayload, PacketMeta, PacketTarget, PredictionKind,
-    S2CPacket, StreamID, TransformPredictionMask,
+    C2SPacket, InputType, PacketBundle, PacketEnvelope, PacketMeta, PacketPayload, PacketTarget,
+    PredictionKind, S2CPacket, StreamID, TransformPredictionMask,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -53,19 +53,16 @@ impl RedSquareGame {
         };
         let stream_id = player.control_stream_id;
 
-        let mut bundle = PacketBundle::with_meta(
-            PacketMeta { optional: false, stream_id: Some(stream_id) },
-            vec![
-                S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
-                S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
-                S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
-                S2CPacket::SurfaceClearBackground {
-                    surface_id: 1,
-                    color: [0.18, 0.02, 250.0, 1.0],
-                },
-                S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
-            ],
-        );
+        let mut bundle = vec![
+            S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
+            S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
+            S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
+            S2CPacket::SurfaceClearBackground {
+                surface_id: 1,
+                color: [0.18, 0.02, 250.0, 1.0],
+            },
+            S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
+        ];
 
         let binding_packets =
             [(1, "move_up"), (2, "move_down"), (3, "move_left"), (4, "move_right")]
@@ -77,7 +74,11 @@ impl RedSquareGame {
                 });
         bundle.extend(binding_packets);
 
-        state.send(PacketTarget::Client(client_id), PacketPayload::Bundle(bundle));
+        state.send(PacketEnvelope {
+            target: PacketTarget::Client(client_id),
+            payload: PacketPayload::Bundle(bundle),
+            meta: Some(PacketMeta { optional: false, stream_id: Some(stream_id) }),
+        });
     }
 }
 
@@ -93,7 +94,7 @@ impl Game for RedSquareGame {
         self.send_bootstrap(state, client_id);
 
         let snapshots: Vec<ClientId> = self.players.keys().copied().collect();
-        let mut snapshot_bundle = PacketBundle::default();
+        let mut snapshot_bundle: PacketBundle = Vec::new();
         for element_id in snapshots {
             snapshot_bundle.push(S2CPacket::ElementAdd { element_id });
             snapshot_bundle.push(S2CPacket::ElementSetTransformPrediction {
@@ -103,11 +104,15 @@ impl Game for RedSquareGame {
                 kind: PredictionKind::Interpolation,
             });
         }
-        if !snapshot_bundle.packets.is_empty() {
-            state.send(PacketTarget::Client(client_id), PacketPayload::Bundle(snapshot_bundle));
+        if !snapshot_bundle.is_empty() {
+            state.send(PacketEnvelope {
+                target: PacketTarget::Client(client_id),
+                payload: PacketPayload::Bundle(snapshot_bundle),
+                meta: None,
+            });
         }
 
-        let mut bundle = PacketBundle::default();
+        let mut bundle: PacketBundle = Vec::new();
         bundle.extend([
             S2CPacket::ElementAdd { element_id: client_id },
             S2CPacket::ElementSetTransformPrediction {
@@ -117,7 +122,11 @@ impl Game for RedSquareGame {
                 kind: PredictionKind::Interpolation,
             },
         ]);
-        state.send(PacketTarget::BroadcastExcept(client_id), PacketPayload::Bundle(bundle));
+        state.send(PacketEnvelope {
+            target: PacketTarget::BroadcastExcept(client_id),
+            payload: PacketPayload::Bundle(bundle),
+            meta: None,
+        });
 
         log::info!("client {client_id} connected");
     }
@@ -125,10 +134,11 @@ impl Game for RedSquareGame {
     fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId) {
         self.players.remove(&client_id);
 
-        state.send(
-            PacketTarget::Broadcast,
-            PacketPayload::Single(S2CPacket::ElementRemove { element_id: client_id }),
-        );
+        state.send(PacketEnvelope {
+            target: PacketTarget::Broadcast,
+            payload: PacketPayload::Single(S2CPacket::ElementRemove { element_id: client_id }),
+            meta: None,
+        });
 
         log::info!("client {client_id} disconnected");
     }
@@ -183,14 +193,18 @@ impl Game for RedSquareGame {
                 (player.element.y + dy * PLAYER_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT);
         }
 
-        let mut bundle = PacketBundle::new(PacketMeta { optional: true, stream_id: None });
+        let mut bundle: PacketBundle = Vec::new();
         bundle.extend(self.players.iter().map(|(element_id, player)| S2CPacket::ElementMove {
             element_id: *element_id,
             x: player.element.x,
             y: player.element.y,
         }));
-        if !bundle.packets.is_empty() {
-            state.send(PacketTarget::Broadcast, PacketPayload::Bundle(bundle));
+        if !bundle.is_empty() {
+            state.send(PacketEnvelope {
+                target: PacketTarget::Broadcast,
+                payload: PacketPayload::Bundle(bundle),
+                meta: Some(PacketMeta { optional: true, stream_id: None }),
+            });
         }
     }
 }
