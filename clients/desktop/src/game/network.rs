@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::net::{SocketAddr, UdpSocket};
 
 use anyhow::{Context, Result};
@@ -140,8 +140,17 @@ impl QuicClient {
     }
 
     fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
-        let state = self.stream_states.entry(stream_id).or_default();
+        let state = match self.stream_states.entry(stream_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                log::debug!("client stream {} created (rx)", stream_id);
+                entry.insert(QuicStreamState::default())
+            },
+        };
         state.recv_buffer.extend_from_slice(bytes);
+        if fin && !state.recv_finished {
+            log::debug!("client stream {} received FIN", stream_id);
+        }
         state.recv_finished |= fin;
 
         let mut frames = Vec::new();
@@ -162,6 +171,7 @@ impl QuicClient {
         };
         if should_remove {
             self.stream_states.remove(&stream_id);
+            log::debug!("client stream {} cleaned up", stream_id);
         }
     }
 

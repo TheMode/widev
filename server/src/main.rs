@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -50,9 +50,37 @@ struct QuicStreamState {
 }
 
 impl Session {
+    fn stream_state_mut(&mut self, stream_id: u64, direction: &str) -> &mut QuicStreamState {
+        match self.streams.entry(stream_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                log::debug!(
+                    "server stream {} created for client {} ({direction})",
+                    stream_id,
+                    self.client_id
+                );
+                entry.insert(QuicStreamState::default())
+            },
+        }
+    }
+
+    fn requeue_pending_write(&mut self, stream_id: u64, chunk: PendingStreamWrite) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.pending_writes.push_front(chunk);
+        }
+    }
+
     fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
-        let state = self.streams.entry(stream_id).or_default();
+        let client_id = self.client_id;
+        let state = self.stream_state_mut(stream_id, "rx");
         state.recv_buffer.extend_from_slice(bytes);
+        if fin && !state.recv_finished {
+            log::debug!(
+                "server stream {} received FIN from client {}",
+                stream_id,
+                client_id
+            );
+        }
         state.recv_finished |= fin;
 
         let mut frames = Vec::new();
@@ -77,11 +105,8 @@ impl Session {
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(&payload);
 
-        self.streams
-            .entry(stream_id)
-            .or_default()
-            .pending_writes
-            .push_back(PendingStreamWrite { data: framed, offset: 0 });
+        let state = self.stream_state_mut(stream_id, "tx");
+        state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
     }
 
     fn flush_stream_writes(&mut self) -> Result<()> {
@@ -100,16 +125,12 @@ impl Session {
                     Ok(written) => {
                         chunk.offset += written;
                         if chunk.offset < chunk.data.len() {
-                            if let Some(state) = self.streams.get_mut(&stream_id) {
-                                state.pending_writes.push_front(chunk);
-                            }
+                            self.requeue_pending_write(stream_id, chunk);
                             break;
                         }
                     },
                     Err(quiche::Error::Done) => {
-                        if let Some(state) = self.streams.get_mut(&stream_id) {
-                            state.pending_writes.push_front(chunk);
-                        }
+                        self.requeue_pending_write(stream_id, chunk);
                         break;
                     },
                     Err(err) => return Err(anyhow::anyhow!("stream_send failed: {err:?}")),
@@ -132,6 +153,11 @@ impl Session {
         };
         if should_remove {
             self.streams.remove(&stream_id);
+            log::debug!(
+                "server stream {} cleaned up for client {}",
+                stream_id,
+                self.client_id
+            );
         }
     }
 }

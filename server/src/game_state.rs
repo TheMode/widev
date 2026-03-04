@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use crate::game::ClientId;
-use crate::packets::{PacketBundle, PacketMessage, PacketTarget, S2CPacket, StreamID};
+use crate::packets::{PacketBundle, PacketMessage, PacketMeta, PacketTarget, S2CPacket, StreamID};
 
 #[derive(Clone)]
 pub struct StreamPacket {
@@ -51,72 +51,49 @@ impl GameState {
         self.clients.remove(&client_id);
     }
 
-    pub fn connected_clients(&self) -> Vec<ClientId> {
-        self.clients.keys().copied().collect()
-    }
-
     pub fn send(&mut self, target: PacketTarget, message: PacketMessage) {
         let bundle = match message {
             PacketMessage::Packet(packet) => PacketBundle::single(packet),
             PacketMessage::Bundle(bundle) => bundle,
         };
+        let meta = bundle.meta.unwrap_or_default();
         match target {
             PacketTarget::Client(client_id) => {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return;
                 };
-                let meta = bundle.meta.unwrap_or_default();
-                for packet in bundle.packets {
-                    if meta.optional {
-                        client.datagram_outbox.push_back(packet);
-                        continue;
-                    }
-                    let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                    client.stream_outbox.push_back(StreamPacket { stream_id, packet });
-                }
+                Self::enqueue_packets(client, bundle.packets, meta);
             },
             PacketTarget::Broadcast => {
-                let meta = bundle.meta.unwrap_or_default();
-                for client_id in self.connected_clients() {
-                    let Some(client) = self.clients.get_mut(&client_id) else {
-                        continue;
-                    };
-                    for packet in &bundle.packets {
-                        if meta.optional {
-                            client.datagram_outbox.push_back(packet.clone());
-                            continue;
-                        }
-                        let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                        client.stream_outbox.push_back(StreamPacket {
-                            stream_id,
-                            packet: packet.clone(),
-                        });
-                    }
+                for client in self.clients.values_mut() {
+                    Self::enqueue_packets(client, bundle.packets.iter().cloned(), meta);
                 }
             },
             PacketTarget::BroadcastExcept(excluded_client_id) => {
-                let meta = bundle.meta.unwrap_or_default();
-                for client_id in self.connected_clients() {
+                for (&client_id, client) in self.clients.iter_mut() {
                     if client_id == excluded_client_id {
                         continue;
                     }
-                    let Some(client) = self.clients.get_mut(&client_id) else {
-                        continue;
-                    };
-                    for packet in &bundle.packets {
-                        if meta.optional {
-                            client.datagram_outbox.push_back(packet.clone());
-                            continue;
-                        }
-                        let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                        client.stream_outbox.push_back(StreamPacket {
-                            stream_id,
-                            packet: packet.clone(),
-                        });
-                    }
+                    Self::enqueue_packets(client, bundle.packets.iter().cloned(), meta);
                 }
             },
         }
+    }
+
+    fn enqueue_packets<I>(client: &mut ClientState, packets: I, meta: PacketMeta)
+    where
+        I: IntoIterator<Item = S2CPacket>,
+    {
+        if meta.optional {
+            client.datagram_outbox.extend(packets);
+            return;
+        }
+
+        let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+        client.stream_outbox.extend(packets.into_iter().map(|packet| StreamPacket {
+            stream_id,
+            packet,
+        }));
     }
 
     pub fn create_stream(&mut self, client_id: ClientId) -> Option<StreamID> {
