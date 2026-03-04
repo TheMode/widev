@@ -65,37 +65,37 @@ impl GameState {
                 let Some(client) = self.clients.get_mut(&client_id) else {
                     return;
                 };
+                let meta = bundle.meta.unwrap_or_default();
                 for packet in bundle.packets {
-                    let meta = packet.meta.or(bundle.meta).unwrap_or_default();
                     if meta.optional {
-                        client.datagram_outbox.push_back(packet.packet);
+                        client.datagram_outbox.push_back(packet);
                         continue;
                     }
                     let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                    client
-                        .stream_outbox
-                        .push_back(StreamPacket { stream_id, packet: packet.packet });
+                    client.stream_outbox.push_back(StreamPacket { stream_id, packet });
                 }
             },
             PacketTarget::Broadcast => {
+                let meta = bundle.meta.unwrap_or_default();
                 for client_id in self.connected_clients() {
                     let Some(client) = self.clients.get_mut(&client_id) else {
                         continue;
                     };
                     for packet in &bundle.packets {
-                        let meta = packet.meta.or(bundle.meta).unwrap_or_default();
                         if meta.optional {
-                            client.datagram_outbox.push_back(packet.packet.clone());
+                            client.datagram_outbox.push_back(packet.clone());
                             continue;
                         }
                         let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                        client
-                            .stream_outbox
-                            .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
+                        client.stream_outbox.push_back(StreamPacket {
+                            stream_id,
+                            packet: packet.clone(),
+                        });
                     }
                 }
             },
             PacketTarget::BroadcastExcept(excluded_client_id) => {
+                let meta = bundle.meta.unwrap_or_default();
                 for client_id in self.connected_clients() {
                     if client_id == excluded_client_id {
                         continue;
@@ -104,15 +104,15 @@ impl GameState {
                         continue;
                     };
                     for packet in &bundle.packets {
-                        let meta = packet.meta.or(bundle.meta).unwrap_or_default();
                         if meta.optional {
-                            client.datagram_outbox.push_back(packet.packet.clone());
+                            client.datagram_outbox.push_back(packet.clone());
                             continue;
                         }
                         let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                        client
-                            .stream_outbox
-                            .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
+                        client.stream_outbox.push_back(StreamPacket {
+                            stream_id,
+                            packet: packet.clone(),
+                        });
                     }
                 }
             },

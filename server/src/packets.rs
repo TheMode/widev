@@ -10,16 +10,10 @@ pub struct PacketMeta {
     pub stream_id: Option<StreamID>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PacketWithMeta {
-    pub packet: S2CPacket,
-    pub meta: Option<PacketMeta>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct PacketBundle {
     pub meta: Option<PacketMeta>,
-    pub packets: Vec<PacketWithMeta>,
+    pub packets: Vec<S2CPacket>,
 }
 
 #[derive(Clone, Copy)]
@@ -41,32 +35,21 @@ impl PacketBundle {
     }
 
     pub fn single(packet: S2CPacket) -> Self {
-        Self { meta: None, packets: vec![PacketWithMeta { packet, meta: None }] }
+        Self { meta: None, packets: vec![packet] }
     }
 
     pub fn with_meta(meta: PacketMeta, packets: Vec<S2CPacket>) -> Self {
-        Self {
-            meta: Some(meta),
-            packets: packets
-                .into_iter()
-                .map(|packet| PacketWithMeta { packet, meta: None })
-                .collect(),
-        }
+        Self { meta: Some(meta), packets }
     }
 
     pub fn push(&mut self, packet: S2CPacket) {
-        self.packets.push(PacketWithMeta { packet, meta: None });
+        self.packets.push(packet);
     }
 
     pub fn extend<I>(&mut self, packets: I)
     where
         I: IntoIterator<Item = S2CPacket>,
     {
-        self.packets
-            .extend(packets.into_iter().map(|packet| PacketWithMeta { packet, meta: None }));
-    }
-
-    pub fn push_with_meta(&mut self, packet: S2CPacket, meta: PacketMeta) {
-        self.packets.push(PacketWithMeta { packet, meta: Some(meta) });
+        self.packets.extend(packets);
     }
 }
