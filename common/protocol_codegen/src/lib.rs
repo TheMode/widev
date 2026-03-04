@@ -19,6 +19,8 @@ pub struct Schema {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TypedefDef {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(rename = "type")]
     pub ty: String,
 }

@@ -2,14 +2,17 @@
   "typedefs": [
     {
       "name": "ElementId",
+      "description": "Unique identifier for world elements/entities.",
       "type": "u32"
     },
     {
       "name": "SurfaceId",
+      "description": "Unique identifier for a client surface/window.",
       "type": "u32"
     },
     {
       "name": "Color",
+      "description": "OKLCH + alpha packed as [L, C, H_degrees, A].",
       "type": "[f32; 4]"
     }
   ],
