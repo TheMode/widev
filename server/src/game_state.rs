@@ -60,37 +60,62 @@ impl GameState {
             PacketMessage::Packet(packet) => PacketBundle::single(packet),
             PacketMessage::Bundle(bundle) => bundle,
         };
-        if let PacketTarget::Client(client_id) = target {
-            let Some(client) = self.clients.get_mut(&client_id) else {
-                return;
-            };
-            for packet in bundle.packets {
-                let meta = packet.meta.or(bundle.meta).unwrap_or_default();
-                if meta.optional {
-                    client.datagram_outbox.push_back(packet.packet);
-                    continue;
+        match target {
+            PacketTarget::Client(client_id) => {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return;
+                };
+                for packet in bundle.packets {
+                    let meta = packet.meta.or(bundle.meta).unwrap_or_default();
+                    if meta.optional {
+                        client.datagram_outbox.push_back(packet.packet);
+                        continue;
+                    }
+                    let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+                    client
+                        .stream_outbox
+                        .push_back(StreamPacket { stream_id, packet: packet.packet });
                 }
-                let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                client.stream_outbox.push_back(StreamPacket { stream_id, packet: packet.packet });
-            }
-            return;
-        }
-
-        for client_id in self.connected_clients() {
-            let Some(client) = self.clients.get_mut(&client_id) else {
-                continue;
-            };
-            for packet in &bundle.packets {
-                let meta = packet.meta.or(bundle.meta).unwrap_or_default();
-                if meta.optional {
-                    client.datagram_outbox.push_back(packet.packet.clone());
-                    continue;
+            },
+            PacketTarget::Broadcast => {
+                for client_id in self.connected_clients() {
+                    let Some(client) = self.clients.get_mut(&client_id) else {
+                        continue;
+                    };
+                    for packet in &bundle.packets {
+                        let meta = packet.meta.or(bundle.meta).unwrap_or_default();
+                        if meta.optional {
+                            client.datagram_outbox.push_back(packet.packet.clone());
+                            continue;
+                        }
+                        let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+                        client
+                            .stream_outbox
+                            .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
+                    }
                 }
-                let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
-                client
-                    .stream_outbox
-                    .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
-            }
+            },
+            PacketTarget::BroadcastExcept(excluded_client_id) => {
+                for client_id in self.connected_clients() {
+                    if client_id == excluded_client_id {
+                        continue;
+                    }
+                    let Some(client) = self.clients.get_mut(&client_id) else {
+                        continue;
+                    };
+                    for packet in &bundle.packets {
+                        let meta = packet.meta.or(bundle.meta).unwrap_or_default();
+                        if meta.optional {
+                            client.datagram_outbox.push_back(packet.packet.clone());
+                            continue;
+                        }
+                        let stream_id = meta.stream_id.unwrap_or(Self::DEFAULT_RELIABLE_STREAM_ID);
+                        client
+                            .stream_outbox
+                            .push_back(StreamPacket { stream_id, packet: packet.packet.clone() });
+                    }
+                }
+            },
         }
     }
 

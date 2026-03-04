@@ -238,7 +238,6 @@ pub(super) enum DeclareBindingOutcome {
     Restored {
         binding_id: u16,
         input: InputPath,
-        saved_path: String,
         identifier: String,
     },
     Pending,
@@ -348,7 +347,6 @@ impl BindingState {
                     return DeclareBindingOutcome::Restored {
                         binding_id,
                         input: saved_input,
-                        saved_path,
                         identifier,
                     };
                 }

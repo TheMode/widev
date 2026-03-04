@@ -117,7 +117,7 @@ impl Game for RedSquareGame {
                 kind: PredictionKind::Interpolation,
             },
         ]);
-        state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
+        state.send(PacketTarget::BroadcastExcept(client_id), PacketMessage::Bundle(bundle));
 
         log::info!("client {client_id} connected");
     }

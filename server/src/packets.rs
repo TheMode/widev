@@ -26,6 +26,7 @@ pub struct PacketBundle {
 pub enum PacketTarget {
     Client(ClientId),
     Broadcast,
+    BroadcastExcept(ClientId),
 }
 
 #[derive(Clone)]

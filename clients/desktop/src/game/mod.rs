@@ -15,6 +15,13 @@ mod renderer;
 const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
+const CLIENT_CAPABILITIES: &[&str] = &[
+    "render.draw_square",
+    "prediction.lerp",
+    "input.dynamic_bindings",
+    "input.persist_by_cert",
+    "render.surfaces",
+];
 
 pub struct GameConfig {
     pub server_addr: SocketAddr,
@@ -76,6 +83,63 @@ impl PredictionConfig {
     }
 }
 
+impl ElementState {
+    fn hidden(now: Instant, prediction: PredictionConfig) -> Self {
+        Self {
+            visible: false,
+            last_authoritative: Vec2f::default(),
+            last_authoritative_at: now,
+            target: Vec2f::default(),
+            draw: Vec2f::default(),
+            velocity: Vec2f::default(),
+            prediction,
+        }
+    }
+
+    fn set_position_immediate(&mut self, position: Vec2f, now: Instant) {
+        self.visible = true;
+        self.last_authoritative = position;
+        self.last_authoritative_at = now;
+        self.target = position;
+        self.draw = position;
+        self.velocity = Vec2f::default();
+    }
+
+    fn apply_authoritative_move(&mut self, position: Vec2f, now: Instant) {
+        let dt_seconds =
+            now.duration_since(self.last_authoritative_at).as_secs_f32().max(f32::EPSILON);
+        self.velocity.x = (position.x - self.last_authoritative.x) / dt_seconds;
+        self.velocity.y = (position.y - self.last_authoritative.y) / dt_seconds;
+        self.last_authoritative = position;
+        self.last_authoritative_at = now;
+        self.target = position;
+        self.visible = true;
+    }
+
+    fn tick_prediction(&mut self) {
+        let prediction = self.prediction;
+        if !prediction.affects_translation() {
+            self.draw = self.target;
+            return;
+        }
+
+        match prediction.kind {
+            protocol::PredictionKind::Interpolation => {
+                self.draw.x += (self.target.x - self.draw.x) * LERP_ALPHA;
+                self.draw.y += (self.target.y - self.draw.y) * LERP_ALPHA;
+            },
+            protocol::PredictionKind::Extrapolation => {
+                let predicted_x = self.draw.x + self.velocity.x * FIXED_FRAME_DT_SECONDS;
+                let predicted_y = self.draw.y + self.velocity.y * FIXED_FRAME_DT_SECONDS;
+                self.draw.x =
+                    predicted_x + (self.target.x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
+                self.draw.y =
+                    predicted_y + (self.target.y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
+            },
+        }
+    }
+}
+
 pub(super) struct ClientGame {
     net: network::QuicClient,
     sent_hello: bool,
@@ -110,26 +174,9 @@ impl ClientGame {
     pub(super) fn tick_network(&mut self) -> Result<()> {
         let incoming = self.net.poll()?;
 
-        if self.server_cert_fingerprint.is_none() {
-            if let Some(cert_der) = self.net.peer_cert_der() {
-                let fp = fingerprint_hex(&cert_der);
-                self.server_cert_fingerprint = Some(fp.clone());
-                log::info!("connected cert fingerprint: {fp}");
-                let cached = self.bindings.binding_count(&fp);
-                if cached == 0 {
-                    log::info!("no cached bindings for this server cert");
-                } else {
-                    log::info!("found {cached} cached binding(s) for this server cert");
-                }
-            }
-        }
+        self.ensure_server_identity_logged();
 
-        for bytes in incoming.datagrams {
-            if let Ok(packet) = protocol::decode_s2c(&bytes) {
-                self.handle_server_packet(packet)?;
-            }
-        }
-        for bytes in incoming.streams {
+        for bytes in incoming.datagrams.into_iter().chain(incoming.streams) {
             if let Ok(packet) = protocol::decode_s2c(&bytes) {
                 self.handle_server_packet(packet)?;
             }
@@ -138,13 +185,10 @@ impl ClientGame {
         if self.net.is_established() && !self.sent_hello {
             let hello = protocol::C2SPacket::ClientHello {
                 client_name: "desktop-client".to_string(),
-                capabilities: vec![
-                    "render.draw_square".to_string(),
-                    "prediction.lerp".to_string(),
-                    "input.dynamic_bindings".to_string(),
-                    "input.persist_by_cert".to_string(),
-                    "render.surfaces".to_string(),
-                ],
+                capabilities: CLIENT_CAPABILITIES
+                    .iter()
+                    .map(|capability| (*capability).to_string())
+                    .collect(),
             };
             self.send_c2s(hello)?;
             self.sent_hello = true;
@@ -152,26 +196,7 @@ impl ClientGame {
         }
 
         for element in self.elements.values_mut() {
-            let prediction = element.prediction;
-            if !prediction.affects_translation() {
-                element.draw = element.target;
-                continue;
-            }
-
-            match prediction.kind {
-                protocol::PredictionKind::Interpolation => {
-                    element.draw.x += (element.target.x - element.draw.x) * LERP_ALPHA;
-                    element.draw.y += (element.target.y - element.draw.y) * LERP_ALPHA;
-                },
-                protocol::PredictionKind::Extrapolation => {
-                    let predicted_x = element.draw.x + element.velocity.x * FIXED_FRAME_DT_SECONDS;
-                    let predicted_y = element.draw.y + element.velocity.y * FIXED_FRAME_DT_SECONDS;
-                    element.draw.x = predicted_x
-                        + (element.target.x - predicted_x) * PREDICTION_CORRECTION_ALPHA;
-                    element.draw.y = predicted_y
-                        + (element.target.y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
-                },
-            }
+            element.tick_prediction();
         }
 
         Ok(())
@@ -262,6 +287,160 @@ impl ClientGame {
         self.surfaces.get(&surface_id).copied().unwrap_or_default()
     }
 
+    fn ensure_server_identity_logged(&mut self) {
+        if self.server_cert_fingerprint.is_some() {
+            return;
+        }
+        let Some(cert_der) = self.net.peer_cert_der() else {
+            return;
+        };
+
+        let fp = fingerprint_hex(&cert_der);
+        self.server_cert_fingerprint = Some(fp.clone());
+        log::info!("connected cert fingerprint: {fp}");
+        let cached = self.bindings.binding_count(&fp);
+        if cached == 0 {
+            log::info!("no cached bindings for this server cert");
+        } else {
+            log::info!("found {cached} cached binding(s) for this server cert");
+        }
+    }
+
+    fn surface_state_mut(&mut self, surface_id: protocol::SurfaceId) -> &mut SurfaceState {
+        self.surfaces.entry(surface_id).or_default()
+    }
+
+    fn apply_surface_dimension_lock(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        width: u32,
+        height: u32,
+    ) {
+        let state = self.surface_state_mut(surface_id);
+        if width == 0 || height == 0 {
+            state.dimension_lock = None;
+            log::info!("surface {surface_id} dimension lock removed");
+            return;
+        }
+        state.dimension_lock = Some((width, height));
+        log::info!("surface {surface_id} dimension lock: {}x{}", width, height);
+    }
+
+    fn apply_surface_aspect_ratio_lock(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        numerator: u32,
+        denominator: u32,
+    ) {
+        let state = self.surface_state_mut(surface_id);
+        if numerator == 0 || denominator == 0 {
+            state.aspect_ratio_lock = None;
+            log::info!("surface {surface_id} aspect-ratio lock removed");
+            return;
+        }
+        state.aspect_ratio_lock = Some((numerator, denominator));
+        log::info!("surface {surface_id} aspect-ratio lock: {}/{}", numerator, denominator);
+    }
+
+    fn apply_surface_clear_background(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        color: protocol::Color,
+    ) {
+        self.surface_state_mut(surface_id).clear_background = Some(color);
+        log::info!(
+            "surface {surface_id} background clear color (oklch): [{:.3}, {:.3}, {:.2}, {:.3}]",
+            color[0],
+            color[1],
+            color[2],
+            color[3]
+        );
+    }
+
+    fn apply_transform_prediction(
+        &mut self,
+        element_id: u32,
+        enabled: bool,
+        affected_mask: protocol::TransformPredictionMask,
+        kind: protocol::PredictionKind,
+    ) {
+        let config = PredictionConfig { enabled, affected_mask, kind };
+        let changed = if let Some(element) = self.elements.get_mut(&element_id) {
+            let changed = element.prediction.enabled != config.enabled
+                || element.prediction.kind != config.kind
+                || element.prediction.affected_mask.bits() != config.affected_mask.bits();
+            element.prediction = config;
+            changed
+        } else {
+            let changed = self
+                .pending_prediction
+                .get(&element_id)
+                .map(|prev| {
+                    prev.enabled != config.enabled
+                        || prev.kind != config.kind
+                        || prev.affected_mask.bits() != config.affected_mask.bits()
+                })
+                .unwrap_or(true);
+            self.pending_prediction.insert(element_id, config);
+            changed
+        };
+
+        if changed {
+            log::info!(
+                "transform prediction for element {}: enabled={}, affected_mask={:#010b}, kind={:?}",
+                element_id,
+                enabled,
+                affected_mask.bits(),
+                kind
+            );
+        } else {
+            log::debug!("ignored duplicate transform prediction for element {}", element_id);
+        }
+    }
+
+    fn handle_binding_declare(
+        &mut self,
+        binding_id: u16,
+        identifier: String,
+        input_type: protocol::InputType,
+    ) -> Result<()> {
+        log::debug!("binding request: {identifier} ({input_type:?})");
+        match self.bindings.declare_binding(
+            self.server_cert_fingerprint.as_deref(),
+            binding_id,
+            identifier,
+            input_type,
+        ) {
+            DeclareBindingOutcome::Restored { binding_id, input, identifier } => {
+                self.send_binding_ack(binding_id)?;
+                log::debug!("restored '{}' -> {}", identifier, input);
+            },
+            DeclareBindingOutcome::Pending => {},
+        }
+        Ok(())
+    }
+
+    fn handle_element_add(&mut self, element_id: u32) {
+        let now = Instant::now();
+        let prediction =
+            self.pending_prediction.remove(&element_id).unwrap_or(self.default_prediction);
+        self.elements.entry(element_id).or_insert_with(|| ElementState::hidden(now, prediction));
+    }
+
+    fn handle_element_move(&mut self, element_id: u32, x: f32, y: f32) {
+        let Some(element) = self.elements.get_mut(&element_id) else {
+            log::debug!("ignored ElementMove for unknown element_id={element_id}");
+            return;
+        };
+        let now = Instant::now();
+        let position = Vec2f { x, y };
+        if !element.visible {
+            element.set_position_immediate(position, now);
+            return;
+        }
+        element.apply_authoritative_move(position, now);
+    }
+
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
@@ -275,39 +454,13 @@ impl ClientGame {
                 self.game_name = name;
             },
             protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
-                let state = self.surfaces.entry(surface_id).or_default();
-                if width == 0 || height == 0 {
-                    state.dimension_lock = None;
-                    log::info!("surface {surface_id} dimension lock removed");
-                } else {
-                    state.dimension_lock = Some((width, height));
-                    log::info!("surface {surface_id} dimension lock: {}x{}", width, height);
-                }
+                self.apply_surface_dimension_lock(surface_id, width, height);
             },
             protocol::S2CPacket::SurfaceLockAspectRatio { surface_id, numerator, denominator } => {
-                let state = self.surfaces.entry(surface_id).or_default();
-                if numerator == 0 || denominator == 0 {
-                    state.aspect_ratio_lock = None;
-                    log::info!("surface {surface_id} aspect-ratio lock removed");
-                } else {
-                    state.aspect_ratio_lock = Some((numerator, denominator));
-                    log::info!(
-                        "surface {surface_id} aspect-ratio lock: {}/{}",
-                        numerator,
-                        denominator
-                    );
-                }
+                self.apply_surface_aspect_ratio_lock(surface_id, numerator, denominator);
             },
             protocol::S2CPacket::SurfaceClearBackground { surface_id, color } => {
-                let state = self.surfaces.entry(surface_id).or_default();
-                state.clear_background = Some(color);
-                log::info!(
-                    "surface {surface_id} background clear color (oklch): [{:.3}, {:.3}, {:.2}, {:.3}]",
-                    color[0],
-                    color[1],
-                    color[2],
-                    color[3]
-                );
+                self.apply_surface_clear_background(surface_id, color);
             },
             protocol::S2CPacket::ElementSetTransformPrediction {
                 element_id,
@@ -315,81 +468,16 @@ impl ClientGame {
                 affected_mask,
                 kind,
             } => {
-                let config = PredictionConfig { enabled, affected_mask, kind };
-                if let Some(element) = self.elements.get_mut(&element_id) {
-                    element.prediction = config;
-                } else {
-                    self.pending_prediction.insert(element_id, config);
-                }
-                log::info!(
-                    "transform prediction for element {}: enabled={}, affected_mask={:#010b}, kind={:?}",
-                    element_id,
-                    enabled,
-                    affected_mask.bits(),
-                    kind
-                );
+                self.apply_transform_prediction(element_id, enabled, affected_mask, kind);
             },
             protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
-                log::info!("binding request: {identifier} ({input_type:?})");
-                match self.bindings.declare_binding(
-                    self.server_cert_fingerprint.as_deref(),
-                    binding_id,
-                    identifier,
-                    input_type,
-                ) {
-                    DeclareBindingOutcome::Restored {
-                        binding_id,
-                        input,
-                        saved_path,
-                        identifier,
-                    } => {
-                        self.send_binding_ack(binding_id)?;
-                        log::info!("restored '{}' -> {} ({saved_path})", identifier, input);
-                    },
-                    DeclareBindingOutcome::Pending => {},
-                }
+                self.handle_binding_declare(binding_id, identifier, input_type)?;
             },
             protocol::S2CPacket::ElementAdd { element_id } => {
-                let now = Instant::now();
-                self.elements.entry(element_id).or_insert(ElementState {
-                    visible: false,
-                    last_authoritative: Vec2f::default(),
-                    last_authoritative_at: now,
-                    target: Vec2f::default(),
-                    draw: Vec2f::default(),
-                    velocity: Vec2f::default(),
-                    prediction: self
-                        .pending_prediction
-                        .remove(&element_id)
-                        .unwrap_or(self.default_prediction),
-                });
+                self.handle_element_add(element_id);
             },
             protocol::S2CPacket::ElementMove { element_id, x, y } => {
-                let Some(element) = self.elements.get_mut(&element_id) else {
-                    log::debug!("ignored ElementMove for unknown element_id={element_id}");
-                    return Ok(());
-                };
-                let position = Vec2f { x, y };
-                if !element.visible {
-                    element.last_authoritative = position;
-                    element.target = position;
-                    element.draw = position;
-                    element.velocity = Vec2f::default();
-                    element.last_authoritative_at = Instant::now();
-                    element.visible = true;
-                    return Ok(());
-                }
-                let now = Instant::now();
-                let dt_seconds = now
-                    .duration_since(element.last_authoritative_at)
-                    .as_secs_f32()
-                    .max(f32::EPSILON);
-                element.velocity.x = (position.x - element.last_authoritative.x) / dt_seconds;
-                element.velocity.y = (position.y - element.last_authoritative.y) / dt_seconds;
-                element.last_authoritative = position;
-                element.last_authoritative_at = now;
-                element.target = position;
-                element.visible = true;
+                self.handle_element_move(element_id, x, y);
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
                 self.elements.remove(&element_id);
