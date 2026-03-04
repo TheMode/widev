@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game};
 use crate::game_state::GameState;
 use crate::packets::{
-    C2SPacket, InputType, PacketBundle, PacketMessage, PacketMeta, PacketTarget, PredictionKind,
+    C2SPacket, InputType, PacketBundle, PacketPayload, PacketMeta, PacketTarget, PredictionKind,
     S2CPacket, StreamID, TransformPredictionMask,
 };
 
@@ -77,7 +77,7 @@ impl RedSquareGame {
                 });
         bundle.extend(binding_packets);
 
-        state.send(PacketTarget::Client(client_id), PacketMessage::Bundle(bundle));
+        state.send(PacketTarget::Client(client_id), PacketPayload::Bundle(bundle));
     }
 }
 
@@ -104,7 +104,7 @@ impl Game for RedSquareGame {
             });
         }
         if !snapshot_bundle.packets.is_empty() {
-            state.send(PacketTarget::Client(client_id), PacketMessage::Bundle(snapshot_bundle));
+            state.send(PacketTarget::Client(client_id), PacketPayload::Bundle(snapshot_bundle));
         }
 
         let mut bundle = PacketBundle::default();
@@ -117,7 +117,7 @@ impl Game for RedSquareGame {
                 kind: PredictionKind::Interpolation,
             },
         ]);
-        state.send(PacketTarget::BroadcastExcept(client_id), PacketMessage::Bundle(bundle));
+        state.send(PacketTarget::BroadcastExcept(client_id), PacketPayload::Bundle(bundle));
 
         log::info!("client {client_id} connected");
     }
@@ -127,7 +127,7 @@ impl Game for RedSquareGame {
 
         state.send(
             PacketTarget::Broadcast,
-            PacketMessage::Packet(S2CPacket::ElementRemove { element_id: client_id }),
+            PacketPayload::Single(S2CPacket::ElementRemove { element_id: client_id }),
         );
 
         log::info!("client {client_id} disconnected");
@@ -190,7 +190,7 @@ impl Game for RedSquareGame {
             y: player.element.y,
         }));
         if !bundle.packets.is_empty() {
-            state.send(PacketTarget::Broadcast, PacketMessage::Bundle(bundle));
+            state.send(PacketTarget::Broadcast, PacketPayload::Bundle(bundle));
         }
     }
 }

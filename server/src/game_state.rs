@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use crate::game::ClientId;
-use crate::packets::{PacketBundle, PacketMessage, PacketMeta, PacketTarget, S2CPacket, StreamID};
+use crate::packets::{PacketBundle, PacketPayload, PacketMeta, PacketTarget, S2CPacket, StreamID};
 
 #[derive(Clone)]
 pub struct StreamPacket {
@@ -51,10 +51,10 @@ impl GameState {
         self.clients.remove(&client_id);
     }
 
-    pub fn send(&mut self, target: PacketTarget, message: PacketMessage) {
-        let bundle = match message {
-            PacketMessage::Packet(packet) => PacketBundle::single(packet),
-            PacketMessage::Bundle(bundle) => bundle,
+    pub fn send(&mut self, target: PacketTarget, payload: PacketPayload) {
+        let bundle = match payload {
+            PacketPayload::Single(packet) => PacketBundle::single(packet),
+            PacketPayload::Bundle(bundle) => bundle,
         };
         let meta = bundle.meta.unwrap_or_default();
         match target {

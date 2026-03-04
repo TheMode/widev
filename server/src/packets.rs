@@ -24,8 +24,8 @@ pub enum PacketTarget {
 }
 
 #[derive(Clone)]
-pub enum PacketMessage {
-    Packet(S2CPacket),
+pub enum PacketPayload {
+    Single(S2CPacket),
     Bundle(PacketBundle),
 }
 
