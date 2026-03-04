@@ -20,7 +20,13 @@ pub(super) struct QuicClient {
     send_buf: [u8; MAX_DATAGRAM_SIZE],
     recv_buf: [u8; 65_535],
     app_buf: [u8; 4096],
-    stream_recv_buffers: HashMap<u64, Vec<u8>>,
+    stream_states: HashMap<u64, QuicStreamState>,
+}
+
+#[derive(Default)]
+struct QuicStreamState {
+    recv_buffer: Vec<u8>,
+    recv_finished: bool,
 }
 
 impl QuicClient {
@@ -51,7 +57,7 @@ impl QuicClient {
             send_buf: [0; MAX_DATAGRAM_SIZE],
             recv_buf: [0; 65_535],
             app_buf: [0; 4096],
-            stream_recv_buffers: HashMap::new(),
+            stream_states: HashMap::new(),
         };
 
         client.flush_outgoing()?;
@@ -106,13 +112,9 @@ impl QuicClient {
             loop {
                 match self.conn.stream_recv(stream_id, &mut self.app_buf) {
                     Ok((len, fin)) => {
-                        let recv_buf = self.stream_recv_buffers.entry(stream_id).or_default();
-                        recv_buf.extend_from_slice(&self.app_buf[..len]);
-                        while let Some(frame) = pop_frame(recv_buf) {
-                            streams.push(frame);
-                        }
+                        let chunk = self.app_buf[..len].to_vec();
+                        streams.extend(self.ingest_stream_data(stream_id, &chunk, fin));
                         if fin {
-                            self.stream_recv_buffers.remove(&stream_id);
                             break;
                         }
                     },
@@ -135,6 +137,32 @@ impl QuicClient {
     pub(super) fn send_datagram(&mut self, payload: &[u8]) -> Result<()> {
         let _ = self.conn.dgram_send(payload);
         self.flush_outgoing()
+    }
+
+    fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
+        let state = self.stream_states.entry(stream_id).or_default();
+        state.recv_buffer.extend_from_slice(bytes);
+        state.recv_finished |= fin;
+
+        let mut frames = Vec::new();
+        while let Some(frame) = pop_frame(&mut state.recv_buffer) {
+            frames.push(frame);
+        }
+
+        self.cleanup_stream_if_closed(stream_id);
+        frames
+    }
+
+    fn cleanup_stream_if_closed(&mut self, stream_id: u64) {
+        let should_remove = if let Some(state) = self.stream_states.get(&stream_id) {
+            state.recv_buffer.is_empty()
+                && (state.recv_finished || self.conn.stream_finished(stream_id))
+        } else {
+            false
+        };
+        if should_remove {
+            self.stream_states.remove(&stream_id);
+        }
     }
 
     fn flush_outgoing(&mut self) -> Result<()> {
