@@ -28,7 +28,7 @@ pub struct GameConfig {
     pub server_addr: SocketAddr,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct RenderState {
     pub(super) x: f32,
     pub(super) y: f32,
@@ -43,7 +43,7 @@ struct Vec2f {
     y: f32,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
 pub(super) struct SurfaceState {
     pub(super) dimension_lock: Option<(u32, u32)>,
     pub(super) aspect_ratio_lock: Option<(u32, u32)>,

@@ -10,7 +10,7 @@ use quiche::RecvInfo;
 use rand::RngCore;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(5);
 
 pub(super) struct IncomingPackets {
     pub(super) datagrams: Vec<Vec<u8>>,

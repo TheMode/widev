@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use winit::application::ApplicationHandler;
@@ -14,6 +15,7 @@ use super::ClientGame;
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const MAIN_SURFACE_ID: u32 = 1;
+const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
 pub(super) fn run(game: ClientGame) -> Result<()> {
     let event_loop = EventLoop::new().context("failed to create event loop")?;
@@ -28,6 +30,10 @@ struct App {
     input_capture: InputCapture,
     window_focused: bool,
     window_occluded: bool,
+    force_redraw: bool,
+    next_tick_at: Instant,
+    last_rendered_states: Vec<super::RenderState>,
+    last_surface_state: Option<super::SurfaceState>,
     surface_list_sent: bool,
     last_reported_surface_size: Option<(u32, u32)>,
     last_prompt_signature: Option<String>,
@@ -42,6 +48,10 @@ impl App {
             input_capture: InputCapture::new(),
             window_focused: true,
             window_occluded: false,
+            force_redraw: true,
+            next_tick_at: Instant::now(),
+            last_rendered_states: Vec::new(),
+            last_surface_state: None,
             surface_list_sent: false,
             last_reported_surface_size: None,
             last_prompt_signature: None,
@@ -50,6 +60,38 @@ impl App {
 
     fn render_active(&self) -> bool {
         self.window_focused && !self.window_occluded
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn wake_for_render(&mut self) {
+        self.next_tick_at = Instant::now();
+        self.force_redraw = true;
+        self.request_redraw();
+    }
+
+    fn apply_render_activity_change(&mut self) {
+        if self.render_active() {
+            self.wake_for_render();
+        }
+    }
+
+    fn update_control_flow(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.render_active() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            return;
+        }
+
+        let now = Instant::now();
+        if now >= self.next_tick_at {
+            self.next_tick_at = now + TICK_INTERVAL;
+            self.request_redraw();
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_tick_at));
     }
 
     fn tick_frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -73,8 +115,8 @@ impl App {
             self.surface_list_sent = true;
             self.last_reported_surface_size = Some((size.width, size.height));
         }
+        let surface = self.game.surface_state(MAIN_SURFACE_ID);
         if let Some(renderer) = self.renderer.as_mut() {
-            let surface = self.game.surface_state(MAIN_SURFACE_ID);
             renderer.set_surface_constraints(
                 surface.dimension_lock,
                 surface.aspect_ratio_lock,
@@ -105,8 +147,16 @@ impl App {
 
         let mut states = self.game.render_states();
         states.extend(overlay_states);
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.render(&states)?;
+        let render_needed = self.force_redraw
+            || self.last_surface_state != Some(surface)
+            || self.last_rendered_states != states;
+        if render_needed {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.render(&states)?;
+            }
+            self.last_rendered_states = states;
+            self.last_surface_state = Some(surface);
+            self.force_redraw = false;
         }
 
         self.input_capture.end_frame();
@@ -174,14 +224,12 @@ impl ApplicationHandler for App {
         self.renderer = Some(renderer);
         self.window_focused = true;
         self.window_occluded = false;
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.wake_for_render();
+        self.update_control_flow(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+        self.update_control_flow(event_loop);
     }
 
     fn device_event(
@@ -205,24 +253,17 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
-                if self.render_active() {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
+                self.apply_render_activity_change();
             },
             WindowEvent::Occluded(occluded) => {
                 self.window_occluded = occluded;
-                if self.render_active() {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
+                self.apply_render_activity_change();
             },
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
                 }
+                self.wake_for_render();
                 if self.game.is_connected() {
                     let next_size = (size.width, size.height);
                     if self.last_reported_surface_size != Some(next_size) {
@@ -241,11 +282,6 @@ impl ApplicationHandler for App {
                     log::error!("client frame error: {err:#}");
                     event_loop.exit();
                     return;
-                }
-                if self.render_active() {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
                 }
             },
             WindowEvent::Destroyed => {
