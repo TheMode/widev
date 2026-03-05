@@ -1,17 +1,20 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use mio::{Events, Interest, Poll, Token};
 use quiche::RecvInfo;
 use rand::RngCore;
 
 pub mod protocol;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const MAX_WORKER_POLL_WAIT: Duration = Duration::from_millis(10);
+const STREAM_COMPACT_THRESHOLD: usize = 4096;
 const DEFAULT_CLIENT_NAME: &str = "desktop-bot";
 const DEFAULT_CAPABILITIES: &[&str] = &["stress.multiclient", "input.synthetic"];
 
@@ -56,14 +59,18 @@ impl<'a> BotContext<'a> {
 #[derive(Default)]
 struct QuicStreamState {
     recv_buffer: Vec<u8>,
+    recv_offset: usize,
     recv_finished: bool,
 }
 
 struct BotSession {
     bot_id: u32,
+    token: Token,
     server_addr: SocketAddr,
     local_addr: SocketAddr,
-    socket: UdpSocket,
+    socket: mio::net::UdpSocket,
+    socket_writable: bool,
+    pending_send: Option<PendingDatagram>,
     conn: quiche::Connection,
     stream_states: HashMap<u64, QuicStreamState>,
     flow: Box<dyn BotFlow>,
@@ -75,6 +82,12 @@ struct BotSession {
 
 enum WorkerCommand {
     AddBot(u32),
+}
+
+struct PendingDatagram {
+    len: usize,
+    to: SocketAddr,
+    bytes: [u8; MAX_DATAGRAM_SIZE],
 }
 
 pub struct PassiveFlow;
@@ -257,7 +270,11 @@ fn run_worker(
     server_addr: SocketAddr,
     bot_tick_hz: u32,
 ) -> Result<()> {
+    let mut poll = Poll::new().context("failed to create mio poll")?;
+    let mut events = Events::with_capacity(1024);
     let mut sessions = Vec::<BotSession>::new();
+    let mut index_by_token = HashMap::<Token, usize>::new();
+    let mut next_token_id: usize = 1;
 
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut recv_buf = [0u8; 65_535];
@@ -272,11 +289,24 @@ fn run_worker(
             match cmd_rx.try_recv() {
                 Ok(WorkerCommand::AddBot(bot_id)) => {
                     let flow = flow_factory(bot_id);
-                    let mut session = create_bot_session(bot_id, server_addr, bot_tick_hz, flow)
-                        .with_context(|| {
-                            format!("failed to create bot session {bot_id} on worker {worker_id}")
-                        })?;
-                    flush_outgoing(&session.socket, &mut session.conn, &mut send_buf)?;
+                    let token = Token(next_token_id);
+                    next_token_id = next_token_id.wrapping_add(1).max(1);
+                    let mut session =
+                        create_bot_session(bot_id, token, server_addr, bot_tick_hz, flow)
+                            .with_context(|| {
+                                format!(
+                                    "failed to create bot session {bot_id} on worker {worker_id}"
+                                )
+                            })?;
+                    poll.registry()
+                        .register(
+                            &mut session.socket,
+                            session.token,
+                            Interest::READABLE | Interest::WRITABLE,
+                        )
+                        .context("failed to register bot UDP socket with poll")?;
+                    index_by_token.insert(session.token, sessions.len());
+                    flush_outgoing(&mut session, &mut send_buf)?;
                     sessions.push(session);
                     had_activity = true;
                 },
@@ -288,45 +318,75 @@ fn run_worker(
             }
         }
 
-        let mut remove_indices = Vec::new();
-
-        for (idx, session) in sessions.iter_mut().enumerate() {
-            match process_session(session, &mut send_buf, &mut recv_buf, &mut app_buf) {
-                Ok(active) => {
-                    had_activity |= active;
-                    if session.conn.is_closed() {
-                        remove_indices.push(idx);
-                    }
-                },
+        let now = Instant::now();
+        let mut idx = sessions.len();
+        while idx > 0 {
+            idx -= 1;
+            match process_session_logic(&mut sessions[idx], now, &mut send_buf, &mut app_buf) {
+                Ok(active) => had_activity |= active,
                 Err(err) => {
-                    log::warn!("worker {worker_id} bot {} failed: {err:#}", session.bot_id);
-                    remove_indices.push(idx);
+                    log::warn!("worker {worker_id} bot {} failed: {err:#}", sessions[idx].bot_id);
+                    sessions[idx].conn.close(false, 0, b"worker processing error").ok();
                 },
             }
         }
 
-        while let Some(idx) = remove_indices.pop() {
-            sessions.swap_remove(idx);
+        if remove_closed_sessions(&mut sessions, &mut index_by_token, poll.registry()) {
+            had_activity = true;
         }
 
         if commands_closed && sessions.is_empty() {
             return Ok(());
         }
 
-        if !had_activity {
-            thread::sleep(WORKER_IDLE_SLEEP);
+        let wait = if had_activity { Duration::ZERO } else { compute_poll_wait(&sessions) };
+        poll.poll(&mut events, Some(wait)).context("poll failed")?;
+
+        let mut recv_failed_tokens = Vec::new();
+        for event in events.iter() {
+            let Some(&session_idx) = index_by_token.get(&event.token()) else {
+                continue;
+            };
+            let Some(session) = sessions.get_mut(session_idx) else {
+                continue;
+            };
+
+            if event.is_writable() {
+                session.socket_writable = true;
+            }
+            if event.is_readable() {
+                match recv_udp(session, &mut recv_buf) {
+                    Ok(_) => {},
+                    Err(err) => {
+                        log::warn!("worker {worker_id} bot {} recv failed: {err:#}", session.bot_id);
+                        recv_failed_tokens.push(event.token());
+                    },
+                }
+            }
+        }
+
+        if !recv_failed_tokens.is_empty() {
+            for token in recv_failed_tokens {
+                if let Some(&session_idx) = index_by_token.get(&token) {
+                    if let Some(session) = sessions.get_mut(session_idx) {
+                        session.conn.close(false, 0, b"recv error").ok();
+                    }
+                }
+            }
+            remove_closed_sessions(&mut sessions, &mut index_by_token, poll.registry());
         }
     }
 }
 
 fn create_bot_session(
     bot_id: u32,
+    token: Token,
     server_addr: SocketAddr,
     bot_tick_hz: u32,
     flow: Box<dyn BotFlow>,
 ) -> Result<BotSession> {
-    let socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind UDP socket")?;
-    socket.set_nonblocking(true).context("failed to set non-blocking socket")?;
+    let socket = mio::net::UdpSocket::bind("0.0.0.0:0".parse().expect("valid socket addr"))
+        .context("failed to bind UDP socket")?;
 
     let local_addr = socket.local_addr().context("failed to query local socket address")?;
 
@@ -346,9 +406,12 @@ fn create_bot_session(
 
     Ok(BotSession {
         bot_id,
+        token,
         server_addr,
         local_addr,
         socket,
+        socket_writable: true,
+        pending_send: None,
         conn,
         stream_states: HashMap::new(),
         flow,
@@ -359,15 +422,14 @@ fn create_bot_session(
     })
 }
 
-fn process_session(
+fn process_session_logic(
     session: &mut BotSession,
+    now: Instant,
     send_buf: &mut [u8],
-    recv_buf: &mut [u8],
     app_buf: &mut [u8],
 ) -> Result<bool> {
     let mut had_activity = false;
 
-    recv_udp(session, recv_buf, &mut had_activity)?;
     process_datagrams(session, app_buf, &mut had_activity)?;
     process_streams(session, app_buf, &mut had_activity)?;
 
@@ -379,7 +441,6 @@ fn process_session(
     }
 
     if let Some(interval) = session.tick_interval {
-        let now = Instant::now();
         if now >= session.next_tick_at {
             let mut ctx = BotContext { bot_id: session.bot_id, outgoing: &mut session.outgoing };
             session.flow.on_tick(&mut ctx, now)?;
@@ -406,19 +467,20 @@ fn process_session(
         }
     }
 
-    if flush_outgoing(&session.socket, &mut session.conn, send_buf)? {
+    if flush_outgoing(session, send_buf)? {
         had_activity = true;
     }
 
     Ok(had_activity)
 }
 
-fn recv_udp(session: &mut BotSession, recv_buf: &mut [u8], had_activity: &mut bool) -> Result<()> {
+fn recv_udp(session: &mut BotSession, recv_buf: &mut [u8]) -> Result<bool> {
+    let mut had_activity = false;
     loop {
         let recv = session.socket.recv_from(recv_buf);
         let (len, from) = match recv {
             Ok(v) => v,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => return Err(err).context("socket recv_from failed"),
         };
 
@@ -432,9 +494,9 @@ fn recv_udp(session: &mut BotSession, recv_buf: &mut [u8], had_activity: &mut bo
                 log::debug!("bot {} conn.recv error: {err:?}", session.bot_id);
             }
         }
-        *had_activity = true;
+        had_activity = true;
     }
-    Ok(())
+    Ok(had_activity)
 }
 
 fn process_datagrams(
@@ -469,6 +531,7 @@ fn process_streams(
                 Ok((len, fin)) => {
                     {
                         let state = session.stream_states.entry(stream_id).or_default();
+                        maybe_compact_stream_buffer(state);
                         state.recv_buffer.extend_from_slice(&app_buf[..len]);
                         state.recv_finished |= fin;
                     }
@@ -498,23 +561,21 @@ fn process_streams(
 
 fn pop_decoded_frame(state: &mut QuicStreamState) -> Option<protocol::S2CPacket> {
     loop {
-        if state.recv_buffer.len() < 4 {
+        let unread = &state.recv_buffer[state.recv_offset..];
+        if unread.len() < 4 {
             return None;
         }
 
-        let len = u32::from_be_bytes([
-            state.recv_buffer[0],
-            state.recv_buffer[1],
-            state.recv_buffer[2],
-            state.recv_buffer[3],
-        ]) as usize;
-        if state.recv_buffer.len() < 4 + len {
+        let len = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as usize;
+        if unread.len() < 4 + len {
             return None;
         }
 
-        let end = 4 + len;
-        let decoded = protocol::decode_s2c(&state.recv_buffer[4..end]).ok();
-        state.recv_buffer.drain(..end);
+        let payload_start = state.recv_offset + 4;
+        let end = payload_start + len;
+        let decoded = protocol::decode_s2c(&state.recv_buffer[payload_start..end]).ok();
+        state.recv_offset = end;
+        maybe_compact_stream_buffer(state);
 
         if let Some(packet) = decoded {
             return Some(packet);
@@ -528,13 +589,61 @@ fn cleanup_stream_if_closed(
     stream_id: u64,
 ) {
     let should_remove = if let Some(state) = stream_states.get(&stream_id) {
-        state.recv_buffer.is_empty() && (state.recv_finished || conn.stream_finished(stream_id))
+        state.recv_offset >= state.recv_buffer.len()
+            && (state.recv_finished || conn.stream_finished(stream_id))
     } else {
         false
     };
     if should_remove {
         stream_states.remove(&stream_id);
     }
+}
+
+fn maybe_compact_stream_buffer(state: &mut QuicStreamState) {
+    if state.recv_offset == 0 {
+        return;
+    }
+    if state.recv_offset < STREAM_COMPACT_THRESHOLD
+        && state.recv_offset * 2 < state.recv_buffer.len()
+    {
+        return;
+    }
+    state.recv_buffer.drain(..state.recv_offset);
+    state.recv_offset = 0;
+}
+
+fn compute_poll_wait(sessions: &[BotSession]) -> Duration {
+    if sessions.is_empty() {
+        return MAX_WORKER_POLL_WAIT;
+    }
+
+    let now = Instant::now();
+    let mut wait = MAX_WORKER_POLL_WAIT;
+
+    for session in sessions {
+        if session.pending_send.is_some() && session.socket_writable {
+            return Duration::ZERO;
+        }
+        if !session.outgoing.is_empty() {
+            return Duration::ZERO;
+        }
+        if let Some(timeout) = session.conn.timeout() {
+            wait = wait.min(timeout);
+        }
+
+        if session.conn.is_closed() {
+            return Duration::ZERO;
+        }
+
+        if let Some(_) = session.tick_interval {
+            if session.next_tick_at <= now {
+                return Duration::ZERO;
+            }
+            wait = wait.min(session.next_tick_at.saturating_duration_since(now));
+        }
+    }
+
+    wait
 }
 
 fn handle_s2c_packet(session: &mut BotSession, packet: protocol::S2CPacket) -> Result<()> {
@@ -547,16 +656,49 @@ fn handle_s2c_packet(session: &mut BotSession, packet: protocol::S2CPacket) -> R
 }
 
 fn flush_outgoing(
-    socket: &UdpSocket,
-    conn: &mut quiche::Connection,
+    session: &mut BotSession,
     send_buf: &mut [u8],
 ) -> Result<bool> {
     let mut sent_any = false;
-    loop {
-        match conn.send(send_buf) {
-            Ok((len, send_info)) => {
-                socket.send_to(&send_buf[..len], send_info.to).context("socket send_to failed")?;
+
+    if let Some(pending) = &session.pending_send {
+        match session.socket.send_to(&pending.bytes[..pending.len], pending.to) {
+            Ok(_) => {
+                session.pending_send = None;
                 sent_any = true;
+            },
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                session.socket_writable = false;
+                return Ok(sent_any);
+            },
+            Err(err) => return Err(err).context("socket send_to failed"),
+        }
+    }
+
+    if !session.socket_writable {
+        return Ok(sent_any);
+    }
+
+    loop {
+        match session.conn.send(send_buf) {
+            Ok((len, send_info)) => {
+                match session.socket.send_to(&send_buf[..len], send_info.to) {
+                    Ok(_) => {
+                        sent_any = true;
+                    },
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        let mut pending = PendingDatagram {
+                            len,
+                            to: send_info.to,
+                            bytes: [0u8; MAX_DATAGRAM_SIZE],
+                        };
+                        pending.bytes[..len].copy_from_slice(&send_buf[..len]);
+                        session.pending_send = Some(pending);
+                        session.socket_writable = false;
+                        break;
+                    },
+                    Err(err) => return Err(err).context("socket send_to failed"),
+                }
             },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
@@ -564,6 +706,30 @@ fn flush_outgoing(
     }
 
     Ok(sent_any)
+}
+
+fn remove_closed_sessions(
+    sessions: &mut Vec<BotSession>,
+    index_by_token: &mut HashMap<Token, usize>,
+    registry: &mio::Registry,
+) -> bool {
+    let mut removed_any = false;
+    let mut idx = sessions.len();
+    while idx > 0 {
+        idx -= 1;
+        if !sessions[idx].conn.is_closed() {
+            continue;
+        }
+        let mut removed = sessions.swap_remove(idx);
+        registry.deregister(&mut removed.socket).ok();
+        index_by_token.remove(&removed.token);
+        if idx < sessions.len() {
+            let moved_token = sessions[idx].token;
+            index_by_token.insert(moved_token, idx);
+        }
+        removed_any = true;
+    }
+    removed_any
 }
 
 fn build_client_quic_config() -> Result<quiche::Config> {

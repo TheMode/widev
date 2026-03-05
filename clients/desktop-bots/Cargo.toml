@@ -13,6 +13,8 @@ serde = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+mio = { version = "1.1.1", features = ["os-poll", "net"] }
+libc = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
