@@ -2,12 +2,17 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use glyphon::{
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
+};
 use taffy::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use super::bindings::BindingPromptState;
+use super::LatencySnapshot;
 use super::RenderState;
 
 const SHADER_SOURCE: &str = r#"
@@ -81,6 +86,30 @@ const QUAD_VERTICES: [Vertex; 4] = [
 
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TextCommand {
+    pub(super) text: String,
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) max_width: f32,
+    pub(super) font_size: f32,
+    pub(super) line_height: f32,
+    pub(super) color: u32,
+}
+
+#[derive(Default)]
+pub(super) struct OverlayFrame {
+    pub(super) rects: Vec<RenderState>,
+    pub(super) texts: Vec<TextCommand>,
+}
+
+impl OverlayFrame {
+    pub(super) fn merge_into(self, rects: &mut Vec<RenderState>, texts: &mut Vec<TextCommand>) {
+        rects.extend(self.rects);
+        texts.extend(self.texts);
+    }
+}
+
 pub(super) struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -98,6 +127,12 @@ pub(super) struct Renderer {
     virtual_dimension_lock: Option<(u32, u32)>,
     aspect_ratio_lock: Option<(u32, u32)>,
     clear_color: wgpu::Color,
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    viewport: Viewport,
+    text_atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    text_buffers: Vec<Buffer>,
 }
 
 impl Renderer {
@@ -189,7 +224,7 @@ impl Renderer {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("widev-pipeline-layout"),
             bind_group_layouts: &[&uniform_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("widev-pipeline"),
@@ -244,7 +279,7 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -265,6 +300,12 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let text_cache = Cache::new(&device);
+        let mut text_atlas = TextAtlas::new(&device, &queue, &text_cache, format);
+        let text_renderer =
+            TextRenderer::new(&mut text_atlas, &device, wgpu::MultisampleState::default(), None);
+        let viewport = Viewport::new(&device, &text_cache);
+
         Ok(Self {
             surface,
             device,
@@ -282,6 +323,12 @@ impl Renderer {
             virtual_dimension_lock: None,
             aspect_ratio_lock: None,
             clear_color: wgpu::Color::BLACK,
+            font_system: FontSystem::new(),
+            swash_cache: SwashCache::new(),
+            viewport,
+            text_atlas,
+            text_renderer,
+            text_buffers: Vec::new(),
         })
     }
 
@@ -316,7 +363,11 @@ impl Renderer {
         self.write_screen_uniform();
     }
 
-    pub(super) fn render(&mut self, render_states: &[RenderState]) -> Result<()> {
+    pub(super) fn render(
+        &mut self,
+        render_states: &[RenderState],
+        text_commands: &[TextCommand],
+    ) -> Result<()> {
         self.ensure_instance_capacity(render_states.len().max(1));
         self.write_instances(render_states);
 
@@ -335,6 +386,12 @@ impl Renderer {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (vp_x, vp_y, vp_w, vp_h) = self.compute_viewport();
+        self.viewport.update(
+            &self.queue,
+            Resolution { width: self.config.width, height: self.config.height },
+        );
+        self.prepare_text(text_commands, vp_x, vp_y, vp_w, vp_h)
+            .context("failed to prepare text")?;
 
         let mut encoder = self
             .device
@@ -354,6 +411,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
 
             pass.set_pipeline(&self.pipeline);
@@ -364,15 +422,19 @@ impl Renderer {
             pass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
             pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
             pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..render_states.len() as u32);
+            self.text_renderer
+                .render(&self.text_atlas, &self.viewport, &mut pass)
+                .context("failed to render text")?;
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
+        self.text_atlas.trim();
         Ok(())
     }
 
-    pub(super) fn build_binding_overlay(&self, prompt: &BindingPromptState) -> Vec<RenderState> {
-        let mut states = Vec::new();
+    pub(super) fn build_binding_overlay(&self, prompt: &BindingPromptState) -> OverlayFrame {
+        let mut overlay = OverlayFrame::default();
         let (virtual_w, virtual_h) = self.compute_virtual_size();
         let vw = virtual_w as f32;
         let vh = virtual_h as f32;
@@ -422,7 +484,7 @@ impl Renderer {
                 ..Default::default()
             }),
         ) else {
-            return states;
+            return overlay;
         };
         let Ok(row2) = taffy.new_with_children(
             Style {
@@ -434,7 +496,7 @@ impl Renderer {
             },
             &[left_card, right_card],
         ) else {
-            return states;
+            return overlay;
         };
         let Ok(root) = taffy.new_with_children(
             Style {
@@ -452,7 +514,7 @@ impl Renderer {
             },
             &[header, action, row2, controls, sources],
         ) else {
-            return states;
+            return overlay;
         };
         if taffy
             .compute_layout(
@@ -464,7 +526,7 @@ impl Renderer {
             )
             .is_err()
         {
-            return states;
+            return overlay;
         }
 
         let get_rect = |node| {
@@ -474,21 +536,21 @@ impl Renderer {
             Some((left, top, layout.size.width, layout.size.height))
         };
         let Some((header_left, header_top, header_w, header_h)) = get_rect(header) else {
-            return states;
+            return overlay;
         };
         let Some((action_left, action_top, action_w, action_h)) = get_rect(action) else {
-            return states;
+            return overlay;
         };
         let Some((row2_left, row2_top, _row2_w, _row2_h)) = get_rect(row2) else {
-            return states;
+            return overlay;
         };
         let left_layout = match taffy.layout(left_card) {
             Ok(layout) => layout,
-            Err(_) => return states,
+            Err(_) => return overlay,
         };
         let right_layout = match taffy.layout(right_card) {
             Ok(layout) => layout,
-            Err(_) => return states,
+            Err(_) => return overlay,
         };
         let left_left = row2_left + left_layout.location.x;
         let left_top = row2_top + left_layout.location.y;
@@ -499,19 +561,19 @@ impl Renderer {
         let right_w = right_layout.size.width;
         let right_h = right_layout.size.height;
         if right_w <= 0.0 || right_h <= 0.0 {
-            return states;
+            return overlay;
         }
         let Some((controls_left, controls_top, controls_w, controls_h)) = get_rect(controls) else {
-            return states;
+            return overlay;
         };
         let Some((sources_left, sources_top, sources_w, sources_h)) = get_rect(sources) else {
-            return states;
+            return overlay;
         };
 
-        push_rect(&mut states, panel_x, panel_y, panel_w, panel_h, 0x070b12);
-        draw_border(&mut states, panel_left, panel_top, panel_w, panel_h, 0x2b3f5f);
+        push_rect(&mut overlay.rects, panel_x, panel_y, panel_w, panel_h, 0x070b12);
+        draw_border(&mut overlay.rects, panel_left, panel_top, panel_w, panel_h, 0x2b3f5f);
         push_rect(
-            &mut states,
+            &mut overlay.rects,
             header_left + header_w * 0.5,
             header_top + header_h * 0.5,
             header_w,
@@ -519,12 +581,12 @@ impl Renderer {
             0x142033,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             header_left + 12.0 * ui_scale,
             header_top + 14.0 * ui_scale,
             "Input Binding",
             header_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            28.0 * ui_scale * 0.5,
             0xe2e8f0,
         );
 
@@ -535,26 +597,26 @@ impl Renderer {
             (controls_left, controls_top, controls_w, controls_h),
             (sources_left, sources_top, sources_w, sources_h),
         ] {
-            push_rect(&mut states, l + w * 0.5, t + h * 0.5, w, h, 0x0f1727);
-            draw_border(&mut states, l, t, w, h, 0x334155);
+            push_rect(&mut overlay.rects, l + w * 0.5, t + h * 0.5, w, h, 0x0f1727);
+            draw_border(&mut overlay.rects, l, t, w, h, 0x334155);
         }
 
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             action_left + 12.0 * ui_scale,
             action_top + 12.0 * ui_scale,
             &format!("Action: {}", prompt.identifier),
             action_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            22.0 * ui_scale * 0.5,
             0xbfdbfe,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             action_left + 12.0 * ui_scale,
             action_top + 36.0 * ui_scale,
             &format!("Input Type: {:?}", prompt.input_type),
             action_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0x93c5fd,
         );
 
@@ -565,68 +627,68 @@ impl Renderer {
             .map(|path| path.with_device_scope(prompt.any_device_scope).to_string())
             .unwrap_or_else(|| "No input captured".to_string());
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             left_left + 12.0 * ui_scale,
             left_top + 10.0 * ui_scale,
             "Device Scope",
             left_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xf8fafc,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             left_left + 12.0 * ui_scale,
             left_top + 36.0 * ui_scale,
             scope_label,
             left_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xfde68a,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             right_left + 12.0 * ui_scale,
             right_top + 10.0 * ui_scale,
             "Captured Input",
             right_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xf8fafc,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             right_left + 12.0 * ui_scale,
             right_top + 36.0 * ui_scale,
             &captured,
             right_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0x86efac,
         );
 
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             controls_left + 12.0 * ui_scale,
             controls_top + 10.0 * ui_scale,
             "Controls",
             controls_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xf8fafc,
         );
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             controls_left + 12.0 * ui_scale,
             controls_top + 36.0 * ui_scale,
             "Enter confirm | Backspace skip | Tab toggle scope | Esc exit",
             controls_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xfde68a,
         );
 
         draw_text_line(
-            &mut states,
+            &mut overlay.texts,
             sources_left + 12.0 * ui_scale,
             sources_top + 10.0 * ui_scale,
             "Supported Inputs",
             sources_w - 24.0 * ui_scale,
-            2.0 * ui_scale,
+            18.0 * ui_scale * 0.5,
             0xf8fafc,
         );
         let mut y = sources_top + 36.0 * ui_scale;
@@ -637,18 +699,41 @@ impl Renderer {
                 break;
             }
             draw_text_line(
-                &mut states,
+                &mut overlay.texts,
                 sources_left + 12.0 * ui_scale,
                 y,
                 &format!("- {line}"),
                 sources_w - 24.0 * ui_scale,
-                2.0 * ui_scale,
+                16.0 * ui_scale * 0.5,
                 0xcbd5e1,
             );
             y += line_h;
         }
 
-        states
+        overlay
+    }
+
+    pub(super) fn build_latency_overlay(&self, latency: LatencySnapshot) -> OverlayFrame {
+        let mut overlay = OverlayFrame::default();
+        let (virtual_w, _virtual_h) = self.compute_virtual_size();
+        let vw = virtual_w as f32;
+
+        let horizontal_margin = 12.0;
+        let vertical_margin = 10.0;
+
+        let path_text = if latency.connected {
+            format_latency_ms(latency.quiche_rtt.map(|v| v.as_secs_f64() * 1000.0))
+        } else {
+            "--".to_string()
+        };
+        let font_size = 24.0;
+        let text_width = estimate_text_width(&path_text, font_size);
+        let left = (vw - horizontal_margin - text_width).max(0.0);
+        let top = vertical_margin;
+
+        draw_text_line(&mut overlay.texts, left, top, &path_text, text_width, font_size, 0xffffff);
+
+        overlay
     }
 
     fn ensure_instance_capacity(&mut self, required: usize) {
@@ -732,6 +817,73 @@ impl Renderer {
             (0, vp_y, vp_w, vp_h)
         }
     }
+
+    fn prepare_text(
+        &mut self,
+        text_commands: &[TextCommand],
+        vp_x: u32,
+        vp_y: u32,
+        vp_w: u32,
+        vp_h: u32,
+    ) -> Result<()> {
+        self.text_buffers.clear();
+        let (virtual_w, virtual_h) = self.compute_virtual_size();
+        let scale_x = vp_w as f32 / virtual_w.max(1) as f32;
+        let scale_y = vp_h as f32 / virtual_h.max(1) as f32;
+
+        for command in text_commands {
+            let font_size = (command.font_size * scale_y).max(1.0).round();
+            let line_height = (command.line_height * scale_y).max(font_size + 1.0).round();
+            let mut buffer =
+                Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
+            buffer.set_wrap(&mut self.font_system, Wrap::None);
+            buffer.set_size(
+                &mut self.font_system,
+                Some((command.max_width * scale_x).max(1.0).round()),
+                None,
+            );
+            buffer.set_text(
+                &mut self.font_system,
+                &command.text,
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Basic,
+                None,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            self.text_buffers.push(buffer);
+        }
+
+        let text_areas: Vec<TextArea<'_>> = self
+            .text_buffers
+            .iter()
+            .zip(text_commands.iter())
+            .map(|(buffer, command)| TextArea {
+                buffer,
+                left: (vp_x as f32 + command.x * scale_x).round(),
+                top: (vp_y as f32 + command.y * scale_y).round(),
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: vp_x as i32,
+                    top: vp_y as i32,
+                    right: (vp_x + vp_w) as i32,
+                    bottom: (vp_y + vp_h) as i32,
+                },
+                default_color: text_color(command.color),
+                custom_glyphs: &[],
+            })
+            .collect();
+
+        self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        )?;
+        Ok(())
+    }
 }
 
 fn unpack_color(rgb: u32) -> [f32; 4] {
@@ -801,106 +953,41 @@ fn draw_border(
 }
 
 fn draw_text_line(
-    states: &mut Vec<RenderState>,
+    texts: &mut Vec<TextCommand>,
     x: f32,
     y: f32,
     text: &str,
     max_width: f32,
-    scale: f32,
+    font_size: f32,
     color: u32,
 ) {
-    let snapped_scale = scale.max(1.0).round();
-    let text = text.to_ascii_uppercase();
-    let char_w = 6.0 * snapped_scale;
-    let max_chars = (max_width / char_w).floor().max(1.0) as usize;
-    let total_chars = text.chars().count();
-    let clipped = if total_chars > max_chars {
-        let take = max_chars.saturating_sub(3);
-        let mut out: String = text.chars().take(take).collect();
-        out.push_str("...");
-        out
-    } else {
-        text
-    };
-    draw_text(states, x.round(), y.round(), &clipped, snapped_scale, color);
+    texts.push(TextCommand {
+        text: text.to_string(),
+        x: x.round(),
+        y: y.round(),
+        max_width: max_width.max(1.0),
+        font_size: font_size.max(1.0),
+        line_height: (font_size * 1.2).max(font_size + 2.0),
+        color,
+    });
 }
 
-fn draw_text(states: &mut Vec<RenderState>, x: f32, y: f32, text: &str, scale: f32, color: u32) {
-    let mut cursor_x = x;
-    for ch in text.chars() {
-        if let Some(rows) = glyph_rows(ch) {
-            for (row, pattern) in rows.iter().enumerate() {
-                for col in 0..5 {
-                    if (pattern >> (4 - col)) & 1 == 1 {
-                        let px = cursor_x + col as f32 * scale;
-                        let py = y + row as f32 * scale;
-                        push_rect(states, px + scale * 0.5, py + scale * 0.5, scale, scale, color);
-                    }
-                }
-            }
-        }
-        cursor_x += 6.0 * scale;
+fn format_latency_ms(value_ms: Option<f64>) -> String {
+    match value_ms {
+        Some(ms) if ms.is_finite() => format!("{} ms", ms.round() as i64),
+        _ => "--".to_string(),
     }
 }
 
-fn glyph_rows(ch: char) -> Option<[u8; 7]> {
-    match ch {
-        'A' => Some([0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
-        'B' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
-        'C' => Some([0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]),
-        'D' => Some([0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]),
-        'E' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
-        'F' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000]),
-        'G' => Some([0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110]),
-        'H' => Some([0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
-        'I' => Some([0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        'J' => Some([0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110]),
-        'K' => Some([0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
-        'L' => Some([0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
-        'M' => Some([0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001]),
-        'N' => Some([0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001]),
-        'O' => Some([0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
-        'P' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
-        'Q' => Some([0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101]),
-        'R' => Some([0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
-        'S' => Some([0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
-        'T' => Some([0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
-        'U' => Some([0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
-        'V' => Some([0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
-        'W' => Some([0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010]),
-        'X' => Some([0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001]),
-        'Y' => Some([0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100]),
-        'Z' => Some([0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111]),
-        '0' => Some([0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]),
-        '1' => Some([0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
-        '2' => Some([0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
-        '3' => Some([0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110]),
-        '4' => Some([0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]),
-        '5' => Some([0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110]),
-        '6' => Some([0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
-        '7' => Some([0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]),
-        '8' => Some([0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]),
-        '9' => Some([0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110]),
-        ' ' => Some([0, 0, 0, 0, 0, 0, 0]),
-        ':' => Some([0, 0b00100, 0, 0, 0b00100, 0, 0]),
-        '-' => Some([0, 0, 0, 0b11111, 0, 0, 0]),
-        '_' => Some([0, 0, 0, 0, 0, 0, 0b11111]),
-        '/' => Some([0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0, 0]),
-        '*' => Some([0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0]),
-        '(' => Some([0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010]),
-        ')' => Some([0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000]),
-        '[' => Some([0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110]),
-        ']' => Some([0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110]),
-        '|' => Some([0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
-        '.' => Some([0, 0, 0, 0, 0, 0b00100, 0]),
-        '>' => Some([0b10000, 0b01000, 0b00100, 0b00010, 0b00100, 0b01000, 0b10000]),
-        '<' => Some([0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001]),
-        ',' => Some([0, 0, 0, 0, 0b00100, 0b00100, 0b01000]),
-        '=' => Some([0, 0b11111, 0, 0b11111, 0, 0, 0]),
-        '?' => Some([0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100]),
-        '!' => Some([0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100]),
-        _ => None,
-    }
+fn estimate_text_width(text: &str, font_size: f32) -> f32 {
+    (text.chars().count() as f32 * font_size * 0.62).ceil().max(font_size)
+}
+
+fn text_color(rgb: u32) -> Color {
+    let r = ((rgb >> 16) & 0xff) as u8;
+    let g = ((rgb >> 8) & 0xff) as u8;
+    let b = (rgb & 0xff) as u8;
+    Color::rgb(r, g, b)
 }
 
 fn friendly_supported_lines(prompt: &BindingPromptState) -> Vec<String> {

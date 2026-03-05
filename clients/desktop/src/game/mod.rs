@@ -16,6 +16,7 @@ const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
+const LATENCY_SMOOTHING_ALPHA: f64 = 0.06;
 const PLAYER_SIZE: f32 = 32.0;
 const DEFAULT_PLAYER_COLOR: protocol::Color = [0.65, 0.24, 29.0, 1.0];
 const CLIENT_CAPABILITIES: &[&str] = &[
@@ -158,6 +159,13 @@ pub(super) struct ClientGame {
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
+    smoothed_path_rtt: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LatencySnapshot {
+    pub(super) connected: bool,
+    pub(super) quiche_rtt: Option<Duration>,
 }
 
 impl ClientGame {
@@ -175,6 +183,7 @@ impl ClientGame {
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
+            smoothed_path_rtt: None,
         })
     }
 
@@ -202,6 +211,7 @@ impl ClientGame {
             log::info!("connected to server {}", self.net.server_addr());
         }
         self.maybe_send_ping()?;
+        self.update_smoothed_latency();
 
         for element in self.elements.values_mut() {
             element.tick_prediction();
@@ -293,6 +303,29 @@ impl ClientGame {
 
     pub(super) fn surface_state(&self, surface_id: protocol::SurfaceId) -> SurfaceState {
         self.surfaces.get(&surface_id).copied().unwrap_or_default()
+    }
+
+    pub(super) fn latency_snapshot(&self) -> LatencySnapshot {
+        LatencySnapshot { connected: self.net.is_established(), quiche_rtt: self.smoothed_path_rtt }
+    }
+
+    fn update_smoothed_latency(&mut self) {
+        let Some(current_rtt) = self.net.path_rtt() else {
+            self.smoothed_path_rtt = None;
+            return;
+        };
+
+        let smoothed = match self.smoothed_path_rtt {
+            Some(previous_rtt) => {
+                let previous_secs = previous_rtt.as_secs_f64();
+                let current_secs = current_rtt.as_secs_f64();
+                Duration::from_secs_f64(
+                    previous_secs + (current_secs - previous_secs) * LATENCY_SMOOTHING_ALPHA,
+                )
+            },
+            None => current_rtt,
+        };
+        self.smoothed_path_rtt = Some(smoothed);
     }
 
     fn ensure_server_identity_logged(&mut self) {
@@ -469,7 +502,8 @@ impl ClientGame {
             },
             protocol::S2CPacket::Pong { nonce } => {
                 if let Some(sent_at) = self.pending_ping_nonces.remove(&nonce) {
-                    let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                    let rtt = sent_at.elapsed();
+                    let rtt_ms = rtt.as_secs_f64() * 1000.0;
                     let quiche_rtt_ms = self
                         .net
                         .path_rtt()
