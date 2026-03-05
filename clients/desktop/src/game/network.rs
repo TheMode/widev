@@ -373,9 +373,7 @@ fn flush_outgoing(
     loop {
         match conn.send(send_buf) {
             Ok((len, send_info)) => {
-                socket
-                    .send_to(&send_buf[..len], send_info.to)
-                    .context("socket send_to failed")?;
+                socket.send_to(&send_buf[..len], send_info.to).context("socket send_to failed")?;
                 sent_any = true;
             },
             Err(quiche::Error::Done) => break,

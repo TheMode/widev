@@ -2724,6 +2724,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "widev-desktop-bots"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "env_logger",
+ "log",
+ "protocol_codegen",
+ "quiche",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "widev-desktop-client"
 version = "0.1.0"
 dependencies = [

@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -15,8 +15,8 @@ use rand::RngCore;
 
 use crate::game::ClientId;
 use crate::packets::{
-    decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketTarget, S2CPacket,
-    PacketPriority, StreamID,
+    decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketPriority, PacketTarget,
+    S2CPacket, StreamID,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -54,6 +54,28 @@ struct PacedDatagram {
     at: Instant,
     to: SocketAddr,
     bytes: Vec<u8>,
+    seq: u64,
+}
+
+impl PartialEq for PacedDatagram {
+    fn eq(&self, other: &Self) -> bool {
+        self.at == other.at && self.seq == other.seq
+    }
+}
+
+impl Eq for PacedDatagram {}
+
+impl PartialOrd for PacedDatagram {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PacedDatagram {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so BinaryHeap pops the earliest datagram first.
+        other.at.cmp(&self.at).then_with(|| other.seq.cmp(&self.seq))
+    }
 }
 
 pub struct NetworkRuntime {
@@ -247,7 +269,8 @@ fn run_io_thread(
 
     let mut sessions: HashMap<ClientId, Session> = HashMap::new();
     let mut client_id_by_addr: HashMap<SocketAddr, ClientId> = HashMap::new();
-    let mut paced_datagrams: VecDeque<PacedDatagram> = VecDeque::new();
+    let mut paced_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
+    let mut next_paced_seq: u64 = 1;
 
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut app_buf = [0u8; 4096];
@@ -302,7 +325,13 @@ fn run_io_thread(
             session.maybe_send_ping();
 
             if session.flush_stream_writes().is_err()
-                || flush_quic(session, &mut send_buf, &mut paced_datagrams).is_err()
+                || flush_quic(
+                    session,
+                    &mut send_buf,
+                    &mut paced_datagrams,
+                    &mut next_paced_seq,
+                )
+                .is_err()
                 || session.conn.is_closed()
             {
                 disconnected.push(client_id);
@@ -325,7 +354,7 @@ fn run_io_thread(
 
 fn compute_io_wait(
     sessions: &HashMap<ClientId, Session>,
-    paced_datagrams: &VecDeque<PacedDatagram>,
+    paced_datagrams: &BinaryHeap<PacedDatagram>,
 ) -> Duration {
     let mut wait = IO_MAX_WAIT;
 
@@ -335,7 +364,7 @@ fn compute_io_wait(
         }
     }
 
-    if let Some(next) = paced_datagrams.front() {
+    if let Some(next) = paced_datagrams.peek() {
         let now = Instant::now();
         if next.at <= now {
             return Duration::ZERO;
@@ -358,18 +387,20 @@ fn handle_io_command(
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match cmd {
-        IoCommand::AddConnection { client_id, client_addr, initial_packet } => handle_add_connection(
-            shard_id,
-            shard_count,
-            local_addr,
-            config,
-            sessions,
-            client_id_by_addr,
-            event_tx,
-            client_id,
-            client_addr,
-            initial_packet,
-        ),
+        IoCommand::AddConnection { client_id, client_addr, initial_packet } => {
+            handle_add_connection(
+                shard_id,
+                shard_count,
+                local_addr,
+                config,
+                sessions,
+                client_id_by_addr,
+                event_tx,
+                client_id,
+                client_addr,
+                initial_packet,
+            )
+        },
         IoCommand::IncomingDatagram { from, data } => {
             if let Some(client_id) = client_id_by_addr.get(&from).copied() {
                 if let Some(session) = sessions.get_mut(&client_id) {
@@ -426,13 +457,7 @@ fn handle_add_connection(
     };
 
     let mut session = Session::new(client_id, client_addr, conn);
-    recv_on_session(
-        &mut session,
-        &mut pkt_buf,
-        client_addr,
-        local_addr,
-        "conn.recv after accept",
-    );
+    recv_on_session(&mut session, &mut pkt_buf, client_addr, local_addr, "conn.recv after accept");
 
     sessions.insert(client_id, session);
     client_id_by_addr.insert(client_addr, client_id);
@@ -563,10 +588,7 @@ fn decode_and_forward_c2s(
     if handle_c2s_control_packet(session, &packet) {
         return;
     }
-    let _ = event_tx.send(NetworkEvent::ClientPacket {
-        client_id: session.client_id,
-        packet,
-    });
+    let _ = event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
 }
 
 fn handle_c2s_control_packet(session: &mut Session, packet: &C2SPacket) -> bool {
@@ -586,7 +608,7 @@ fn handle_c2s_control_packet(session: &mut Session, packet: &C2SPacket) -> bool 
                     .next()
                     .map(|stats| stats.rtt.as_secs_f64() * 1000.0)
                     .unwrap_or_default();
-                log::info!(
+                log::debug!(
                     "server latency client {}: {:.2}ms (quiche_rtt={:.2}ms)",
                     session.client_id,
                     rtt_ms,
@@ -617,7 +639,8 @@ fn recv_on_session(
 fn flush_quic(
     session: &mut Session,
     send_buf: &mut [u8],
-    paced_datagrams: &mut VecDeque<PacedDatagram>,
+    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
+    next_paced_seq: &mut u64,
 ) -> Result<()> {
     loop {
         match session.conn.send(send_buf) {
@@ -628,8 +651,10 @@ fn flush_quic(
                         at: send_info.at,
                         to: send_info.to,
                         bytes: send_buf[..len].to_vec(),
+                        seq: *next_paced_seq,
                     },
                 );
+                *next_paced_seq = next_paced_seq.wrapping_add(1).max(1);
             },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
@@ -641,26 +666,21 @@ fn flush_quic(
 
 fn flush_due_paced_datagrams(
     socket: &UdpSocket,
-    paced_datagrams: &mut VecDeque<PacedDatagram>,
+    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
 ) -> Result<()> {
     let now = Instant::now();
-    while let Some(pending) = paced_datagrams.front() {
+    while let Some(pending) = paced_datagrams.peek() {
         if pending.at > now {
             break;
         }
-        let pending = paced_datagrams.pop_front().expect("front exists");
+        let pending = paced_datagrams.pop().expect("heap top exists");
         socket.send_to(&pending.bytes, pending.to)?;
     }
     Ok(())
 }
 
-fn push_paced_datagram(paced_datagrams: &mut VecDeque<PacedDatagram>, datagram: PacedDatagram) {
-    let index = paced_datagrams.iter().position(|existing| datagram.at < existing.at);
-    if let Some(index) = index {
-        paced_datagrams.insert(index, datagram);
-    } else {
-        paced_datagrams.push_back(datagram);
-    }
+fn push_paced_datagram(paced_datagrams: &mut BinaryHeap<PacedDatagram>, datagram: PacedDatagram) {
+    paced_datagrams.push(datagram);
 }
 
 fn build_server_quic_config() -> Result<quiche::Config> {
@@ -725,6 +745,7 @@ struct Session {
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
+    queued_stream_bytes: usize,
 }
 
 struct PendingStreamWrite {
@@ -749,6 +770,7 @@ impl Session {
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
+            queued_stream_bytes: 0,
         }
     }
 
@@ -820,17 +842,14 @@ impl Session {
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         framed.extend_from_slice(&payload);
+        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(framed.len());
 
         let state = self.stream_state_mut(stream_id, "tx");
         state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
     }
 
     fn queued_stream_bytes(&self) -> usize {
-        self.streams
-            .values()
-            .flat_map(|state| state.pending_writes.iter())
-            .map(|chunk| chunk.data.len().saturating_sub(chunk.offset))
-            .sum()
+        self.queued_stream_bytes
     }
 
     fn has_stream_budget(&self, next_framed_len: usize) -> bool {
@@ -853,6 +872,8 @@ impl Session {
                 match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], false) {
                     Ok(written) => {
                         chunk.offset += written;
+                        self.queued_stream_bytes =
+                            self.queued_stream_bytes.saturating_sub(written);
                         if chunk.offset < chunk.data.len() {
                             self.requeue_pending_write(stream_id, chunk);
                             break;

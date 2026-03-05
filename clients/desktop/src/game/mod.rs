@@ -465,7 +465,7 @@ impl ClientGame {
                         .path_rtt()
                         .map(|rtt| rtt.as_secs_f64() * 1000.0)
                         .unwrap_or_default();
-                    log::info!(
+                    log::debug!(
                         "client latency: {:.2}ms (quiche_rtt={:.2}ms)",
                         rtt_ms,
                         quiche_rtt_ms

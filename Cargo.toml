@@ -2,6 +2,7 @@
 members = [
   "server",
   "clients/desktop",
+  "clients/desktop-bots",
   "common/protocol_codegen",
 ]
 resolver = "2"
@@ -21,3 +22,6 @@ clap = { version = "4.5", features = ["derive"] }
 sha2 = "0.10"
 log = "0.4"
 env_logger = "0.11"
+
+[profile.release]
+debug = true
