@@ -1,6 +1,6 @@
 use std::collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque};
 use std::fs;
-use std::io;
+use std::io::{self, IoSliceMut};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,16 +14,135 @@ use rand::RngCore;
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::game::{ClientId, NetworkEvent};
-use crate::network_platform::{detect_udp_capabilities, RecvBatch, RecvBatcher, SendBatcher};
 use crate::packets::{
     decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketPriority, PacketTarget,
     S2CPacket, StreamID,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+const MAX_RECV_DATAGRAM_SIZE: usize = 65_535;
+const RECV_BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
+const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
+
+#[derive(Clone, Copy)]
+struct RecvMeta {
+    slot: usize,
+    offset: usize,
+    from: SocketAddr,
+    len: usize,
+}
+
+struct RecvBatch {
+    storage: Vec<u8>,
+    metas: Vec<RecvMeta>,
+}
+
+impl RecvBatch {
+    fn new() -> Self {
+        Self {
+            storage: vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE],
+            metas: Vec::with_capacity(RECV_BATCH_SIZE),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.metas.clear();
+    }
+
+    fn push(&mut self, slot: usize, offset: usize, from: SocketAddr, len: usize) {
+        self.metas.push(RecvMeta { slot, offset, from, len });
+    }
+
+    fn len(&self) -> usize {
+        self.metas.len()
+    }
+
+    fn from(&self, index: usize) -> SocketAddr {
+        self.metas[index].from
+    }
+
+    fn packet(&self, index: usize) -> &[u8] {
+        let meta = self.metas[index];
+        let slot_start = meta.slot * MAX_RECV_DATAGRAM_SIZE;
+        let start = slot_start + meta.offset;
+        &self.storage[start..start + meta.len]
+    }
+}
+
+struct RecvBatcher {
+    socket: UdpSocket,
+    udp_state: quinn_udp::UdpSocketState,
+    rx_meta: Vec<quinn_udp::RecvMeta>,
+}
+
+impl RecvBatcher {
+    fn new(socket: UdpSocket) -> io::Result<Self> {
+        let udp_state = quinn_udp::UdpSocketState::new((&socket).into())?;
+        let rx_meta = vec![quinn_udp::RecvMeta::default(); RECV_BATCH_SIZE];
+        Ok(Self { socket, udp_state, rx_meta })
+    }
+
+    fn recv_next_batch(&mut self, batch: &mut RecvBatch) -> io::Result<usize> {
+        batch.clear();
+
+        let received = {
+            let mut bufs: Vec<IoSliceMut<'_>> = batch
+                .storage
+                .chunks_mut(MAX_RECV_DATAGRAM_SIZE)
+                .take(RECV_BATCH_SIZE)
+                .map(IoSliceMut::new)
+                .collect();
+
+            match self.udp_state.recv((&self.socket).into(), &mut bufs, &mut self.rx_meta) {
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
+                Err(err) => return Err(err),
+            }
+        };
+
+        for slot in 0..received {
+            let meta = &self.rx_meta[slot];
+            let stride = meta.stride.max(1);
+            let mut offset = 0usize;
+
+            while offset < meta.len {
+                let len = (meta.len - offset).min(stride);
+                batch.push(slot, offset, meta.addr, len);
+                offset += stride;
+            }
+        }
+
+        Ok(batch.len())
+    }
+}
+
+struct UdpCapabilities {
+    batch_size: usize,
+    batch_recv: bool,
+    batch_send: bool,
+    gso_enabled: bool,
+    gro_enabled: bool,
+    max_gso_segments: usize,
+    gro_segments: usize,
+}
+
+fn detect_udp_capabilities(socket: &UdpSocket) -> io::Result<UdpCapabilities> {
+    let state = quinn_udp::UdpSocketState::new(socket.into())?;
+    let max_gso_segments = state.max_gso_segments().max(1);
+    let gro_segments = state.gro_segments().max(1);
+    Ok(UdpCapabilities {
+        batch_size: quinn_udp::BATCH_SIZE,
+        batch_recv: quinn_udp::BATCH_SIZE > 1,
+        batch_send: quinn_udp::BATCH_SIZE > 1,
+        gso_enabled: max_gso_segments > 1,
+        gro_enabled: gro_segments > 1,
+        max_gso_segments,
+        gro_segments,
+    })
+}
 
 enum IoCommand {
     DispatchEnvelopes(Vec<PacketEnvelope>),
@@ -124,12 +243,12 @@ impl NetworkRuntime {
                 first_socket.take().expect("first socket available")
             } else {
                 bind_reuseport_udp_socket(local_addr)
-                    .context("failed to bind UDP socket for I/O sender shard")?
+                    .context("failed to bind UDP socket for I/O shard")?
             };
-            let event_tx = event_tx.clone();
-            let running = Arc::clone(&running);
-            let next_client_id = Arc::clone(&next_client_id);
 
+            let event_tx = event_tx.clone();
+            let io_running = Arc::clone(&running);
+            let next_client_id = Arc::clone(&next_client_id);
             let handle = thread::spawn(move || {
                 if let Err(err) = run_io_thread(
                     shard_id,
@@ -137,7 +256,7 @@ impl NetworkRuntime {
                     local_addr,
                     io_rx,
                     event_tx,
-                    running,
+                    io_running,
                     next_client_id,
                 ) {
                     log::error!("I/O thread {shard_id} crashed: {err:#}");
@@ -189,12 +308,14 @@ fn run_io_thread(
     next_client_id: Arc<AtomicU32>,
 ) -> Result<()> {
     let recv_socket = socket.try_clone().context("failed to clone UDP socket for I/O receiver")?;
-    let send_batcher = SendBatcher::new(socket).context("failed to initialize quinn-udp sender")?;
+    let send_udp_state =
+        quinn_udp::UdpSocketState::new((&socket).into()).context("failed to initialize UDP sender state")?;
     let mut recv_batcher =
         RecvBatcher::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
     let mut recv_batch = RecvBatch::new();
     let mut shard = ShardState::new(shard_id, local_addr, build_server_quic_config()?, event_tx);
-    let mut paced_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
+    let mut delayed_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
+    let mut ready_datagrams: VecDeque<PacedDatagram> = VecDeque::new();
     let mut next_paced_seq: u64 = 1;
 
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
@@ -209,13 +330,18 @@ fn run_io_thread(
         );
 
         // Flush any previously queued datagrams whose pacing deadline has arrived.
-        flush_due_paced_datagrams(&send_batcher, &mut paced_datagrams)?;
+        flush_due_paced_datagrams(
+            &socket,
+            &send_udp_state,
+            &mut delayed_datagrams,
+            &mut ready_datagrams,
+        )?;
 
         // Drive due QUIC timeouts (tracked in a min-heap).
         shard.process_due_quic_timeouts();
 
         // Wait for cross-thread work, bounded by next QUIC/pacing deadline.
-        let wait_for = compute_io_wait(&mut shard, &paced_datagrams);
+        let wait_for = compute_io_wait(&mut shard, &delayed_datagrams, &ready_datagrams);
         if !recv_and_drain_io_commands(&io_rx, wait_for, &mut shard) {
             break;
         }
@@ -230,12 +356,18 @@ fn run_io_thread(
             &mut shard,
             &mut app_buf,
             &mut send_buf,
-            &mut paced_datagrams,
+            &mut delayed_datagrams,
+            &mut ready_datagrams,
             &mut next_paced_seq,
         );
 
         // Send datagrams generated by this iteration that are already due.
-        flush_due_paced_datagrams(&send_batcher, &mut paced_datagrams)?;
+        flush_due_paced_datagrams(
+            &socket,
+            &send_udp_state,
+            &mut delayed_datagrams,
+            &mut ready_datagrams,
+        )?;
 
         cleanup_disconnected_sessions(&mut shard, disconnected);
     }
@@ -273,7 +405,8 @@ fn process_sessions_tick(
     shard: &mut ShardState,
     app_buf: &mut [u8],
     send_buf: &mut [u8],
-    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
+    delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
+    ready_datagrams: &mut VecDeque<PacedDatagram>,
     next_paced_seq: &mut u64,
 ) -> Vec<ClientId> {
     let mut disconnected = Vec::new();
@@ -286,7 +419,14 @@ fn process_sessions_tick(
         session.maybe_send_ping();
 
         if session.flush_stream_writes().is_err()
-            || flush_quic(session, send_buf, paced_datagrams, next_paced_seq).is_err()
+            || flush_quic(
+                session,
+                send_buf,
+                delayed_datagrams,
+                ready_datagrams,
+                next_paced_seq,
+            )
+            .is_err()
             || session.conn.is_closed()
         {
             disconnected.push(client_id);
@@ -405,8 +545,13 @@ impl ShardState {
 
 fn compute_io_wait(
     shard: &mut ShardState,
-    paced_datagrams: &BinaryHeap<PacedDatagram>,
+    delayed_datagrams: &BinaryHeap<PacedDatagram>,
+    ready_datagrams: &VecDeque<PacedDatagram>,
 ) -> Duration {
+    if !ready_datagrams.is_empty() {
+        return IO_BACKPRESSURE_WAIT;
+    }
+
     let mut wait = IO_MAX_WAIT;
 
     if let Some(next_timeout) = shard.peek_next_quic_timeout().map(|entry| entry.at) {
@@ -417,7 +562,7 @@ fn compute_io_wait(
         wait = wait.min(next_timeout.duration_since(now));
     }
 
-    if let Some(next) = paced_datagrams.peek() {
+    if let Some(next) = delayed_datagrams.peek() {
         let now = Instant::now();
         if next.at <= now {
             return Duration::ZERO;
@@ -751,14 +896,18 @@ fn recv_on_session(
 fn flush_quic(
     session: &mut Session,
     send_buf: &mut [u8],
-    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
+    delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
+    ready_datagrams: &mut VecDeque<PacedDatagram>,
     next_paced_seq: &mut u64,
 ) -> Result<()> {
+    let now = Instant::now();
     loop {
         match session.conn.send(send_buf) {
             Ok((len, send_info)) => {
                 push_paced_datagram(
-                    paced_datagrams,
+                    delayed_datagrams,
+                    ready_datagrams,
+                    now,
                     PacedDatagram {
                         at: send_info.at,
                         to: send_info.to,
@@ -777,31 +926,35 @@ fn flush_quic(
 }
 
 fn flush_due_paced_datagrams(
-    send_batcher: &SendBatcher,
-    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
+    send_socket: &UdpSocket,
+    send_udp_state: &quinn_udp::UdpSocketState,
+    delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
+    ready_datagrams: &mut VecDeque<PacedDatagram>,
 ) -> Result<()> {
     let now = Instant::now();
-    let mut due = Vec::new();
-    while let Some(next) = paced_datagrams.peek() {
+    while let Some(next) = delayed_datagrams.peek() {
         if next.at > now {
             break;
         }
-        due.push(paced_datagrams.pop().expect("heap top exists"));
+        ready_datagrams.push_back(delayed_datagrams.pop().expect("heap top exists"));
     }
-    if due.is_empty() {
+
+    if ready_datagrams.is_empty() {
         return Ok(());
     }
 
-    let max_gso_segments = send_batcher.max_gso_segments();
-    let mut idx = 0usize;
-    while idx < due.len() {
-        let destination = due[idx].to;
-        let segment_len = due[idx].bytes.len();
+    let max_gso_segments = send_udp_state.max_gso_segments().max(1);
+
+    while let Some(first) = ready_datagrams.front() {
+        let destination = first.to;
+        let segment_len = first.bytes.len();
         let mut segment_count = 1usize;
 
-        while segment_count < max_gso_segments && idx + segment_count < due.len() {
-            let next = &due[idx + segment_count];
-            if next.to != destination || next.bytes.len() != segment_len {
+        for datagram in ready_datagrams.iter().skip(1) {
+            if segment_count >= max_gso_segments {
+                break;
+            }
+            if datagram.to != destination || datagram.bytes.len() != segment_len {
                 break;
             }
             segment_count += 1;
@@ -810,38 +963,47 @@ fn flush_due_paced_datagrams(
         let mut gso_payload = Vec::new();
         let (contents, segment_size) = if segment_count > 1 {
             gso_payload.reserve(segment_len * segment_count);
-            for datagram in &due[idx..idx + segment_count] {
+            for datagram in ready_datagrams.iter().take(segment_count) {
                 gso_payload.extend_from_slice(&datagram.bytes);
             }
             (&gso_payload[..], Some(segment_len))
         } else {
-            (&due[idx].bytes[..], None)
+            (&first.bytes[..], None)
         };
 
-        let transmit =
-            quinn_udp::Transmit { destination, ecn: None, contents, segment_size, src_ip: None };
+        let transmit = quinn_udp::Transmit {
+            destination,
+            ecn: None,
+            contents,
+            segment_size,
+            src_ip: None,
+        };
 
-        match send_batcher.send_transmit(&transmit) {
-            Ok(()) => idx += segment_count,
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                for datagram in due.into_iter().skip(idx) {
-                    push_paced_datagram(paced_datagrams, datagram);
+        match send_udp_state.send(send_socket.into(), &transmit) {
+            Ok(()) => {
+                for _ in 0..segment_count {
+                    let _ = ready_datagrams.pop_front();
                 }
-                return Ok(());
             },
-            Err(err) => {
-                for datagram in due.into_iter().skip(idx) {
-                    push_paced_datagram(paced_datagrams, datagram);
-                }
-                return Err(err.into());
-            },
-        }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) => return Err(err.into()),
+        };
     }
+
     Ok(())
 }
 
-fn push_paced_datagram(paced_datagrams: &mut BinaryHeap<PacedDatagram>, datagram: PacedDatagram) {
-    paced_datagrams.push(datagram);
+fn push_paced_datagram(
+    delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
+    ready_datagrams: &mut VecDeque<PacedDatagram>,
+    now: Instant,
+    datagram: PacedDatagram,
+) {
+    if datagram.at <= now {
+        ready_datagrams.push_back(datagram);
+    } else {
+        delayed_datagrams.push(datagram);
+    }
 }
 
 fn bind_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
