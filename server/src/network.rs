@@ -692,7 +692,7 @@ fn handle_add_connection(
 }
 
 fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
-    if !envelope_can_target_thread(shard, envelope) {
+    if !envelope_has_local_targets(shard, envelope.target) {
         return;
     }
 
@@ -710,10 +710,21 @@ fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelop
     });
 }
 
-fn envelope_can_target_thread(shard: &ShardState, envelope: &PacketEnvelope) -> bool {
-    match envelope.target {
+fn envelope_has_local_targets(shard: &ShardState, target: PacketTarget) -> bool {
+    match target {
         PacketTarget::Client(client_id) => shard.sessions.contains_key(&client_id),
-        _ => true,
+        PacketTarget::Broadcast => !shard.sessions.is_empty(),
+        PacketTarget::BroadcastExcept(excluded_client_id) => {
+            if shard.sessions.len() > 1 {
+                return true;
+            }
+            shard
+                .sessions
+                .keys()
+                .next()
+                .map(|client_id| *client_id != excluded_client_id)
+                .unwrap_or(false)
+        },
     }
 }
 
