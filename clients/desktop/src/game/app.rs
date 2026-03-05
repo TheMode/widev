@@ -26,6 +26,8 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     input_capture: InputCapture,
+    window_focused: bool,
+    window_occluded: bool,
     surface_list_sent: bool,
     last_reported_surface_size: Option<(u32, u32)>,
     last_prompt_signature: Option<String>,
@@ -38,10 +40,16 @@ impl App {
             window: None,
             renderer: None,
             input_capture: InputCapture::new(),
+            window_focused: true,
+            window_occluded: false,
             surface_list_sent: false,
             last_reported_surface_size: None,
             last_prompt_signature: None,
         }
+    }
+
+    fn render_active(&self) -> bool {
+        self.window_focused && !self.window_occluded
     }
 
     fn tick_frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -164,6 +172,8 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.window_focused = true;
+        self.window_occluded = false;
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -193,6 +203,22 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if self.render_active() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            },
+            WindowEvent::Occluded(occluded) => {
+                self.window_occluded = occluded;
+                if self.render_active() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            },
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
@@ -216,9 +242,14 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                if self.render_active() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
+            },
+            WindowEvent::Destroyed => {
+                self.window_focused = false;
             },
             _ => {},
         }
