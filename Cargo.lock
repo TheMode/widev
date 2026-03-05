@@ -2731,6 +2731,7 @@ dependencies = [
  "bincode",
  "clap",
  "env_logger",
+ "libc",
  "log",
  "mio",
  "protocol_codegen",
