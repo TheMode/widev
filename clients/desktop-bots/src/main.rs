@@ -16,7 +16,7 @@ struct Args {
     bots: usize,
 
     /// Bot joins per second.
-    #[arg(long, default_value_t = 50.0)]
+    #[arg(long, default_value_t = 100.0)]
     join_rate: f64,
 
     /// Per-bot local flow tick rate.
