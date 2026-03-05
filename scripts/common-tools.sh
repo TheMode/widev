@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_ADDR="127.0.0.1:4433"
 
+run_release_binary() {
+  local pkg="$1"
+  local bin="$2"
+  shift 2
+
+  cargo build -p "$pkg" --release
+  exec "$ROOT_DIR/target/release/$bin" "$@"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -33,13 +42,13 @@ case "$cmd" in
   server)
     addr="${1:-$DEFAULT_ADDR}"
     cd "$ROOT_DIR"
-    cargo run -p widev-server --release -- "$addr"
+    run_release_binary "widev-server" "widev-server" "$addr"
     ;;
 
   client)
     addr="${1:-$DEFAULT_ADDR}"
     cd "$ROOT_DIR"
-    cargo run -p widev-desktop-client --release -- "$addr"
+    run_release_binary "widev-desktop-client" "widev-desktop-client" "$addr"
     ;;
 
   bots)
@@ -47,7 +56,7 @@ case "$cmd" in
     count="${2:-600}"
     flow="${3:-ack-move}"
     cd "$ROOT_DIR"
-    cargo run -p widev-desktop-bots --release -- "$addr" --bots "$count" --flow "$flow"
+    run_release_binary "widev-desktop-bots" "widev-desktop-bots" "$addr" --bots "$count" --flow "$flow"
     ;;
 
   flame)
