@@ -514,9 +514,7 @@ fn send_envelope_to_session(session: &mut Session, envelope: &PacketEnvelope) {
             queue_stream_packet_with_priority(session, stream_id, packet, envelope.priority)
         },
         PacketPayload::Bundle(bundle) => {
-            for packet in bundle {
-                queue_stream_packet_with_priority(session, stream_id, packet, envelope.priority);
-            }
+            queue_stream_bundle_with_priority(session, stream_id, bundle, envelope.priority)
         },
     }
 }
@@ -541,6 +539,44 @@ fn queue_stream_packet_with_priority(
     }
 
     session.queue_stream_packet(stream_id, payload);
+}
+
+fn queue_stream_bundle_with_priority(
+    session: &mut Session,
+    stream_id: StreamID,
+    bundle: &[S2CPacket],
+    priority: PacketPriority,
+) {
+    if bundle.is_empty() {
+        return;
+    }
+
+    let mut framed_payloads = Vec::with_capacity(bundle.len());
+    let mut total_framed_len = 0usize;
+
+    for packet in bundle {
+        let Ok(payload) = encode_s2c(packet) else {
+            continue;
+        };
+        let framed_len = 4 + payload.len();
+        total_framed_len = total_framed_len.saturating_add(framed_len);
+        framed_payloads.push(payload);
+    }
+
+    if framed_payloads.is_empty() {
+        return;
+    }
+
+    if matches!(priority, PacketPriority::Droppable) && !session.has_stream_budget(total_framed_len)
+    {
+        log::debug!(
+            "dropping bundle for client {} due to stream congestion budget",
+            session.client_id
+        );
+        return;
+    }
+
+    session.queue_stream_bundle(stream_id, framed_payloads, total_framed_len);
 }
 
 fn pump_app_packets(
@@ -844,6 +880,27 @@ impl Session {
         framed.extend_from_slice(&payload);
         self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(framed.len());
 
+        let state = self.stream_state_mut(stream_id, "tx");
+        state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
+    }
+
+    fn queue_stream_bundle(
+        &mut self,
+        stream_id: u64,
+        payloads: Vec<Vec<u8>>,
+        total_framed_len: usize,
+    ) {
+        if payloads.is_empty() {
+            return;
+        }
+
+        let mut framed = Vec::with_capacity(total_framed_len);
+        for payload in payloads {
+            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&payload);
+        }
+
+        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(framed.len());
         let state = self.stream_state_mut(stream_id, "tx");
         state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
     }
