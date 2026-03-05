@@ -309,8 +309,8 @@ fn run_io_thread(
     next_client_id: Arc<AtomicU32>,
 ) -> Result<()> {
     let recv_socket = socket.try_clone().context("failed to clone UDP socket for I/O receiver")?;
-    let send_udp_state =
-        quinn_udp::UdpSocketState::new((&socket).into()).context("failed to initialize UDP sender state")?;
+    let send_udp_state = quinn_udp::UdpSocketState::new((&socket).into())
+        .context("failed to initialize UDP sender state")?;
     let mut recv_batcher =
         RecvBatcher::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
     let mut recv_batch = RecvBatch::new();
@@ -420,14 +420,8 @@ fn process_sessions_tick(
         session.maybe_send_ping();
 
         if session.flush_stream_writes().is_err()
-            || flush_quic(
-                session,
-                send_buf,
-                delayed_datagrams,
-                ready_datagrams,
-                next_paced_seq,
-            )
-            .is_err()
+            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams, next_paced_seq)
+                .is_err()
             || session.conn.is_closed()
         {
             disconnected.push(client_id);
@@ -983,13 +977,8 @@ fn flush_due_paced_datagrams(
             (&first.bytes[..], None)
         };
 
-        let transmit = quinn_udp::Transmit {
-            destination,
-            ecn: None,
-            contents,
-            segment_size,
-            src_ip: None,
-        };
+        let transmit =
+            quinn_udp::Transmit { destination, ecn: None, contents, segment_size, src_ip: None };
 
         match send_udp_state.send(send_socket.into(), &transmit) {
             Ok(()) => {

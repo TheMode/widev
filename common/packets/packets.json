@@ -102,14 +102,6 @@
       ]
     },
     {
-      "name": "AssetManifest",
-      "description": "Initial visual asset metadata for the current game session.",
-      "fields": [
-        { "name": "player_color_rgba", "type": "[u8; 4]" },
-        { "name": "player_size", "type": "u16" }
-      ]
-    },
-    {
       "name": "SetGameName",
       "description": "Display name of the game/session for client UI.",
       "fields": [
@@ -182,6 +174,14 @@
         { "name": "enabled", "type": "bool" },
         { "name": "affected_mask", "type": "TransformPredictionMask" },
         { "name": "kind", "type": "PredictionKind" }
+      ]
+    },
+    {
+      "name": "ElementSetColor",
+      "description": "Set draw color for one element on this client.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "color", "type": "Color" }
       ]
     }
   ]

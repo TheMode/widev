@@ -11,6 +11,8 @@ use crate::packets::{
 const GAME_WIDTH: f32 = 800.0;
 const GAME_HEIGHT: f32 = 600.0;
 const PLAYER_SPEED: f32 = 220.0;
+const OWN_PLAYER_COLOR: [f32; 4] = [0.74, 0.17, 245.0, 1.0];
+const OTHER_PLAYER_COLOR: [f32; 4] = [0.65, 0.24, 29.0, 1.0];
 
 #[derive(Default, Clone, Copy)]
 struct PlayerInput {
@@ -58,7 +60,6 @@ impl RedSquareGame {
             S2CPacket::SetGameName { name: "Red Square Multiplayer".to_string() },
             S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
             S2CPacket::SurfaceClearBackground { surface_id: 1, color: [0.18, 0.02, 250.0, 1.0] },
-            S2CPacket::AssetManifest { player_color_rgba: [255, 0, 0, 255], player_size: 32 },
         ];
 
         let binding_packets =
@@ -100,6 +101,14 @@ impl Game for RedSquareGame {
                 let mut snapshot_bundle: PacketBundle = Vec::new();
                 for element_id in snapshots {
                     snapshot_bundle.push(S2CPacket::ElementAdd { element_id });
+                    snapshot_bundle.push(S2CPacket::ElementSetColor {
+                        element_id,
+                        color: if element_id == client_id {
+                            OWN_PLAYER_COLOR
+                        } else {
+                            OTHER_PLAYER_COLOR
+                        },
+                    });
                     snapshot_bundle.push(S2CPacket::ElementSetTransformPrediction {
                         element_id,
                         enabled: true,
@@ -117,6 +126,7 @@ impl Game for RedSquareGame {
                 let mut bundle: PacketBundle = Vec::new();
                 bundle.extend([
                     S2CPacket::ElementAdd { element_id: client_id },
+                    S2CPacket::ElementSetColor { element_id: client_id, color: OTHER_PLAYER_COLOR },
                     S2CPacket::ElementSetTransformPrediction {
                         element_id: client_id,
                         enabled: true,

@@ -16,6 +16,8 @@ const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
+const PLAYER_SIZE: f32 = 32.0;
+const DEFAULT_PLAYER_COLOR: protocol::Color = [0.65, 0.24, 29.0, 1.0];
 const CLIENT_CAPABILITIES: &[&str] = &[
     "render.draw_square",
     "prediction.lerp",
@@ -53,6 +55,7 @@ pub(super) struct SurfaceState {
 #[derive(Clone, Copy)]
 struct ElementState {
     visible: bool,
+    color: protocol::Color,
     last_authoritative: Vec2f,
     last_authoritative_at: Instant,
     target: Vec2f,
@@ -85,9 +88,10 @@ impl PredictionConfig {
 }
 
 impl ElementState {
-    fn hidden(now: Instant, prediction: PredictionConfig) -> Self {
+    fn hidden(now: Instant, prediction: PredictionConfig, color: protocol::Color) -> Self {
         Self {
             visible: false,
+            color,
             last_authoritative: Vec2f::default(),
             last_authoritative_at: now,
             target: Vec2f::default(),
@@ -145,8 +149,6 @@ pub(super) struct ClientGame {
     net: network::QuicClient,
     sent_hello: bool,
     server_cert_fingerprint: Option<String>,
-    draw_size: u16,
-    draw_color_rgba: [u8; 4],
     elements: HashMap<u32, ElementState>,
     game_name: String,
     bindings: bindings::BindingState,
@@ -164,8 +166,6 @@ impl ClientGame {
             net: network::QuicClient::connect(server_addr)?,
             sent_hello: false,
             server_cert_fingerprint: None,
-            draw_size: 32,
-            draw_color_rgba: [255, 0, 0, 255],
             elements: HashMap::new(),
             game_name: "widev desktop POC".to_string(),
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
@@ -254,9 +254,9 @@ impl ClientGame {
             .map(|e| RenderState {
                 x: e.draw.x,
                 y: e.draw.y,
-                width: self.draw_size as f32,
-                height: self.draw_size as f32,
-                color: rgba_to_u32(self.draw_color_rgba),
+                width: PLAYER_SIZE,
+                height: PLAYER_SIZE,
+                color: oklch_to_u32(e.color),
             })
             .collect()
     }
@@ -432,7 +432,9 @@ impl ClientGame {
         let now = Instant::now();
         let prediction =
             self.pending_prediction.remove(&element_id).unwrap_or(self.default_prediction);
-        self.elements.entry(element_id).or_insert_with(|| ElementState::hidden(now, prediction));
+        self.elements
+            .entry(element_id)
+            .or_insert_with(|| ElementState::hidden(now, prediction, DEFAULT_PLAYER_COLOR));
     }
 
     fn handle_element_move(&mut self, element_id: u32, x: f32, y: f32) {
@@ -447,6 +449,14 @@ impl ClientGame {
             return;
         }
         element.apply_authoritative_move(position, now);
+    }
+
+    fn apply_element_color(&mut self, element_id: u32, color: protocol::Color) {
+        if let Some(element) = self.elements.get_mut(&element_id) {
+            element.color = color;
+        } else {
+            log::debug!("ignored ElementSetColor for unknown element_id={element_id}");
+        }
     }
 
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
@@ -472,10 +482,6 @@ impl ClientGame {
                     );
                 }
             },
-            protocol::S2CPacket::AssetManifest { player_color_rgba, player_size } => {
-                self.draw_color_rgba = player_color_rgba;
-                self.draw_size = player_size;
-            },
             protocol::S2CPacket::SetGameName { name } => {
                 self.game_name = name;
             },
@@ -495,6 +501,9 @@ impl ClientGame {
                 kind,
             } => {
                 self.apply_transform_prediction(element_id, enabled, affected_mask, kind);
+            },
+            protocol::S2CPacket::ElementSetColor { element_id, color } => {
+                self.apply_element_color(element_id, color);
             },
             protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
                 self.handle_binding_declare(binding_id, identifier, input_type)?;
@@ -546,8 +555,28 @@ pub fn run(config: GameConfig) -> Result<()> {
     app::run(game)
 }
 
-fn rgba_to_u32([r, g, b, _a]: [u8; 4]) -> u32 {
-    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+fn oklch_to_u32([l, c, h_deg, _alpha]: protocol::Color) -> u32 {
+    let l = l.clamp(0.0, 1.0) as f64;
+    let c = c.max(0.0) as f64;
+    let hue = (h_deg as f64).to_radians();
+    let a = c * hue.cos();
+    let b = c * hue.sin();
+
+    let l_ = l + 0.396_337_777_4 * a + 0.215_803_757_3 * b;
+    let m_ = l - 0.105_561_345_8 * a - 0.063_854_172_8 * b;
+    let s_ = l - 0.089_484_177_5 * a - 1.291_485_548 * b;
+
+    let l3 = l_ * l_ * l_;
+    let m3 = m_ * m_ * m_;
+    let s3 = s_ * s_ * s_;
+
+    let r = (4.076_741_662_1 * l3 - 3.307_711_591_3 * m3 + 0.230_969_929_2 * s3).clamp(0.0, 1.0);
+    let g = (-1.268_438_004_6 * l3 + 2.609_757_401_1 * m3 - 0.341_319_396_5 * s3).clamp(0.0, 1.0);
+    let b = (-0.004_196_086_3 * l3 - 0.703_418_614_7 * m3 + 1.707_614_701 * s3).clamp(0.0, 1.0);
+
+    (((r * 255.0).round() as u32) << 16)
+        | (((g * 255.0).round() as u32) << 8)
+        | ((b * 255.0).round() as u32)
 }
 
 fn fingerprint_hex(der: &[u8]) -> String {
