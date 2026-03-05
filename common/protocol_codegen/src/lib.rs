@@ -12,6 +12,8 @@ pub struct Schema {
     pub enums: Vec<EnumDef>,
     #[serde(default)]
     pub bitmasks: Vec<BitmaskDef>,
+    #[serde(default)]
+    pub common: Vec<PacketDef>,
     pub c2s: Vec<PacketDef>,
     pub s2c: Vec<PacketDef>,
 }
@@ -112,6 +114,9 @@ impl CodegenBackend for RustBackend {
 
         out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
         out.push_str("pub enum C2SPacket {\n");
+        for packet in &schema.common {
+            out.push_str(&format_variant(packet));
+        }
         for packet in &schema.c2s {
             out.push_str(&format_variant(packet));
         }
@@ -119,6 +124,9 @@ impl CodegenBackend for RustBackend {
 
         out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
         out.push_str("pub enum S2CPacket {\n");
+        for packet in &schema.common {
+            out.push_str(&format_variant(packet));
+        }
         for packet in &schema.s2c {
             out.push_str(&format_variant(packet));
         }

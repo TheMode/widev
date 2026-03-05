@@ -1,25 +1,20 @@
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
-use std::fs;
-use std::net::{SocketAddr, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use quiche::{Connection, RecvInfo};
-use rand::RngCore;
 
 mod game;
 mod game_state;
 mod games;
+mod network;
 #[allow(dead_code)]
 mod packets;
 
-use game::{ClientId, Game};
-use game_state::{GameState, StreamPacket};
-use packets::{decode_c2s, encode_s2c, S2CPacket};
+use game::Game;
+use game_state::GameState;
+use network::{NetworkEvent, NetworkRuntime};
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Parser)]
@@ -30,268 +25,47 @@ struct Args {
     bind: SocketAddr,
 }
 
-struct Session {
-    client_id: ClientId,
-    conn: Connection,
-    client_addr: SocketAddr,
-    streams: HashMap<u64, QuicStreamState>,
-}
-
-struct PendingStreamWrite {
-    data: Vec<u8>,
-    offset: usize,
-}
-
-#[derive(Default)]
-struct QuicStreamState {
-    recv_buffer: Vec<u8>,
-    pending_writes: VecDeque<PendingStreamWrite>,
-    recv_finished: bool,
-}
-
-impl Session {
-    fn stream_state_mut(&mut self, stream_id: u64, direction: &str) -> &mut QuicStreamState {
-        match self.streams.entry(stream_id) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                log::debug!(
-                    "server stream {} created for client {} ({direction})",
-                    stream_id,
-                    self.client_id
-                );
-                entry.insert(QuicStreamState::default())
-            },
-        }
-    }
-
-    fn requeue_pending_write(&mut self, stream_id: u64, chunk: PendingStreamWrite) {
-        if let Some(state) = self.streams.get_mut(&stream_id) {
-            state.pending_writes.push_front(chunk);
-        }
-    }
-
-    fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
-        let client_id = self.client_id;
-        let state = self.stream_state_mut(stream_id, "rx");
-        state.recv_buffer.extend_from_slice(bytes);
-        if fin && !state.recv_finished {
-            log::debug!(
-                "server stream {} received FIN from client {}",
-                stream_id,
-                client_id
-            );
-        }
-        state.recv_finished |= fin;
-
-        let mut frames = Vec::new();
-        while let Some(frame) = pop_frame(&mut state.recv_buffer) {
-            frames.push(frame);
-        }
-        if state.recv_finished && !state.recv_buffer.is_empty() {
-            log::warn!(
-                "dropping {} trailing bytes on stream {} after FIN (incomplete frame)",
-                state.recv_buffer.len(),
-                stream_id
-            );
-            state.recv_buffer.clear();
-        }
-
-        self.cleanup_stream_if_closed(stream_id);
-        frames
-    }
-
-    fn queue_stream_packet(&mut self, stream_id: u64, payload: Vec<u8>) {
-        let mut framed = Vec::with_capacity(4 + payload.len());
-        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&payload);
-
-        let state = self.stream_state_mut(stream_id, "tx");
-        state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
-    }
-
-    fn flush_stream_writes(&mut self) -> Result<()> {
-        let stream_ids: Vec<u64> = self.streams.keys().copied().collect();
-        for stream_id in stream_ids {
-            loop {
-                let Some(mut chunk) = self
-                    .streams
-                    .get_mut(&stream_id)
-                    .and_then(|state| state.pending_writes.pop_front())
-                else {
-                    break;
-                };
-
-                match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], false) {
-                    Ok(written) => {
-                        chunk.offset += written;
-                        if chunk.offset < chunk.data.len() {
-                            self.requeue_pending_write(stream_id, chunk);
-                            break;
-                        }
-                    },
-                    Err(quiche::Error::Done) => {
-                        self.requeue_pending_write(stream_id, chunk);
-                        break;
-                    },
-                    Err(err) => return Err(anyhow::anyhow!("stream_send failed: {err:?}")),
-                }
-            }
-
-            self.cleanup_stream_if_closed(stream_id);
-        }
-
-        Ok(())
-    }
-
-    fn cleanup_stream_if_closed(&mut self, stream_id: u64) {
-        let should_remove = if let Some(state) = self.streams.get(&stream_id) {
-            state.pending_writes.is_empty()
-                && state.recv_buffer.is_empty()
-                && (state.recv_finished || self.conn.stream_finished(stream_id))
-        } else {
-            false
-        };
-        if should_remove {
-            self.streams.remove(&stream_id);
-            log::debug!(
-                "server stream {} cleaned up for client {}",
-                stream_id,
-                self.client_id
-            );
-        }
-    }
-}
-
 fn main() -> Result<()> {
     init_logging();
 
     let args = Args::parse();
-    let bind_addr = args.bind;
+    let network = NetworkRuntime::start(args.bind)?;
 
-    let socket = UdpSocket::bind(bind_addr)
-        .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
-    socket.set_nonblocking(true).context("failed to set UDP socket non-blocking")?;
-
-    let local_addr = socket.local_addr().context("failed to read local addr")?;
-    log::info!("server listening on {local_addr}");
-
-    let cert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("certs");
-    ensure_dev_certs(&cert_dir)?;
-    let cert_path = cert_dir.join("cert.crt");
-    let key_path = cert_dir.join("cert.key");
-    let cert_path_str = cert_path.to_str().context("certificate path is not valid UTF-8")?;
-    let key_path_str = key_path.to_str().context("private key path is not valid UTF-8")?;
-
-    let mut config = build_server_quic_config(cert_path_str, key_path_str, &cert_path, &key_path)?;
-
-    let mut recv_buf = [0u8; 65_535];
-    let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
-    let mut app_buf = [0u8; 4096];
-
-    let mut sessions: Vec<Session> = Vec::new();
-    let mut next_client_id: ClientId = 1;
     let mut game_state = GameState::new(60);
     let mut game = games::default_game(Instant::now(), &mut game_state);
     let mut last_tick = Instant::now();
 
     loop {
-        loop {
-            let recv = socket.recv_from(&mut recv_buf);
-            let (len, from) = match recv {
-                Ok(v) => v,
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(err) => return Err(err).context("socket recv_from failed"),
-            };
-
-            if let Some(session) = sessions.iter_mut().find(|s| s.client_addr == from) {
-                recv_on_session(session, &mut recv_buf[..len], from, local_addr, "conn.recv");
-                continue;
-            }
-
-            let mut pkt_buf = recv_buf[..len].to_vec();
-            let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-
-            if hdr.ty != quiche::Type::Initial {
-                continue;
-            }
-
-            let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-            rand::thread_rng().fill_bytes(&mut scid);
-            let scid = quiche::ConnectionId::from_ref(&scid);
-
-            let conn = quiche::accept(&scid, None, local_addr, from, &mut config)
-                .context("failed to accept incoming QUIC connection")?;
-
-            let client_id = next_client_id;
-            next_client_id = next_client_id.wrapping_add(1).max(1);
-
-            let mut session =
-                Session { client_id, conn, client_addr: from, streams: HashMap::new() };
-
-            recv_on_session(
-                &mut session,
-                &mut recv_buf[..len],
-                from,
-                local_addr,
-                "conn.recv after accept",
-            );
-
-            sessions.push(session);
-            game_state.connect_client(client_id);
-            game.on_client_connected(&mut game_state, client_id);
-            log::info!("accepted connection from {from} as client {client_id}");
-        }
+        handle_network_events(&network, &mut game_state, game.as_mut());
 
         let now = Instant::now();
         let dt = now.duration_since(last_tick);
         if dt >= game_state.tick_interval() {
-            for session in &mut sessions {
-                if session.conn.is_established() {
-                    pump_app_packets(session, &mut app_buf, game.as_mut(), &mut game_state);
-                }
-            }
-
             game.on_tick(&mut game_state, now, dt);
-
-            let mut disconnected_ids: Vec<ClientId> = Vec::new();
-            sessions.retain_mut(|session| {
-                drain_game_outbox_for_session(session, &mut game_state);
-
-                if session.flush_stream_writes().is_err()
-                    || flush_quic(&socket, session, &mut send_buf).is_err()
-                    || session.conn.is_closed()
-                {
-                    disconnected_ids.push(session.client_id);
-                    return false;
-                }
-
-                true
-            });
-
-            for client_id in disconnected_ids {
-                game_state.disconnect_client(client_id);
-                game.on_client_disconnected(&mut game_state, client_id);
-            }
-
-            for session in &mut sessions {
-                drain_game_outbox_for_session(session, &mut game_state);
-            }
-
+            let envelopes = game_state.drain_outbox();
+            network.dispatch_envelopes(envelopes);
             last_tick = now;
         }
 
-        for session in &mut sessions {
-            if let Some(timeout) = session.conn.timeout() {
-                if timeout.is_zero() {
-                    session.conn.on_timeout();
-                }
-            }
-        }
-
         std::thread::sleep(IDLE_SLEEP);
+    }
+}
+
+fn handle_network_events(network: &NetworkRuntime, state: &mut GameState, game: &mut dyn Game) {
+    for event in network.drain_events() {
+        match event {
+            NetworkEvent::ClientConnected(client_id) => {
+                state.connect_client(client_id);
+                game.on_client_connected(state, client_id);
+            },
+            NetworkEvent::ClientDisconnected(client_id) => {
+                state.disconnect_client(client_id);
+                game.on_client_disconnected(state, client_id);
+            },
+            NetworkEvent::ClientPacket { client_id, packet } => {
+                game.on_client_packet(state, client_id, packet);
+            },
+        }
     }
 }
 
@@ -313,164 +87,4 @@ fn init_logging() {
             writeln!(buf, "[{} {}{}{}] {}", ts, c0, record.level(), c1, record.args())
         })
         .init();
-}
-
-fn pump_app_packets(
-    session: &mut Session,
-    app_buf: &mut [u8],
-    game: &mut dyn Game,
-    state: &mut GameState,
-) {
-    loop {
-        match session.conn.dgram_recv(app_buf) {
-            Ok(len) => {
-                if let Ok(packet) = decode_c2s(&app_buf[..len]) {
-                    game.on_client_packet(state, session.client_id, packet);
-                }
-            },
-            Err(quiche::Error::Done) => break,
-            Err(_) => break,
-        }
-    }
-
-    for stream_id in session.conn.readable() {
-        loop {
-            match session.conn.stream_recv(stream_id, app_buf) {
-                Ok((len, fin)) => {
-                    let frames = session.ingest_stream_data(stream_id, &app_buf[..len], fin);
-                    for frame in frames {
-                        if let Ok(packet) = decode_c2s(&frame) {
-                            game.on_client_packet(state, session.client_id, packet);
-                        }
-                    }
-                    if fin {
-                        break;
-                    }
-                },
-                Err(quiche::Error::Done) => break,
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-fn recv_on_session(
-    session: &mut Session,
-    buf: &mut [u8],
-    from: SocketAddr,
-    local_addr: SocketAddr,
-    context: &str,
-) {
-    let recv_info = RecvInfo { from, to: local_addr };
-    if let Err(err) = session.conn.recv(buf, recv_info) {
-        if err != quiche::Error::Done {
-            log::warn!("{context} failed: {err:?}");
-        }
-    }
-}
-
-fn send_game_packets(session: &mut Session, packets: Vec<S2CPacket>) {
-    for packet in packets {
-        if let Ok(bytes) = encode_s2c(&packet) {
-            let _ = session.conn.dgram_send(&bytes);
-        }
-    }
-}
-
-fn drain_game_outbox_for_session(session: &mut Session, game_state: &mut GameState) {
-    if !session.conn.is_established() {
-        return;
-    }
-
-    let packets = game_state.drain_datagrams_for(session.client_id);
-    send_game_packets(session, packets);
-    let stream_packets = game_state.drain_stream_packets_for(session.client_id);
-    queue_stream_packets(session, stream_packets);
-}
-
-fn queue_stream_packets(session: &mut Session, packets: Vec<StreamPacket>) {
-    for stream_packet in packets {
-        if let Ok(payload) = encode_s2c(&stream_packet.packet) {
-            session.queue_stream_packet(stream_packet.stream_id, payload);
-        }
-    }
-}
-
-fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if buffer.len() < 4 {
-        return None;
-    }
-    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-    if buffer.len() < 4 + len {
-        return None;
-    }
-    let payload = buffer[4..4 + len].to_vec();
-    buffer.drain(..4 + len);
-    Some(payload)
-}
-
-fn flush_quic(socket: &UdpSocket, session: &mut Session, send_buf: &mut [u8]) -> Result<()> {
-    loop {
-        match session.conn.send(send_buf) {
-            Ok((len, send_info)) => {
-                socket.send_to(&send_buf[..len], send_info.to)?;
-            },
-            Err(quiche::Error::Done) => break,
-            Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
-        }
-    }
-
-    Ok(())
-}
-
-fn build_server_quic_config(
-    cert_path_str: &str,
-    key_path_str: &str,
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-    config
-        .load_cert_chain_from_pem_file(cert_path_str)
-        .with_context(|| format!("failed to load {}", cert_path.display()))?;
-    config
-        .load_priv_key_from_pem_file(key_path_str)
-        .with_context(|| format!("failed to load {}", key_path.display()))?;
-    config.set_application_protos(&[b"widev-poc-quic"]).context("failed setting ALPN")?;
-    config.set_max_idle_timeout(10_000);
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(16);
-    config.set_initial_max_streams_uni(16);
-    config.enable_dgram(true, 64, 64);
-    config.verify_peer(false);
-    Ok(config)
-}
-
-fn ensure_dev_certs(cert_dir: &PathBuf) -> Result<()> {
-    let cert_path = cert_dir.join("cert.crt");
-    let key_path = cert_dir.join("cert.key");
-    if cert_path.exists() && key_path.exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(cert_dir)
-        .with_context(|| format!("failed to create cert directory {}", cert_dir.display()))?;
-
-    let certified_key = rcgen::generate_simple_self_signed(vec!["widev.local".to_string()])
-        .context("failed to generate self-signed cert")?;
-    let cert_pem = certified_key.cert.pem();
-    let key_pem = certified_key.key_pair.serialize_pem();
-
-    fs::write(&cert_path, cert_pem)
-        .with_context(|| format!("failed to write {}", cert_path.display()))?;
-    fs::write(&key_path, key_pem)
-        .with_context(|| format!("failed to write {}", key_path.display()))?;
-
-    log::info!("generated local dev certs in {}", cert_dir.display());
-    Ok(())
 }

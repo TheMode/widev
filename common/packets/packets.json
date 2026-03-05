@@ -36,6 +36,22 @@
       ]
     }
   ],
+  "common": [
+    {
+      "name": "Ping",
+      "description": "Ping for RTT measurement and keep-alive.",
+      "fields": [
+        { "name": "nonce", "type": "u64" }
+      ]
+    },
+    {
+      "name": "Pong",
+      "description": "Ping response echoing nonce for RTT measurement.",
+      "fields": [
+        { "name": "nonce", "type": "u64" }
+      ]
+    }
+  ],
   "c2s": [
     {
       "name": "ClientHello",

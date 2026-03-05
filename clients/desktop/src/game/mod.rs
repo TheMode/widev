@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bindings::{BindingPromptState, DeclareBindingOutcome};
@@ -15,6 +15,7 @@ mod renderer;
 const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
+const PING_INTERVAL: Duration = Duration::from_secs(2);
 const CLIENT_CAPABILITIES: &[&str] = &[
     "render.draw_square",
     "prediction.lerp",
@@ -152,6 +153,9 @@ pub(super) struct ClientGame {
     default_prediction: PredictionConfig,
     pending_prediction: HashMap<u32, PredictionConfig>,
     surfaces: HashMap<protocol::SurfaceId, SurfaceState>,
+    pending_ping_nonces: HashMap<u64, Instant>,
+    next_ping_nonce: u64,
+    last_ping_sent_at: Instant,
 }
 
 impl ClientGame {
@@ -168,6 +172,9 @@ impl ClientGame {
             default_prediction: PredictionConfig::default(),
             pending_prediction: HashMap::new(),
             surfaces: HashMap::new(),
+            pending_ping_nonces: HashMap::new(),
+            next_ping_nonce: 1,
+            last_ping_sent_at: Instant::now(),
         })
     }
 
@@ -194,6 +201,7 @@ impl ClientGame {
             self.sent_hello = true;
             log::info!("connected to server {}", self.net.server_addr());
         }
+        self.maybe_send_ping()?;
 
         for element in self.elements.values_mut() {
             element.tick_prediction();
@@ -446,6 +454,24 @@ impl ClientGame {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
                 log::info!("server tick rate: {tick_rate_hz}Hz");
             },
+            protocol::S2CPacket::Ping { nonce } => {
+                self.send_c2s(protocol::C2SPacket::Pong { nonce })?;
+            },
+            protocol::S2CPacket::Pong { nonce } => {
+                if let Some(sent_at) = self.pending_ping_nonces.remove(&nonce) {
+                    let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                    let quiche_rtt_ms = self
+                        .net
+                        .path_rtt()
+                        .map(|rtt| rtt.as_secs_f64() * 1000.0)
+                        .unwrap_or_default();
+                    log::info!(
+                        "client latency: {:.2}ms (quiche_rtt={:.2}ms)",
+                        rtt_ms,
+                        quiche_rtt_ms
+                    );
+                }
+            },
             protocol::S2CPacket::AssetManifest { player_color_rgba, player_size } => {
                 self.draw_color_rgba = player_color_rgba;
                 self.draw_size = player_size;
@@ -497,6 +523,21 @@ impl ClientGame {
             self.net.send_datagram(&bytes)?;
         }
         Ok(())
+    }
+
+    fn maybe_send_ping(&mut self) -> Result<()> {
+        if !self.net.is_established() {
+            return Ok(());
+        }
+        if self.last_ping_sent_at.elapsed() < PING_INTERVAL {
+            return Ok(());
+        }
+
+        let nonce = self.next_ping_nonce;
+        self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1).max(1);
+        self.pending_ping_nonces.insert(nonce, Instant::now());
+        self.last_ping_sent_at = Instant::now();
+        self.send_c2s(protocol::C2SPacket::Ping { nonce })
     }
 }
 
