@@ -145,7 +145,7 @@ fn detect_udp_capabilities(socket: &UdpSocket) -> io::Result<UdpCapabilities> {
 }
 
 enum IoCommand {
-    DispatchEnvelopes(Vec<PacketEnvelope>),
+    DispatchEnvelopes(Arc<[PacketEnvelope]>),
     Shutdown,
 }
 
@@ -280,8 +280,9 @@ impl NetworkRuntime {
         if envelopes.is_empty() {
             return;
         }
+        let shared: Arc<[PacketEnvelope]> = envelopes.into();
         for sender in &self.io_senders {
-            let _ = sender.send(IoCommand::DispatchEnvelopes(envelopes.clone()));
+            let _ = sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
         }
     }
 }
@@ -576,8 +577,8 @@ fn compute_io_wait(
 fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
     match cmd {
         IoCommand::DispatchEnvelopes(envelopes) => {
-            for envelope in envelopes {
-                dispatch_envelope_for_thread(shard, &envelope);
+            for envelope in envelopes.iter() {
+                dispatch_envelope_for_thread(shard, envelope);
             }
         },
         IoCommand::Shutdown => {},
@@ -1214,7 +1215,9 @@ impl Session {
 
     fn has_stream_budget(&self, next_framed_len: usize) -> bool {
         let quantum = self.conn.send_quantum();
-        self.queued_stream_bytes.saturating_add(next_framed_len) <= quantum
+        // Allow a single oversized payload while still preventing unbounded queue growth.
+        let budget = quantum.max(next_framed_len);
+        self.queued_stream_bytes.saturating_add(next_framed_len) <= budget
     }
 
     fn flush_stream_writes(&mut self) -> Result<()> {
