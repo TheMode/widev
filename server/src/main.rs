@@ -13,7 +13,8 @@ mod packets;
 
 use game::Game;
 use game_state::GameState;
-use network::{NetworkEvent, NetworkRuntime};
+use game::NetworkEvent;
+use network::NetworkRuntime;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -53,19 +54,16 @@ fn main() -> Result<()> {
 
 fn handle_network_events(network: &NetworkRuntime, state: &mut GameState, game: &mut dyn Game) {
     for event in network.drain_events() {
-        match event {
+        match &event {
             NetworkEvent::ClientConnected(client_id) => {
-                state.connect_client(client_id);
-                game.on_client_connected(state, client_id);
+                state.connect_client(*client_id);
             },
             NetworkEvent::ClientDisconnected(client_id) => {
-                state.disconnect_client(client_id);
-                game.on_client_disconnected(state, client_id);
+                state.disconnect_client(*client_id);
             },
-            NetworkEvent::ClientPacket { client_id, packet } => {
-                game.on_client_packet(state, client_id, packet);
-            },
+            NetworkEvent::ClientPacket { .. } => {},
         }
+        game.on_event(state, event);
     }
 }
 

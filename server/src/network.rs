@@ -13,7 +13,7 @@ use mio::{Events, Interest, Poll, Token};
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
 
-use crate::game::ClientId;
+use crate::game::{ClientId, NetworkEvent};
 use crate::packets::{
     decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketPriority, PacketTarget,
     S2CPacket, StreamID,
@@ -25,16 +25,6 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
 const SERVER_SOCKET: Token = Token(0);
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
-
-#[derive(Debug)]
-pub enum NetworkEvent {
-    ClientConnected(ClientId),
-    ClientDisconnected(ClientId),
-    ClientPacket {
-        client_id: ClientId,
-        packet: C2SPacket,
-    },
-}
 
 enum IoCommand {
     AddConnection {

@@ -5,9 +5,17 @@ use crate::packets::C2SPacket;
 
 pub type ClientId = u32;
 
+#[derive(Debug)]
+pub enum NetworkEvent {
+    ClientConnected(ClientId),
+    ClientDisconnected(ClientId),
+    ClientPacket {
+        client_id: ClientId,
+        packet: C2SPacket,
+    },
+}
+
 pub trait Game {
-    fn on_client_connected(&mut self, state: &mut GameState, client_id: ClientId);
-    fn on_client_disconnected(&mut self, state: &mut GameState, client_id: ClientId);
-    fn on_client_packet(&mut self, state: &mut GameState, client_id: ClientId, packet: C2SPacket);
+    fn on_event(&mut self, state: &mut GameState, event: NetworkEvent);
     fn on_tick(&mut self, state: &mut GameState, now: Instant, dt: Duration);
 }
