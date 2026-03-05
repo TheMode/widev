@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use mio::{Events, Interest, Poll, Token};
 use quiche::RecvInfo;
 use rand::RngCore;
@@ -17,6 +20,9 @@ const MAX_WORKER_POLL_WAIT: Duration = Duration::from_millis(10);
 const STREAM_COMPACT_THRESHOLD: usize = 4096;
 const DEFAULT_CLIENT_NAME: &str = "desktop-bot";
 const DEFAULT_CAPABILITIES: &[&str] = &["stress.multiclient", "input.synthetic"];
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(500);
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 pub struct BotRunnerConfig {
@@ -25,6 +31,7 @@ pub struct BotRunnerConfig {
     pub joins_per_second: f64,
     pub bot_tick_hz: u32,
     pub worker_threads: usize,
+    pub close_on_exit: bool,
 }
 
 pub trait BotFlow: Send + 'static {
@@ -78,10 +85,15 @@ struct BotSession {
     established_notified: bool,
     tick_interval: Option<Duration>,
     next_tick_at: Instant,
+    close_on_exit: bool,
 }
 
 enum WorkerCommand {
     AddBot(u32),
+}
+
+enum WorkerEvent {
+    BotJoined,
 }
 
 struct PendingDatagram {
@@ -197,6 +209,9 @@ pub fn run_with_flow<F>(config: BotRunnerConfig, flow_factory: F) -> Result<()>
 where
     F: Fn(u32) -> Box<dyn BotFlow> + Send + Sync + 'static,
 {
+    SHUTDOWN_REQUESTED.store(false, Ordering::Relaxed);
+    install_signal_handlers();
+
     if config.bot_count == 0 {
         log::warn!("bot_count is 0; nothing to run");
         return Ok(());
@@ -209,6 +224,7 @@ where
     };
 
     let flow_factory: Arc<dyn Fn(u32) -> Box<dyn BotFlow> + Send + Sync> = Arc::new(flow_factory);
+    let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
 
     let mut worker_txs = Vec::with_capacity(worker_threads);
     let mut worker_handles = Vec::with_capacity(worker_threads);
@@ -218,14 +234,20 @@ where
         worker_txs.push(tx);
 
         let flow_factory = Arc::clone(&flow_factory);
-        let server_addr = config.server_addr;
-        let bot_tick_hz = config.bot_tick_hz;
+        let worker_config = config;
+        let event_tx = event_tx.clone();
         worker_handles.push(thread::spawn(move || {
-            if let Err(err) = run_worker(worker_id, rx, flow_factory, server_addr, bot_tick_hz) {
+            if let Err(err) = run_worker(worker_id, rx, event_tx, flow_factory, &worker_config) {
                 log::error!("worker {worker_id} crashed: {err:#}");
             }
         }));
     }
+    drop(event_tx);
+
+    let joined_progress = build_join_progress_bar(config.bot_count as u64);
+    joined_progress.enable_steady_tick(Duration::from_millis(100));
+
+    let progress_handle = spawn_join_progress_consumer(event_rx, joined_progress.clone());
 
     let join_interval = if config.joins_per_second <= 0.0 {
         Duration::ZERO
@@ -233,42 +255,87 @@ where
         Duration::from_secs_f64(1.0 / config.joins_per_second)
     };
 
+    let mut queued_bots = 0usize;
     for idx in 0..config.bot_count {
+        if shutdown_requested() {
+            log::info!("shutdown requested; stopping bot creation");
+            break;
+        }
+
         let bot_id = (idx + 1) as u32;
         let worker_idx = idx % worker_threads;
 
         worker_txs[worker_idx]
             .send(WorkerCommand::AddBot(bot_id))
             .context("failed to queue bot creation to worker")?;
+        queued_bots += 1;
 
         if !join_interval.is_zero() {
             thread::sleep(join_interval);
         }
     }
 
+    joined_progress.set_length(queued_bots as u64);
+
     drop(worker_txs);
 
-    log::info!(
-        "spawned {} bots across {} workers at {:.2} joins/sec targeting {}",
-        config.bot_count,
-        worker_threads,
-        config.joins_per_second,
-        config.server_addr
-    );
+    joined_progress.suspend(|| {
+        log::info!(
+            "spawned {} bots across {} workers at {:.2} joins/sec targeting {}",
+            queued_bots,
+            worker_threads,
+            config.joins_per_second,
+            config.server_addr
+        );
+    });
 
     for handle in worker_handles {
         let _ = handle.join();
     }
+    let _ = progress_handle.join();
 
     Ok(())
+}
+
+fn build_join_progress_bar(target: u64) -> ProgressBar {
+    let progress = ProgressBar::new(target);
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} joined",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=>-"),
+    );
+    progress
+}
+
+fn spawn_join_progress_consumer(
+    event_rx: mpsc::Receiver<WorkerEvent>,
+    progress_bar: ProgressBar,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut joined = 0u64;
+        while let Ok(event) = event_rx.recv() {
+            match event {
+                WorkerEvent::BotJoined => {
+                    joined = joined.saturating_add(1);
+                    progress_bar.set_position(joined);
+                    if joined >= progress_bar.length().unwrap_or(0) {
+                        break;
+                    }
+                },
+            }
+        }
+        progress_bar.finish_with_message("join phase complete");
+    })
 }
 
 fn run_worker(
     worker_id: usize,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
+    event_tx: mpsc::Sender<WorkerEvent>,
     flow_factory: Arc<dyn Fn(u32) -> Box<dyn BotFlow> + Send + Sync>,
-    server_addr: SocketAddr,
-    bot_tick_hz: u32,
+    config: &BotRunnerConfig,
 ) -> Result<()> {
     let mut poll = Poll::new().context("failed to create mio poll")?;
     let mut events = Events::with_capacity(1024);
@@ -281,9 +348,18 @@ fn run_worker(
     let mut app_buf = [0u8; 4096];
 
     let mut commands_closed = false;
+    let mut shutdown_deadline: Option<Instant> = None;
 
     loop {
         let mut had_activity = false;
+
+        if shutdown_requested() && shutdown_deadline.is_none() {
+            commands_closed = true;
+            shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE_PERIOD);
+            if config.close_on_exit {
+                send_connection_close_for_sessions(&mut sessions, &mut send_buf);
+            }
+        }
 
         loop {
             match cmd_rx.try_recv() {
@@ -291,13 +367,10 @@ fn run_worker(
                     let flow = flow_factory(bot_id);
                     let token = Token(next_token_id);
                     next_token_id = next_token_id.wrapping_add(1).max(1);
-                    let mut session =
-                        create_bot_session(bot_id, token, server_addr, bot_tick_hz, flow)
-                            .with_context(|| {
-                                format!(
-                                    "failed to create bot session {bot_id} on worker {worker_id}"
-                                )
-                            })?;
+                    let mut session = create_bot_session(bot_id, token, flow, config)
+                        .with_context(|| {
+                            format!("failed to create bot session {bot_id} on worker {worker_id}")
+                        })?;
                     poll.registry()
                         .register(
                             &mut session.socket,
@@ -322,8 +395,14 @@ fn run_worker(
         let mut idx = sessions.len();
         while idx > 0 {
             idx -= 1;
+            let was_established = sessions[idx].established_notified;
             match process_session_logic(&mut sessions[idx], now, &mut send_buf, &mut app_buf) {
-                Ok(active) => had_activity |= active,
+                Ok(active) => {
+                    had_activity |= active;
+                    if !was_established && sessions[idx].established_notified {
+                        let _ = event_tx.send(WorkerEvent::BotJoined);
+                    }
+                },
                 Err(err) => {
                     log::warn!("worker {worker_id} bot {} failed: {err:#}", sessions[idx].bot_id);
                     sessions[idx].conn.close(false, 0, b"worker processing error").ok();
@@ -337,6 +416,16 @@ fn run_worker(
 
         if commands_closed && sessions.is_empty() {
             return Ok(());
+        }
+
+        if let Some(deadline) = shutdown_deadline {
+            if Instant::now() >= deadline {
+                if config.close_on_exit {
+                    send_connection_close_for_sessions(&mut sessions, &mut send_buf);
+                }
+                clear_sessions(&mut sessions, &mut index_by_token, poll.registry());
+                return Ok(());
+            }
         }
 
         let wait = if had_activity { Duration::ZERO } else { compute_poll_wait(&sessions) };
@@ -358,7 +447,10 @@ fn run_worker(
                 match recv_udp(session, &mut recv_buf) {
                     Ok(_) => {},
                     Err(err) => {
-                        log::warn!("worker {worker_id} bot {} recv failed: {err:#}", session.bot_id);
+                        log::warn!(
+                            "worker {worker_id} bot {} recv failed: {err:#}",
+                            session.bot_id
+                        );
                         recv_failed_tokens.push(event.token());
                     },
                 }
@@ -378,36 +470,56 @@ fn run_worker(
     }
 }
 
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGINT, on_shutdown_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_shutdown_signal as libc::sighandler_t);
+    }
+}
+
+extern "C" fn on_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
+
 fn create_bot_session(
     bot_id: u32,
     token: Token,
-    server_addr: SocketAddr,
-    bot_tick_hz: u32,
     flow: Box<dyn BotFlow>,
+    config: &BotRunnerConfig,
 ) -> Result<BotSession> {
     let socket = mio::net::UdpSocket::bind("0.0.0.0:0".parse().expect("valid socket addr"))
         .context("failed to bind UDP socket")?;
 
     let local_addr = socket.local_addr().context("failed to query local socket address")?;
 
-    let mut config = build_client_quic_config()?;
+    let mut quic_config = build_client_quic_config()?;
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     rand::thread_rng().fill_bytes(&mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let conn = quiche::connect(Some("widev.local"), &scid, local_addr, server_addr, &mut config)
-        .context("failed to create QUIC connection")?;
+    let conn = quiche::connect(
+        Some("widev.local"),
+        &scid,
+        local_addr,
+        config.server_addr,
+        &mut quic_config,
+    )
+    .context("failed to create QUIC connection")?;
 
-    let tick_interval = if bot_tick_hz == 0 {
+    let tick_interval = if config.bot_tick_hz == 0 {
         None
     } else {
-        Some(Duration::from_secs_f64(1.0 / bot_tick_hz as f64))
+        Some(Duration::from_secs_f64(1.0 / config.bot_tick_hz as f64))
     };
 
     Ok(BotSession {
         bot_id,
         token,
-        server_addr,
+        server_addr: config.server_addr,
         local_addr,
         socket,
         socket_writable: true,
@@ -419,7 +531,28 @@ fn create_bot_session(
         established_notified: false,
         tick_interval,
         next_tick_at: Instant::now(),
+        close_on_exit: config.close_on_exit,
     })
+}
+
+impl Drop for BotSession {
+    fn drop(&mut self) {
+        if !self.close_on_exit || self.conn.is_closed() {
+            return;
+        }
+
+        let _ = self.conn.close(false, 0, b"bot shutdown");
+        let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
+        for _ in 0..8 {
+            match self.conn.send(&mut send_buf) {
+                Ok((len, send_info)) => {
+                    let _ = self.socket.send_to(&send_buf[..len], send_info.to);
+                },
+                Err(quiche::Error::Done) => break,
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 fn process_session_logic(
@@ -655,10 +788,7 @@ fn handle_s2c_packet(session: &mut BotSession, packet: protocol::S2CPacket) -> R
     session.flow.on_server_packet(&mut ctx, &packet)
 }
 
-fn flush_outgoing(
-    session: &mut BotSession,
-    send_buf: &mut [u8],
-) -> Result<bool> {
+fn flush_outgoing(session: &mut BotSession, send_buf: &mut [u8]) -> Result<bool> {
     let mut sent_any = false;
 
     if let Some(pending) = &session.pending_send {
@@ -681,24 +811,19 @@ fn flush_outgoing(
 
     loop {
         match session.conn.send(send_buf) {
-            Ok((len, send_info)) => {
-                match session.socket.send_to(&send_buf[..len], send_info.to) {
-                    Ok(_) => {
-                        sent_any = true;
-                    },
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        let mut pending = PendingDatagram {
-                            len,
-                            to: send_info.to,
-                            bytes: [0u8; MAX_DATAGRAM_SIZE],
-                        };
-                        pending.bytes[..len].copy_from_slice(&send_buf[..len]);
-                        session.pending_send = Some(pending);
-                        session.socket_writable = false;
-                        break;
-                    },
-                    Err(err) => return Err(err).context("socket send_to failed"),
-                }
+            Ok((len, send_info)) => match session.socket.send_to(&send_buf[..len], send_info.to) {
+                Ok(_) => {
+                    sent_any = true;
+                },
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    let mut pending =
+                        PendingDatagram { len, to: send_info.to, bytes: [0u8; MAX_DATAGRAM_SIZE] };
+                    pending.bytes[..len].copy_from_slice(&send_buf[..len]);
+                    session.pending_send = Some(pending);
+                    session.socket_writable = false;
+                    break;
+                },
+                Err(err) => return Err(err).context("socket send_to failed"),
             },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
@@ -706,6 +831,16 @@ fn flush_outgoing(
     }
 
     Ok(sent_any)
+}
+
+fn send_connection_close_for_sessions(sessions: &mut [BotSession], send_buf: &mut [u8]) {
+    for session in sessions.iter_mut() {
+        if session.conn.is_closed() {
+            continue;
+        }
+        let _ = session.conn.close(false, 0, b"bot shutdown");
+        let _ = flush_outgoing(session, send_buf);
+    }
 }
 
 fn remove_closed_sessions(
@@ -730,6 +865,17 @@ fn remove_closed_sessions(
         removed_any = true;
     }
     removed_any
+}
+
+fn clear_sessions(
+    sessions: &mut Vec<BotSession>,
+    index_by_token: &mut HashMap<Token, usize>,
+    registry: &mio::Registry,
+) {
+    while let Some(mut session) = sessions.pop() {
+        registry.deregister(&mut session.socket).ok();
+    }
+    index_by_token.clear();
 }
 
 fn build_client_quic_config() -> Result<quiche::Config> {

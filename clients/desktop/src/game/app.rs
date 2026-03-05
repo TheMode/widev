@@ -94,7 +94,7 @@ impl App {
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_tick_at));
     }
 
-    fn tick_frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+    fn tick_frame(&mut self, _event_loop: &ActiveEventLoop) -> Result<()> {
         let Some(window) = self.window.clone() else {
             return Ok(());
         };
@@ -138,11 +138,6 @@ impl App {
             window.set_title(self.game.game_name());
             let input_capture = &self.input_capture;
             self.game.send_bound_inputs(|path| input_capture.read_binding_value(path))?;
-        }
-
-        if self.input_capture.is_exit_requested() {
-            event_loop.exit();
-            return Ok(());
         }
 
         let mut states = self.game.render_states();

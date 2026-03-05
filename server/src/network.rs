@@ -4,38 +4,28 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use mio::{Events, Interest, Poll, Token};
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::game::{ClientId, NetworkEvent};
+use crate::network_platform::{detect_udp_capabilities, RecvBatch, RecvBatcher, SendBatcher};
 use crate::packets::{
     decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketPriority, PacketTarget,
     S2CPacket, StreamID,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const POLL_SLEEP: Duration = Duration::from_millis(10);
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
-const SERVER_SOCKET: Token = Token(0);
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 
 enum IoCommand {
-    AddConnection {
-        client_id: ClientId,
-        client_addr: SocketAddr,
-        initial_packet: Vec<u8>,
-    },
-    IncomingDatagram {
-        from: SocketAddr,
-        data: Vec<u8>,
-    },
     DispatchEnvelopes(Vec<PacketEnvelope>),
     Shutdown,
 }
@@ -68,6 +58,26 @@ impl Ord for PacedDatagram {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct QuicTimeout {
+    at: Instant,
+    client_id: ClientId,
+    generation: u64,
+}
+
+impl PartialOrd for QuicTimeout {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for QuicTimeout {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so BinaryHeap pops the earliest timeout first.
+        other.at.cmp(&self.at).then_with(|| other.generation.cmp(&self.generation))
+    }
+}
+
 pub struct NetworkRuntime {
     io_senders: Vec<mpsc::Sender<IoCommand>>,
     event_rx: mpsc::Receiver<NetworkEvent>,
@@ -80,67 +90,61 @@ impl NetworkRuntime {
         let thread_count =
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
 
-        let recv_socket = UdpSocket::bind(bind_addr)
+        let first_socket = bind_reuseport_udp_socket(bind_addr)
             .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
-        recv_socket.set_nonblocking(true).context("failed to set UDP socket non-blocking")?;
-        let local_addr = recv_socket.local_addr().context("failed to read local addr")?;
+        let local_addr = first_socket.local_addr().context("failed to read local addr")?;
         log::info!("server listening on {local_addr} with {thread_count} I/O threads");
+        let caps = detect_udp_capabilities(&first_socket)
+            .context("failed to detect UDP networking capabilities")?;
+        log::info!(
+            "network capabilities:\n  batch_read={} (batch_size={})\n  batch_write={}\n  gso={} (max_segments={})\n  gro={} (segments={})",
+            if caps.batch_recv { "enabled" } else { "disabled" },
+            caps.batch_size,
+            if caps.batch_send { "enabled" } else { "disabled" },
+            if caps.gso_enabled { "enabled" } else { "disabled" },
+            caps.max_gso_segments,
+            if caps.gro_enabled { "enabled" } else { "disabled" },
+            caps.gro_segments
+        );
 
-        let owner_by_addr: Arc<Mutex<HashMap<SocketAddr, usize>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let next_client_id = Arc::new(AtomicU32::new(1));
         let running = Arc::new(AtomicBool::new(true));
+        let next_client_id = Arc::new(AtomicU32::new(1));
 
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
 
         let mut threads = Vec::new();
         let mut io_senders = Vec::with_capacity(thread_count);
+        let mut first_socket = Some(first_socket);
 
         for shard_id in 0..thread_count {
             let (io_tx, io_rx) = mpsc::channel::<IoCommand>();
             io_senders.push(io_tx);
 
-            let socket =
-                recv_socket.try_clone().context("failed to clone UDP socket for I/O thread")?;
+            let socket = if shard_id == 0 {
+                first_socket.take().expect("first socket available")
+            } else {
+                bind_reuseport_udp_socket(local_addr)
+                    .context("failed to bind UDP socket for I/O sender shard")?
+            };
             let event_tx = event_tx.clone();
-            let owner_by_addr = Arc::clone(&owner_by_addr);
             let running = Arc::clone(&running);
+            let next_client_id = Arc::clone(&next_client_id);
 
             let handle = thread::spawn(move || {
                 if let Err(err) = run_io_thread(
                     shard_id,
-                    thread_count,
                     socket,
                     local_addr,
                     io_rx,
                     event_tx,
-                    owner_by_addr,
                     running,
+                    next_client_id,
                 ) {
                     log::error!("I/O thread {shard_id} crashed: {err:#}");
                 }
             });
             threads.push(handle);
         }
-
-        let recv_io_senders = io_senders.clone();
-        let owner_by_addr = Arc::clone(&owner_by_addr);
-        let next_client_id = Arc::clone(&next_client_id);
-        let running_recv = Arc::clone(&running);
-
-        let recv_handle = thread::spawn(move || {
-            if let Err(err) = run_recv_thread(
-                recv_socket,
-                recv_io_senders,
-                owner_by_addr,
-                next_client_id,
-                thread_count,
-                running_recv,
-            ) {
-                log::error!("receiver thread crashed: {err:#}");
-            }
-        });
-        threads.push(recv_handle);
 
         Ok(Self { io_senders, event_rx, threads, running })
     }
@@ -175,90 +179,21 @@ impl Drop for NetworkRuntime {
     }
 }
 
-fn run_recv_thread(
-    recv_socket: UdpSocket,
-    io_senders: Vec<mpsc::Sender<IoCommand>>,
-    owner_by_addr: Arc<Mutex<HashMap<SocketAddr, usize>>>,
-    next_client_id: Arc<AtomicU32>,
-    shard_count: usize,
-    running: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut socket = mio::net::UdpSocket::from_std(recv_socket);
-    let mut poll = Poll::new().context("failed to create mio::Poll")?;
-    poll.registry()
-        .register(&mut socket, SERVER_SOCKET, Interest::READABLE)
-        .context("failed to register UDP socket with mio")?;
-    let mut events = Events::with_capacity(1024);
-
-    let mut recv_buf = [0u8; 65_535];
-
-    while running.load(Ordering::Relaxed) {
-        poll.poll(&mut events, Some(POLL_SLEEP)).context("mio poll failed")?;
-
-        for event in events.iter() {
-            if event.token() != SERVER_SOCKET || !event.is_readable() {
-                continue;
-            }
-
-            loop {
-                let (len, from) = match socket.recv_from(&mut recv_buf) {
-                    Ok(v) => v,
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(err) => return Err(err).context("UDP recv_from failed"),
-                };
-
-                let data = recv_buf[..len].to_vec();
-                if let Some(owner_shard) = lookup_owner(&owner_by_addr, from) {
-                    let _ =
-                        io_senders[owner_shard].send(IoCommand::IncomingDatagram { from, data });
-                    continue;
-                }
-
-                // Only initial packets create new sessions.
-                let mut hdr_buf = data.clone();
-                let hdr = match quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                if hdr.ty != quiche::Type::Initial {
-                    continue;
-                }
-
-                let client_id = next_client_id.fetch_add(1, Ordering::Relaxed).max(1);
-                let shard_id = shard_for_client(client_id, shard_count);
-                set_owner(&owner_by_addr, from, shard_id);
-
-                if io_senders[shard_id]
-                    .send(IoCommand::AddConnection {
-                        client_id,
-                        client_addr: from,
-                        initial_packet: data,
-                    })
-                    .is_err()
-                {
-                    remove_owner(&owner_by_addr, from);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn run_io_thread(
     shard_id: usize,
-    shard_count: usize,
     socket: UdpSocket,
     local_addr: SocketAddr,
     io_rx: mpsc::Receiver<IoCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
-    owner_by_addr: Arc<Mutex<HashMap<SocketAddr, usize>>>,
     running: Arc<AtomicBool>,
+    next_client_id: Arc<AtomicU32>,
 ) -> Result<()> {
-    let mut config = build_server_quic_config()?;
-
-    let mut sessions: HashMap<ClientId, Session> = HashMap::new();
-    let mut client_id_by_addr: HashMap<SocketAddr, ClientId> = HashMap::new();
+    let recv_socket = socket.try_clone().context("failed to clone UDP socket for I/O receiver")?;
+    let send_batcher = SendBatcher::new(socket).context("failed to initialize quinn-udp sender")?;
+    let mut recv_batcher =
+        RecvBatcher::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
+    let mut recv_batch = RecvBatch::new();
+    let mut shard = ShardState::new(shard_id, local_addr, build_server_quic_config()?, event_tx);
     let mut paced_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
     let mut next_paced_seq: u64 = 1;
 
@@ -266,92 +201,220 @@ fn run_io_thread(
     let mut app_buf = [0u8; 4096];
 
     while running.load(Ordering::Relaxed) {
-        flush_due_paced_datagrams(&socket, &mut paced_datagrams)?;
+        drain_received_datagrams(
+            &mut recv_batcher,
+            &mut recv_batch,
+            &mut shard,
+            next_client_id.as_ref(),
+        );
 
-        for session in sessions.values_mut() {
-            if let Some(timeout) = session.conn.timeout() {
-                if timeout.is_zero() {
-                    session.conn.on_timeout();
-                }
-            }
+        // Flush any previously queued datagrams whose pacing deadline has arrived.
+        flush_due_paced_datagrams(&send_batcher, &mut paced_datagrams)?;
+
+        // Drive due QUIC timeouts (tracked in a min-heap).
+        shard.process_due_quic_timeouts();
+
+        // Wait for cross-thread work, bounded by next QUIC/pacing deadline.
+        let wait_for = compute_io_wait(&mut shard, &paced_datagrams);
+        if !recv_and_drain_io_commands(&io_rx, wait_for, &mut shard) {
+            break;
         }
+        drain_received_datagrams(
+            &mut recv_batcher,
+            &mut recv_batch,
+            &mut shard,
+            next_client_id.as_ref(),
+        );
 
-        let wait_for = compute_io_wait(&sessions, &paced_datagrams);
-        match io_rx.recv_timeout(wait_for) {
-            Ok(cmd) => handle_io_command(
-                cmd,
-                shard_id,
-                shard_count,
-                local_addr,
-                &mut config,
-                &mut sessions,
-                &mut client_id_by_addr,
-                &event_tx,
-            ),
-            Err(mpsc::RecvTimeoutError::Timeout) => {},
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+        let disconnected = process_sessions_tick(
+            &mut shard,
+            &mut app_buf,
+            &mut send_buf,
+            &mut paced_datagrams,
+            &mut next_paced_seq,
+        );
 
-        while let Ok(cmd) = io_rx.try_recv() {
-            if matches!(cmd, IoCommand::Shutdown) {
-                return Ok(());
-            }
-            handle_io_command(
-                cmd,
-                shard_id,
-                shard_count,
-                local_addr,
-                &mut config,
-                &mut sessions,
-                &mut client_id_by_addr,
-                &event_tx,
-            );
-        }
+        // Send datagrams generated by this iteration that are already due.
+        flush_due_paced_datagrams(&send_batcher, &mut paced_datagrams)?;
 
-        let mut disconnected = Vec::new();
-
-        for (&client_id, session) in sessions.iter_mut() {
-            pump_app_packets(session, &mut app_buf, &event_tx);
-            session.maybe_send_ping();
-
-            if session.flush_stream_writes().is_err()
-                || flush_quic(
-                    session,
-                    &mut send_buf,
-                    &mut paced_datagrams,
-                    &mut next_paced_seq,
-                )
-                .is_err()
-                || session.conn.is_closed()
-            {
-                disconnected.push(client_id);
-            }
-        }
-
-        flush_due_paced_datagrams(&socket, &mut paced_datagrams)?;
-
-        for client_id in disconnected {
-            if let Some(session) = sessions.remove(&client_id) {
-                client_id_by_addr.remove(&session.client_addr);
-                remove_owner(&owner_by_addr, session.client_addr);
-                let _ = event_tx.send(NetworkEvent::ClientDisconnected(client_id));
-            }
-        }
+        cleanup_disconnected_sessions(&mut shard, disconnected);
     }
 
     Ok(())
 }
 
+fn recv_and_drain_io_commands(
+    io_rx: &mpsc::Receiver<IoCommand>,
+    wait_for: Duration,
+    shard: &mut ShardState,
+) -> bool {
+    match io_rx.recv_timeout(wait_for) {
+        Ok(cmd) => {
+            if matches!(cmd, IoCommand::Shutdown) {
+                return false;
+            }
+            handle_io_command(cmd, shard);
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => return true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+    }
+
+    while let Ok(cmd) = io_rx.try_recv() {
+        if matches!(cmd, IoCommand::Shutdown) {
+            return false;
+        }
+        handle_io_command(cmd, shard);
+    }
+
+    true
+}
+
+fn process_sessions_tick(
+    shard: &mut ShardState,
+    app_buf: &mut [u8],
+    send_buf: &mut [u8],
+    paced_datagrams: &mut BinaryHeap<PacedDatagram>,
+    next_paced_seq: &mut u64,
+) -> Vec<ClientId> {
+    let mut disconnected = Vec::new();
+    let mut touched_sessions = Vec::new();
+
+    // Pump application I/O and flush QUIC output for each session.
+    for (&client_id, session) in shard.sessions.iter_mut() {
+        touched_sessions.push(client_id);
+        pump_app_packets(session, app_buf, &shard.event_tx);
+        session.maybe_send_ping();
+
+        if session.flush_stream_writes().is_err()
+            || flush_quic(session, send_buf, paced_datagrams, next_paced_seq).is_err()
+            || session.conn.is_closed()
+        {
+            disconnected.push(client_id);
+        }
+    }
+
+    for client_id in touched_sessions {
+        shard.refresh_quic_timeout(client_id);
+    }
+
+    disconnected
+}
+
+fn cleanup_disconnected_sessions(shard: &mut ShardState, disconnected: Vec<ClientId>) {
+    for client_id in disconnected {
+        if let Some(session) = shard.sessions.remove(&client_id) {
+            shard.client_id_by_addr.remove(&session.client_addr);
+            let _ = shard.event_tx.send(NetworkEvent::ClientDisconnected(client_id));
+        }
+    }
+}
+
+struct ShardState {
+    shard_id: usize,
+    local_addr: SocketAddr,
+    config: quiche::Config,
+    sessions: HashMap<ClientId, Session>,
+    client_id_by_addr: HashMap<SocketAddr, ClientId>,
+    quic_timeouts: BinaryHeap<QuicTimeout>,
+    event_tx: mpsc::Sender<NetworkEvent>,
+}
+
+impl ShardState {
+    fn new(
+        shard_id: usize,
+        local_addr: SocketAddr,
+        config: quiche::Config,
+        event_tx: mpsc::Sender<NetworkEvent>,
+    ) -> Self {
+        Self {
+            shard_id,
+            local_addr,
+            config,
+            sessions: HashMap::new(),
+            client_id_by_addr: HashMap::new(),
+            quic_timeouts: BinaryHeap::new(),
+            event_tx,
+        }
+    }
+
+    fn refresh_quic_timeout(&mut self, client_id: ClientId) {
+        let Some(session) = self.sessions.get_mut(&client_id) else {
+            return;
+        };
+
+        session.timeout_generation = session.timeout_generation.wrapping_add(1).max(1);
+        if let Some(timeout) = session.conn.timeout() {
+            let now = Instant::now();
+            let at = now.checked_add(timeout).unwrap_or(now);
+            self.quic_timeouts.push(QuicTimeout {
+                at,
+                client_id,
+                generation: session.timeout_generation,
+            });
+        }
+    }
+
+    fn with_session_and_refresh(&mut self, client_id: ClientId, f: impl FnOnce(&mut Session)) {
+        let mut had_session = false;
+        if let Some(session) = self.sessions.get_mut(&client_id) {
+            f(session);
+            had_session = true;
+        }
+        if had_session {
+            self.refresh_quic_timeout(client_id);
+        }
+    }
+
+    fn process_due_quic_timeouts(&mut self) {
+        loop {
+            let Some(next) = self.peek_next_quic_timeout().copied() else {
+                break;
+            };
+            if next.at > Instant::now() {
+                break;
+            }
+            self.quic_timeouts.pop();
+
+            let mut should_refresh = false;
+            if let Some(session) = self.sessions.get_mut(&next.client_id) {
+                if session.timeout_generation == next.generation {
+                    session.conn.on_timeout();
+                    should_refresh = true;
+                }
+            }
+            if should_refresh {
+                self.refresh_quic_timeout(next.client_id);
+            }
+        }
+    }
+
+    fn peek_next_quic_timeout(&mut self) -> Option<&QuicTimeout> {
+        while let Some(top) = self.quic_timeouts.peek() {
+            let is_stale = match self.sessions.get(&top.client_id) {
+                Some(session) => session.timeout_generation != top.generation,
+                None => true,
+            };
+            if !is_stale {
+                break;
+            }
+            self.quic_timeouts.pop();
+        }
+        self.quic_timeouts.peek()
+    }
+}
+
 fn compute_io_wait(
-    sessions: &HashMap<ClientId, Session>,
+    shard: &mut ShardState,
     paced_datagrams: &BinaryHeap<PacedDatagram>,
 ) -> Duration {
     let mut wait = IO_MAX_WAIT;
 
-    for session in sessions.values() {
-        if let Some(timeout) = session.conn.timeout() {
-            wait = wait.min(timeout);
+    if let Some(next_timeout) = shard.peek_next_quic_timeout().map(|entry| entry.at) {
+        let now = Instant::now();
+        if next_timeout <= now {
+            return Duration::ZERO;
         }
+        wait = wait.min(next_timeout.duration_since(now));
     }
 
     if let Some(next) = paced_datagrams.peek() {
@@ -365,66 +428,87 @@ fn compute_io_wait(
     wait
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_io_command(
-    cmd: IoCommand,
-    shard_id: usize,
-    shard_count: usize,
-    local_addr: SocketAddr,
-    config: &mut quiche::Config,
-    sessions: &mut HashMap<ClientId, Session>,
-    client_id_by_addr: &mut HashMap<SocketAddr, ClientId>,
-    event_tx: &mpsc::Sender<NetworkEvent>,
-) {
+fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
     match cmd {
-        IoCommand::AddConnection { client_id, client_addr, initial_packet } => {
-            handle_add_connection(
-                shard_id,
-                shard_count,
-                local_addr,
-                config,
-                sessions,
-                client_id_by_addr,
-                event_tx,
-                client_id,
-                client_addr,
-                initial_packet,
-            )
-        },
-        IoCommand::IncomingDatagram { from, data } => {
-            if let Some(client_id) = client_id_by_addr.get(&from).copied() {
-                if let Some(session) = sessions.get_mut(&client_id) {
-                    let mut data = data;
-                    recv_on_session(session, &mut data, from, local_addr, "conn.recv");
-                }
-            }
-        },
         IoCommand::DispatchEnvelopes(envelopes) => {
             for envelope in envelopes {
-                dispatch_envelope_for_thread(shard_id, shard_count, sessions, &envelope);
+                dispatch_envelope_for_thread(shard, &envelope);
             }
         },
         IoCommand::Shutdown => {},
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn drain_received_datagrams(
+    recv_batcher: &mut RecvBatcher,
+    recv_batch: &mut RecvBatch,
+    shard: &mut ShardState,
+    next_client_id: &AtomicU32,
+) {
+    loop {
+        let batch_count = match recv_batcher.recv_next_batch(recv_batch) {
+            Ok(count) => count,
+            Err(err) => {
+                log::warn!("UDP receive failed on shard {}: {err}", shard.shard_id);
+                break;
+            },
+        };
+        if batch_count == 0 {
+            break;
+        }
+
+        for index in 0..batch_count {
+            let from = recv_batch.from(index);
+            let data = recv_batch.packet(index).to_vec();
+            handle_received_datagram(shard, from, data, next_client_id);
+        }
+    }
+}
+
+fn handle_received_datagram(
+    shard: &mut ShardState,
+    from: SocketAddr,
+    data: Vec<u8>,
+    next_client_id: &AtomicU32,
+) {
+    if let Some(client_id) = shard.client_id_by_addr.get(&from).copied() {
+        let local_addr = shard.local_addr;
+        shard.with_session_and_refresh(client_id, |session| {
+            let mut data = data;
+            recv_on_session(session, &mut data, from, local_addr, "conn.recv");
+        });
+        return;
+    }
+
+    // Only initial packets create new sessions.
+    let mut hdr_buf = data.clone();
+    let hdr = match quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    if hdr.ty != quiche::Type::Initial {
+        return;
+    }
+
+    let Ok(client_id) = next_client_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+        if id == u32::MAX {
+            None
+        } else {
+            Some(id + 1)
+        }
+    }) else {
+        log::error!("exhausted global ClientId space; rejecting new connection from {from}");
+        return;
+    };
+    handle_add_connection(shard, client_id, from, data);
+}
+
 fn handle_add_connection(
-    shard_id: usize,
-    shard_count: usize,
-    local_addr: SocketAddr,
-    config: &mut quiche::Config,
-    sessions: &mut HashMap<ClientId, Session>,
-    client_id_by_addr: &mut HashMap<SocketAddr, ClientId>,
-    event_tx: &mpsc::Sender<NetworkEvent>,
+    shard: &mut ShardState,
     client_id: ClientId,
     client_addr: SocketAddr,
     initial_packet: Vec<u8>,
 ) {
-    if shard_for_client(client_id, shard_count) != shard_id {
-        return;
-    }
-
     let mut pkt_buf = initial_packet;
     let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
         Ok(h) => h,
@@ -438,7 +522,7 @@ fn handle_add_connection(
     rand::thread_rng().fill_bytes(&mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
-    let conn = match quiche::accept(&scid, None, local_addr, client_addr, config) {
+    let conn = match quiche::accept(&scid, None, shard.local_addr, client_addr, &mut shard.config) {
         Ok(conn) => conn,
         Err(err) => {
             log::warn!("failed to accept incoming QUIC connection: {err:?}");
@@ -447,126 +531,128 @@ fn handle_add_connection(
     };
 
     let mut session = Session::new(client_id, client_addr, conn);
-    recv_on_session(&mut session, &mut pkt_buf, client_addr, local_addr, "conn.recv after accept");
+    recv_on_session(
+        &mut session,
+        &mut pkt_buf,
+        client_addr,
+        shard.local_addr,
+        "conn.recv after accept",
+    );
 
-    sessions.insert(client_id, session);
-    client_id_by_addr.insert(client_addr, client_id);
-    let _ = event_tx.send(NetworkEvent::ClientConnected(client_id));
+    shard.sessions.insert(client_id, session);
+    shard.client_id_by_addr.insert(client_addr, client_id);
+    shard.refresh_quic_timeout(client_id);
+    let _ = shard.event_tx.send(NetworkEvent::ClientConnected(client_id));
     log::info!("accepted connection from {client_addr} as client {client_id}");
 }
 
-fn dispatch_envelope_for_thread(
-    shard_id: usize,
-    shard_count: usize,
-    sessions: &mut HashMap<ClientId, Session>,
-    envelope: &PacketEnvelope,
-) {
-    match envelope.target {
-        PacketTarget::Client(client_id) => {
-            if shard_for_client(client_id, shard_count) != shard_id {
-                return;
-            }
-            if let Some(session) = sessions.get_mut(&client_id) {
-                send_envelope_to_session(session, envelope);
-            }
-        },
-        PacketTarget::Broadcast => {
-            for session in sessions.values_mut() {
-                send_envelope_to_session(session, envelope);
-            }
-        },
-        PacketTarget::BroadcastExcept(excluded_client_id) => {
-            if shard_for_client(excluded_client_id, shard_count) != shard_id {
-                // Fast path: no local client is excluded for this shard.
-                for session in sessions.values_mut() {
-                    send_envelope_to_session(session, envelope);
-                }
-            } else {
-                for (&client_id, session) in sessions.iter_mut() {
-                    if client_id == excluded_client_id {
-                        continue;
-                    }
-                    send_envelope_to_session(session, envelope);
-                }
-            }
-        },
+fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
+    if !envelope_can_target_thread(shard, envelope) {
+        return;
     }
-}
 
-fn send_envelope_to_session(session: &mut Session, envelope: &PacketEnvelope) {
     let stream_id = envelope
         .sync
         .as_ref()
         .map(|sync| sync.sequential_stream_id)
         .unwrap_or(DEFAULT_RELIABLE_STREAM_ID);
-    match &envelope.payload {
-        PacketPayload::Single(packet) => {
-            queue_stream_packet_with_priority(session, stream_id, packet, envelope.priority)
-        },
-        PacketPayload::Bundle(bundle) => {
-            queue_stream_bundle_with_priority(session, stream_id, bundle, envelope.priority)
-        },
-    }
-}
-
-fn queue_stream_packet_with_priority(
-    session: &mut Session,
-    stream_id: StreamID,
-    packet: &S2CPacket,
-    priority: PacketPriority,
-) {
-    let Ok(payload) = encode_s2c(packet) else {
+    let Some(serialized) = serialize_envelope_payload(&envelope.payload) else {
         return;
     };
-    let framed_len = 4 + payload.len();
 
-    if matches!(priority, PacketPriority::Droppable) && !session.has_stream_budget(framed_len) {
-        log::debug!(
-            "dropping packet for client {} due to stream congestion budget",
-            session.client_id
-        );
-        return;
-    }
-
-    session.queue_stream_packet(stream_id, payload);
+    for_each_target_session_mut(shard, envelope.target, |session| {
+        send_serialized_envelope_to_session(session, stream_id, envelope.priority, &serialized);
+    });
 }
 
-fn queue_stream_bundle_with_priority(
+fn envelope_can_target_thread(shard: &ShardState, envelope: &PacketEnvelope) -> bool {
+    match envelope.target {
+        PacketTarget::Client(client_id) => shard.sessions.contains_key(&client_id),
+        _ => true,
+    }
+}
+
+fn for_each_target_session_mut(
+    shard: &mut ShardState,
+    target: PacketTarget,
+    mut f: impl FnMut(&mut Session),
+) {
+    match target {
+        PacketTarget::Client(client_id) => {
+            if let Some(session) = shard.sessions.get_mut(&client_id) {
+                f(session);
+            }
+        },
+        PacketTarget::Broadcast => {
+            for session in shard.sessions.values_mut() {
+                f(session);
+            }
+        },
+        PacketTarget::BroadcastExcept(excluded_client_id) => {
+            for (&client_id, session) in shard.sessions.iter_mut() {
+                if client_id != excluded_client_id {
+                    f(session);
+                }
+            }
+        },
+    }
+}
+
+fn send_serialized_envelope_to_session(
     session: &mut Session,
     stream_id: StreamID,
-    bundle: &[S2CPacket],
     priority: PacketPriority,
+    serialized: &SerializedEnvelopePayload,
 ) {
-    if bundle.is_empty() {
-        return;
-    }
-
-    let mut framed_payloads = Vec::with_capacity(bundle.len());
-    let mut total_framed_len = 0usize;
-
-    for packet in bundle {
-        let Ok(payload) = encode_s2c(packet) else {
-            continue;
-        };
-        let framed_len = 4 + payload.len();
-        total_framed_len = total_framed_len.saturating_add(framed_len);
-        framed_payloads.push(payload);
-    }
-
-    if framed_payloads.is_empty() {
-        return;
-    }
-
-    if matches!(priority, PacketPriority::Droppable) && !session.has_stream_budget(total_framed_len)
+    if matches!(priority, PacketPriority::Droppable)
+        && !session.has_stream_budget(serialized.framed.len())
     {
         log::debug!(
-            "dropping bundle for client {} due to stream congestion budget",
+            "dropping envelope for client {} due to stream congestion budget",
             session.client_id
         );
         return;
     }
 
-    session.queue_stream_bundle(stream_id, framed_payloads, total_framed_len);
+    session.queue_stream_payloads(stream_id, serialized);
+}
+
+struct SerializedEnvelopePayload {
+    framed: Vec<u8>,
+}
+
+fn serialize_envelope_payload(payload: &PacketPayload) -> Option<SerializedEnvelopePayload> {
+    let mut framed = Vec::new();
+
+    match payload {
+        PacketPayload::Single(packet) => {
+            let Ok(encoded) = encode_s2c(packet) else {
+                return None;
+            };
+            framed.reserve(4 + encoded.len());
+            framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&encoded);
+        },
+        PacketPayload::Bundle(bundle) => {
+            if bundle.is_empty() {
+                return None;
+            }
+
+            for packet in bundle {
+                let Ok(encoded) = encode_s2c(packet) else {
+                    continue;
+                };
+                framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&encoded);
+            }
+        },
+    }
+
+    if framed.is_empty() {
+        return None;
+    }
+
+    Some(SerializedEnvelopePayload { framed })
 }
 
 fn pump_app_packets(
@@ -691,22 +777,97 @@ fn flush_quic(
 }
 
 fn flush_due_paced_datagrams(
-    socket: &UdpSocket,
+    send_batcher: &SendBatcher,
     paced_datagrams: &mut BinaryHeap<PacedDatagram>,
 ) -> Result<()> {
     let now = Instant::now();
-    while let Some(pending) = paced_datagrams.peek() {
-        if pending.at > now {
+    let mut due = Vec::new();
+    while let Some(next) = paced_datagrams.peek() {
+        if next.at > now {
             break;
         }
-        let pending = paced_datagrams.pop().expect("heap top exists");
-        socket.send_to(&pending.bytes, pending.to)?;
+        due.push(paced_datagrams.pop().expect("heap top exists"));
+    }
+    if due.is_empty() {
+        return Ok(());
+    }
+
+    let max_gso_segments = send_batcher.max_gso_segments();
+    let mut idx = 0usize;
+    while idx < due.len() {
+        let destination = due[idx].to;
+        let segment_len = due[idx].bytes.len();
+        let mut segment_count = 1usize;
+
+        while segment_count < max_gso_segments && idx + segment_count < due.len() {
+            let next = &due[idx + segment_count];
+            if next.to != destination || next.bytes.len() != segment_len {
+                break;
+            }
+            segment_count += 1;
+        }
+
+        let mut gso_payload = Vec::new();
+        let (contents, segment_size) = if segment_count > 1 {
+            gso_payload.reserve(segment_len * segment_count);
+            for datagram in &due[idx..idx + segment_count] {
+                gso_payload.extend_from_slice(&datagram.bytes);
+            }
+            (&gso_payload[..], Some(segment_len))
+        } else {
+            (&due[idx].bytes[..], None)
+        };
+
+        let transmit =
+            quinn_udp::Transmit { destination, ecn: None, contents, segment_size, src_ip: None };
+
+        match send_batcher.send_transmit(&transmit) {
+            Ok(()) => idx += segment_count,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                for datagram in due.into_iter().skip(idx) {
+                    push_paced_datagram(paced_datagrams, datagram);
+                }
+                return Ok(());
+            },
+            Err(err) => {
+                for datagram in due.into_iter().skip(idx) {
+                    push_paced_datagram(paced_datagrams, datagram);
+                }
+                return Err(err.into());
+            },
+        }
     }
     Ok(())
 }
 
 fn push_paced_datagram(paced_datagrams: &mut BinaryHeap<PacedDatagram>, datagram: PacedDatagram) {
     paced_datagrams.push(datagram);
+}
+
+fn bind_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
+    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    socket.set_reuse_port(true)?;
+    socket.bind(&bind_addr.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 fn build_server_quic_config() -> Result<quiche::Config> {
@@ -772,6 +933,7 @@ struct Session {
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
     queued_stream_bytes: usize,
+    timeout_generation: u64,
 }
 
 struct PendingStreamWrite {
@@ -797,6 +959,7 @@ impl Session {
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
             queued_stream_bytes: 0,
+            timeout_generation: 0,
         }
     }
 
@@ -864,44 +1027,21 @@ impl Session {
         frames
     }
 
-    fn queue_stream_packet(&mut self, stream_id: u64, payload: Vec<u8>) {
-        let mut framed = Vec::with_capacity(4 + payload.len());
-        framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&payload);
-        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(framed.len());
-
-        let state = self.stream_state_mut(stream_id, "tx");
-        state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
-    }
-
-    fn queue_stream_bundle(
-        &mut self,
-        stream_id: u64,
-        payloads: Vec<Vec<u8>>,
-        total_framed_len: usize,
-    ) {
-        if payloads.is_empty() {
+    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &SerializedEnvelopePayload) {
+        if payload.framed.is_empty() {
             return;
         }
 
-        let mut framed = Vec::with_capacity(total_framed_len);
-        for payload in payloads {
-            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            framed.extend_from_slice(&payload);
-        }
-
-        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(framed.len());
+        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.framed.len());
         let state = self.stream_state_mut(stream_id, "tx");
-        state.pending_writes.push_back(PendingStreamWrite { data: framed, offset: 0 });
-    }
-
-    fn queued_stream_bytes(&self) -> usize {
-        self.queued_stream_bytes
+        state
+            .pending_writes
+            .push_back(PendingStreamWrite { data: payload.framed.clone(), offset: 0 });
     }
 
     fn has_stream_budget(&self, next_framed_len: usize) -> bool {
         let quantum = self.conn.send_quantum();
-        self.queued_stream_bytes().saturating_add(next_framed_len) <= quantum
+        self.queued_stream_bytes.saturating_add(next_framed_len) <= quantum
     }
 
     fn flush_stream_writes(&mut self) -> Result<()> {
@@ -919,8 +1059,7 @@ impl Session {
                 match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], false) {
                     Ok(written) => {
                         chunk.offset += written;
-                        self.queued_stream_bytes =
-                            self.queued_stream_bytes.saturating_sub(written);
+                        self.queued_stream_bytes = self.queued_stream_bytes.saturating_sub(written);
                         if chunk.offset < chunk.data.len() {
                             self.requeue_pending_write(stream_id, chunk);
                             break;
@@ -966,31 +1105,4 @@ fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let payload = buffer[4..4 + len].to_vec();
     buffer.drain(..4 + len);
     Some(payload)
-}
-
-fn shard_for_client(client_id: ClientId, shard_count: usize) -> usize {
-    client_id as usize % shard_count
-}
-
-fn lookup_owner(
-    owner_by_addr: &Arc<Mutex<HashMap<SocketAddr, usize>>>,
-    addr: SocketAddr,
-) -> Option<usize> {
-    owner_by_addr.lock().ok().and_then(|owners| owners.get(&addr).copied())
-}
-
-fn set_owner(
-    owner_by_addr: &Arc<Mutex<HashMap<SocketAddr, usize>>>,
-    addr: SocketAddr,
-    shard: usize,
-) {
-    if let Ok(mut owners) = owner_by_addr.lock() {
-        owners.insert(addr, shard);
-    }
-}
-
-fn remove_owner(owner_by_addr: &Arc<Mutex<HashMap<SocketAddr, usize>>>, addr: SocketAddr) {
-    if let Ok(mut owners) = owner_by_addr.lock() {
-        owners.remove(&addr);
-    }
 }

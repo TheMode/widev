@@ -27,6 +27,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     workers: usize,
 
+    /// Send QUIC CONNECTION_CLOSE packets when bot sessions are dropped.
+    #[arg(long, default_value_t = true)]
+    close_on_exit: bool,
+
     /// Built-in flow preset: passive | ack-move
     #[arg(long, default_value = "ack-move")]
     flow: String,
@@ -42,6 +46,7 @@ fn main() -> Result<()> {
         joins_per_second: args.join_rate,
         bot_tick_hz: args.bot_tick_hz,
         worker_threads: args.workers,
+        close_on_exit: args.close_on_exit,
     };
 
     match args.flow.as_str() {

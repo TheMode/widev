@@ -2,11 +2,13 @@ edition = "2021"
 tab_spaces = 4
 hard_tabs = false
 max_width = 100
+chain_width = 100
+fn_call_width = 100
 
 use_small_heuristics = "Max"
 use_try_shorthand = true
 use_field_init_shorthand = true
-force_explicit_abi = false
+force_explicit_abi = true
 
 reorder_imports = true
 reorder_modules = true

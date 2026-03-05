@@ -590,10 +590,6 @@ impl InputCapture {
         out
     }
 
-    pub(super) fn is_exit_requested(&self) -> bool {
-        self.pressed_keys.iter().any(|(_, code)| *code == KeyCode::Escape)
-    }
-
     pub(super) fn read_binding_value(&self, path: &InputPath) -> f32 {
         match path {
             InputPath::KeyboardKey { device, key } => {

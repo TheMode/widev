@@ -124,7 +124,8 @@ impl Game for RedSquareGame {
                         kind: PredictionKind::Interpolation,
                     },
                 ]);
-                state.send(PacketEnvelope::bundle(PacketTarget::BroadcastExcept(client_id), bundle));
+                state
+                    .send(PacketEnvelope::bundle(PacketTarget::BroadcastExcept(client_id), bundle));
 
                 log::info!("client {client_id} connected");
             },
@@ -190,13 +191,16 @@ impl Game for RedSquareGame {
                 (player.element.y + dy * PLAYER_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT);
         }
 
-        let mut bundle: PacketBundle = Vec::new();
-        bundle.extend(self.players.iter().map(|(element_id, player)| S2CPacket::ElementMove {
-            element_id: *element_id,
-            x: player.element.x,
-            y: player.element.y,
-        }));
-        if !bundle.is_empty() {
+        if !self.players.is_empty() {
+            let bundle: PacketBundle = self
+                .players
+                .iter()
+                .map(|(&element_id, player)| S2CPacket::ElementMove {
+                    element_id,
+                    x: player.element.x,
+                    y: player.element.y,
+                })
+                .collect();
             state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
         }
     }

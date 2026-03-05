@@ -8,12 +8,13 @@ mod game;
 mod game_state;
 mod games;
 mod network;
+mod network_platform;
 #[allow(dead_code)]
 mod packets;
 
 use game::Game;
-use game_state::GameState;
 use game::NetworkEvent;
+use game_state::GameState;
 use network::NetworkRuntime;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
