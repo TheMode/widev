@@ -1,30 +1,27 @@
 include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 
-use std::time::Duration;
 use thiserror::Error;
 
 use crate::game::ClientId;
 
-pub type ServerTick = u64;
 pub type ActionId = u64;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PacketPriority {
-    /// Default reliable delivery on the session's stream.
+    /// Send as soon as practical using the normal transport path.
+    ///
+    /// This does not opt into unreliable delivery or intentional scheduling
+    /// delay beyond ordinary transport backpressure.
     #[default]
     Normal,
-    /// Drop instead of queueing when the session is over budget.
+    /// Prefer freshness over reliability when the session is over budget.
     ///
     /// If the envelope is `Independent`, has no identifier, and its encoded
     /// payload fits a single writable QUIC datagram, the transport may send it
-    /// as a datagram instead of opening a stream.
+    /// as a datagram instead of opening a stream. Otherwise, stream-backed
+    /// sends may be dropped instead of being queued when congestion budget is
+    /// exhausted.
     Droppable,
-    /// Hint that the packet is only useful if sent within this delay budget.
-    MaxDelay(Duration),
-    /// Hint that the packet expires once the server reaches this tick.
-    MaxTick(ServerTick),
-    /// Hint that nearby packets can be batched within this coalescing window.
-    Coalesce(Duration),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -110,21 +107,6 @@ impl PacketEnvelope {
 
     pub fn droppable(mut self) -> Self {
         self.priority = PacketPriority::Droppable;
-        self
-    }
-
-    pub fn max_delay(mut self, delay: Duration) -> Self {
-        self.priority = PacketPriority::MaxDelay(delay);
-        self
-    }
-
-    pub fn max_tick(mut self, tick: ServerTick) -> Self {
-        self.priority = PacketPriority::MaxTick(tick);
-        self
-    }
-
-    pub fn coalesce(mut self, window: Duration) -> Self {
-        self.priority = PacketPriority::Coalesce(window);
         self
     }
 
