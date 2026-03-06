@@ -199,7 +199,8 @@ impl NetworkRuntime {
         out
     }
 
-    pub fn dispatch_messages(&self, messages: Vec<PacketMessage>) {
+    pub fn dispatch_messages(&self, mut messages: Vec<PacketMessage>) {
+        messages.retain(validate_message_for_dispatch);
         if messages.is_empty() {
             return;
         }
@@ -207,6 +208,19 @@ impl NetworkRuntime {
         for worker in &self.io_workers {
             let _ = worker.sender.send(IoCommand::DispatchMessages(Arc::clone(&shared)));
         }
+    }
+}
+
+fn validate_message_for_dispatch(message: &PacketMessage) -> bool {
+    match message {
+        PacketMessage::Envelope(envelope) => {
+            if let Err(err) = envelope.validate() {
+                log::warn!("dropping invalid envelope: {err}");
+                return false;
+            }
+            true
+        },
+        PacketMessage::Control(_) => true,
     }
 }
 
@@ -722,11 +736,6 @@ fn dispatch_message_for_thread(shard: &mut ShardState, message: &PacketMessage) 
 
 fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
     if !envelope_has_local_targets(shard, envelope.target) {
-        return;
-    }
-
-    if let Err(err) = envelope.validate() {
-        log::warn!("dropping invalid envelope: {err}");
         return;
     }
 
