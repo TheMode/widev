@@ -198,10 +198,14 @@ impl Ord for QuicTimeout {
 }
 
 pub struct NetworkRuntime {
-    io_senders: Vec<mpsc::Sender<IoCommand>>,
+    io_shards: Vec<IoShardHandle>,
     event_rx: mpsc::Receiver<NetworkEvent>,
-    threads: Vec<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
+}
+
+struct IoShardHandle {
+    sender: mpsc::Sender<IoCommand>,
+    thread: thread::JoinHandle<()>,
 }
 
 impl NetworkRuntime {
@@ -231,13 +235,11 @@ impl NetworkRuntime {
 
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
 
-        let mut threads = Vec::new();
-        let mut io_senders = Vec::with_capacity(thread_count);
+        let mut io_shards = Vec::with_capacity(thread_count);
         let mut first_socket = Some(first_socket);
 
         for shard_id in 0..thread_count {
             let (io_tx, io_rx) = mpsc::channel::<IoCommand>();
-            io_senders.push(io_tx);
 
             let socket = if shard_id == 0 {
                 first_socket.take().expect("first socket available")
@@ -262,10 +264,13 @@ impl NetworkRuntime {
                     log::error!("I/O thread {shard_id} crashed: {err:#}");
                 }
             });
-            threads.push(handle);
+            io_shards.push(IoShardHandle {
+                sender: io_tx,
+                thread: handle,
+            });
         }
 
-        Ok(Self { io_senders, event_rx, threads, running })
+        Ok(Self { io_shards, event_rx, running })
     }
 
     pub fn drain_events(&self) -> Vec<NetworkEvent> {
@@ -281,8 +286,8 @@ impl NetworkRuntime {
             return;
         }
         let shared: Arc<[PacketEnvelope]> = envelopes.into();
-        for sender in &self.io_senders {
-            let _ = sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
+        for shard in &self.io_shards {
+            let _ = shard.sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
         }
     }
 }
@@ -290,11 +295,14 @@ impl NetworkRuntime {
 impl Drop for NetworkRuntime {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        for sender in &self.io_senders {
-            let _ = sender.send(IoCommand::Shutdown);
+        let io_shards = std::mem::take(&mut self.io_shards);
+
+        for shard in &io_shards {
+            let _ = shard.sender.send(IoCommand::Shutdown);
         }
-        for handle in self.threads.drain(..) {
-            let _ = handle.join();
+
+        for shard in io_shards {
+            let _ = shard.thread.join();
         }
     }
 }
