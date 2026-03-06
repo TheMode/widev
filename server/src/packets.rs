@@ -58,6 +58,10 @@ pub enum PacketControl {
     SequenceCloseAll {
         target: PacketTarget,
     },
+    /// Drop queued work for the target and terminate any active sequence.
+    Clear {
+        target: PacketTarget,
+    },
     /// Block later messages for the target until all currently inflight
     /// transport writes for that target have completed locally.
     Barrier {

@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, IoSliceMut};
 use std::net::{SocketAddr, UdpSocket};
@@ -27,6 +27,7 @@ const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
+const STREAM_RESET_ERROR_CODE: u64 = 0;
 
 struct UdpCapabilities {
     batch_size: usize,
@@ -754,6 +755,15 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
                 session.dispatch_message(SessionMessage::SequenceCloseAll)
             });
         },
+        PacketControl::Clear { target } => {
+            if !envelope_has_local_targets(shard, target) {
+                return;
+            }
+
+            for_each_target_session_mut(shard, target, |session| {
+                session.dispatch_message(SessionMessage::Clear)
+            });
+        },
         PacketControl::Barrier { target } => {
             if !envelope_has_local_targets(shard, target) {
                 return;
@@ -827,6 +837,7 @@ enum SessionMessage {
     Envelope(PendingOrderedEnvelope),
     SequenceClose(Uuid),
     SequenceCloseAll,
+    Clear,
     Barrier,
 }
 
@@ -1300,7 +1311,7 @@ impl Session {
     }
 
     fn dispatch_message(&mut self, message: SessionMessage) {
-        if self.barrier_active {
+        if self.barrier_active && !matches!(&message, SessionMessage::Clear) {
             self.blocked_messages.push_back(message);
             return;
         }
@@ -1316,6 +1327,7 @@ impl Session {
             },
             SessionMessage::SequenceClose(sequence_id) => self.close_sequence(sequence_id),
             SessionMessage::SequenceCloseAll => self.close_all_sequences(),
+            SessionMessage::Clear => self.clear_backlog_and_sequences(),
             SessionMessage::Barrier => {
                 if self.inflight_message_count > 0 {
                     self.barrier_active = true;
@@ -1329,20 +1341,50 @@ impl Session {
             return;
         };
         log::debug!(
-            "client {} closing sequence {:?} on stream {}",
+            "client {} resetting sequence {:?} on stream {}",
             self.client_id,
             sequence_id,
             stream_id
         );
-        self.queue_fin(stream_id);
+        self.reset_stream(stream_id);
     }
 
     fn close_all_sequences(&mut self) {
-        let stream_ids: Vec<u64> =
-            self.sequence_streams.drain().map(|(_, stream_id)| stream_id).collect();
+        let stream_ids = self.take_all_sequence_stream_ids();
+        self.reset_streams(stream_ids, "resetting sequence stream");
+    }
+
+    fn clear_backlog_and_sequences(&mut self) {
+        self.blocked_messages.clear();
+        self.barrier_active = false;
+
+        let mut stream_ids = self.take_all_sequence_stream_ids();
+        stream_ids.extend(self.pending_write_stream_ids());
+        self.reset_streams(stream_ids, "clearing backlog with reset on stream");
+
+        self.maybe_release_barrier();
+    }
+
+    fn take_all_sequence_stream_ids(&mut self) -> Vec<u64> {
+        self.sequence_streams.drain().map(|(_, stream_id)| stream_id).collect()
+    }
+
+    fn pending_write_stream_ids(&self) -> HashSet<u64> {
+        self.streams
+            .iter()
+            .filter_map(|(&stream_id, state)| {
+                (!state.pending_writes.is_empty()).then_some(stream_id)
+            })
+            .collect()
+    }
+
+    fn reset_streams<I>(&mut self, stream_ids: I, action: &str)
+    where
+        I: IntoIterator<Item = u64>,
+    {
         for stream_id in stream_ids {
-            log::debug!("client {} closing sequence stream {}", self.client_id, stream_id);
-            self.queue_fin(stream_id);
+            log::debug!("client {} {} {}", self.client_id, action, stream_id);
+            self.reset_stream(stream_id);
         }
     }
 
@@ -1431,14 +1473,15 @@ impl Session {
             order,
             fin
         );
-        self.queue_stream_payloads(
-            stream_id,
-            &serialized,
-            fin,
-        );
+        self.queue_stream_payloads(stream_id, &serialized, fin);
     }
 
-    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &SerializedEnvelopePayload, fin: bool) {
+    fn queue_stream_payloads(
+        &mut self,
+        stream_id: u64,
+        payload: &SerializedEnvelopePayload,
+        fin: bool,
+    ) {
         if payload.framed.is_empty() {
             return;
         }
@@ -1454,15 +1497,37 @@ impl Session {
         });
     }
 
-    fn queue_fin(&mut self, stream_id: u64) {
-        self.inflight_message_count = self.inflight_message_count.saturating_add(1);
-        let state = self.stream_state_mut(stream_id, "tx");
-        state.pending_writes.push_back(PendingStreamWrite {
-            data: Vec::new(),
-            offset: 0,
-            fin: true,
-            tracks_inflight: true,
-        });
+    fn discard_pending_writes(&mut self, stream_id: u64) {
+        let Some(state) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+
+        for chunk in state.pending_writes.drain(..) {
+            if chunk.tracks_inflight {
+                self.inflight_message_count = self.inflight_message_count.saturating_sub(1);
+            }
+
+            let remaining = chunk.data.len().saturating_sub(chunk.offset);
+            self.queued_stream_bytes = self.queued_stream_bytes.saturating_sub(remaining);
+        }
+    }
+
+    fn reset_stream(&mut self, stream_id: u64) {
+        self.discard_pending_writes(stream_id);
+
+        match self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, STREAM_RESET_ERROR_CODE)
+        {
+            Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {},
+            Err(err) => {
+                log::debug!(
+                    "client {} failed to reset stream {}: {err:?}",
+                    self.client_id,
+                    stream_id
+                );
+            },
+        }
+
+        self.cleanup_stream_if_closed(stream_id);
     }
 
     fn has_stream_budget(&self, next_framed_len: usize) -> bool {
