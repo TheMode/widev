@@ -35,68 +35,39 @@ struct RecvMeta {
     len: usize,
 }
 
-struct RecvBatch {
-    storage: Vec<u8>,
-    metas: Vec<RecvMeta>,
-}
-
-impl RecvBatch {
-    fn new() -> Self {
-        Self {
-            storage: vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE],
-            metas: Vec::with_capacity(RECV_BATCH_SIZE),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.metas.clear();
-    }
-
-    fn push(&mut self, slot: usize, offset: usize, from: SocketAddr, len: usize) {
-        self.metas.push(RecvMeta { slot, offset, from, len });
-    }
-
-    fn len(&self) -> usize {
-        self.metas.len()
-    }
-
-    fn from(&self, index: usize) -> SocketAddr {
-        self.metas[index].from
-    }
-
-    fn packet(&self, index: usize) -> &[u8] {
-        let meta = self.metas[index];
-        let slot_start = meta.slot * MAX_RECV_DATAGRAM_SIZE;
-        let start = slot_start + meta.offset;
-        &self.storage[start..start + meta.len]
-    }
-}
-
-struct RecvBatcher {
+struct RecvBuffer {
     socket: UdpSocket,
     udp_state: quinn_udp::UdpSocketState,
+    storage: Vec<u8>,
+    metas: Vec<RecvMeta>,
     rx_meta: Vec<quinn_udp::RecvMeta>,
 }
 
-impl RecvBatcher {
+impl RecvBuffer {
     fn new(socket: UdpSocket) -> io::Result<Self> {
         let udp_state = quinn_udp::UdpSocketState::new((&socket).into())?;
+        let storage = vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE];
+        let metas = Vec::with_capacity(RECV_BATCH_SIZE);
         let rx_meta = vec![quinn_udp::RecvMeta::default(); RECV_BATCH_SIZE];
-        Ok(Self { socket, udp_state, rx_meta })
+        Ok(Self {
+            socket,
+            udp_state,
+            storage,
+            metas,
+            rx_meta,
+        })
     }
 
-    fn recv_next_batch(&mut self, batch: &mut RecvBatch) -> io::Result<usize> {
-        batch.clear();
+    fn recv_next_batch(&mut self) -> io::Result<usize> {
+        self.metas.clear();
 
         let received = {
-            let mut bufs: Vec<IoSliceMut<'_>> = batch
-                .storage
-                .chunks_mut(MAX_RECV_DATAGRAM_SIZE)
-                .take(RECV_BATCH_SIZE)
-                .map(IoSliceMut::new)
-                .collect();
+            let mut chunks = self.storage.chunks_mut(MAX_RECV_DATAGRAM_SIZE);
+            let mut bufs: [IoSliceMut<'_>; RECV_BATCH_SIZE] = std::array::from_fn(|_| {
+                IoSliceMut::new(chunks.next().expect("fixed receive chunk count"))
+            });
 
-            match self.udp_state.recv((&self.socket).into(), &mut bufs, &mut self.rx_meta) {
+            match self.udp_state.recv((&self.socket).into(), &mut bufs[..], &mut self.rx_meta) {
                 Ok(n) => n,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
                 Err(err) => return Err(err),
@@ -110,12 +81,23 @@ impl RecvBatcher {
 
             while offset < meta.len {
                 let len = (meta.len - offset).min(stride);
-                batch.push(slot, offset, meta.addr, len);
+                self.metas.push(RecvMeta { slot, offset, from: meta.addr, len });
                 offset += stride;
             }
         }
 
-        Ok(batch.len())
+        Ok(self.metas.len())
+    }
+
+    fn from(&self, index: usize) -> SocketAddr {
+        self.metas[index].from
+    }
+
+    fn packet(&self, index: usize) -> &[u8] {
+        let meta = self.metas[index];
+        let slot_start = meta.slot * MAX_RECV_DATAGRAM_SIZE;
+        let start = slot_start + meta.offset;
+        &self.storage[start..start + meta.len]
     }
 }
 
@@ -319,9 +301,8 @@ fn run_io_thread(
     let recv_socket = socket.try_clone().context("failed to clone UDP socket for I/O receiver")?;
     let send_udp_state = quinn_udp::UdpSocketState::new((&socket).into())
         .context("failed to initialize UDP sender state")?;
-    let mut recv_batcher =
-        RecvBatcher::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
-    let mut recv_batch = RecvBatch::new();
+    let mut recv_buffer =
+        RecvBuffer::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
     let mut shard = ShardState::new(shard_id, local_addr, build_server_quic_config()?, event_tx);
     let mut delayed_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
     let mut ready_datagrams: VecDeque<PacedDatagram> = VecDeque::new();
@@ -332,8 +313,7 @@ fn run_io_thread(
 
     while running.load(Ordering::Relaxed) {
         drain_received_datagrams(
-            &mut recv_batcher,
-            &mut recv_batch,
+            &mut recv_buffer,
             &mut shard,
             next_client_id.as_ref(),
         );
@@ -355,8 +335,7 @@ fn run_io_thread(
             break;
         }
         drain_received_datagrams(
-            &mut recv_batcher,
-            &mut recv_batch,
+            &mut recv_buffer,
             &mut shard,
             next_client_id.as_ref(),
         );
@@ -588,13 +567,12 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
 }
 
 fn drain_received_datagrams(
-    recv_batcher: &mut RecvBatcher,
-    recv_batch: &mut RecvBatch,
+    recv_buffer: &mut RecvBuffer,
     shard: &mut ShardState,
     next_client_id: &AtomicU32,
 ) {
     loop {
-        let batch_count = match recv_batcher.recv_next_batch(recv_batch) {
+        let batch_count = match recv_buffer.recv_next_batch() {
             Ok(count) => count,
             Err(err) => {
                 log::warn!("UDP receive failed on shard {}: {err}", shard.shard_id);
@@ -606,8 +584,8 @@ fn drain_received_datagrams(
         }
 
         for index in 0..batch_count {
-            let from = recv_batch.from(index);
-            let data = recv_batch.packet(index).to_vec();
+            let from = recv_buffer.from(index);
+            let data = recv_buffer.packet(index).to_vec();
             handle_received_datagram(shard, from, data, next_client_id);
         }
     }
