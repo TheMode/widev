@@ -17,7 +17,6 @@ pub mod protocol;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_WORKER_POLL_WAIT: Duration = Duration::from_millis(10);
-const STREAM_COMPACT_THRESHOLD: usize = 4096;
 const DEFAULT_CLIENT_NAME: &str = "desktop-bot";
 const DEFAULT_CAPABILITIES: &[&str] = &["stress.multiclient", "input.synthetic"];
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(500);
@@ -66,7 +65,6 @@ impl<'a> BotContext<'a> {
 #[derive(Default)]
 struct QuicStreamState {
     recv_buffer: Vec<u8>,
-    recv_offset: usize,
     recv_finished: bool,
 }
 
@@ -640,7 +638,11 @@ fn process_datagrams(
     loop {
         match session.conn.dgram_recv(app_buf) {
             Ok(len) => {
-                if let Ok(packet) = protocol::decode_s2c(&app_buf[..len]) {
+                let mut framed = app_buf[..len].to_vec();
+                for frame in drain_framed_packets(&mut framed) {
+                    let Ok(packet) = protocol::decode_s2c(&frame) else {
+                        continue;
+                    };
                     handle_s2c_packet(session, packet)?;
                 }
                 *had_activity = true;
@@ -662,17 +664,17 @@ fn process_streams(
         loop {
             match session.conn.stream_recv(stream_id, app_buf) {
                 Ok((len, fin)) => {
-                    {
+                    let frames = {
                         let state = session.stream_states.entry(stream_id).or_default();
-                        maybe_compact_stream_buffer(state);
                         state.recv_buffer.extend_from_slice(&app_buf[..len]);
                         state.recv_finished |= fin;
-                    }
+                        drain_framed_packets(&mut state.recv_buffer)
+                    };
 
-                    while let Some(packet) = {
-                        let state = session.stream_states.entry(stream_id).or_default();
-                        pop_decoded_frame(state)
-                    } {
+                    for frame in frames {
+                        let Ok(packet) = protocol::decode_s2c(&frame) else {
+                            continue;
+                        };
                         handle_s2c_packet(session, packet)?;
                     }
 
@@ -692,28 +694,27 @@ fn process_streams(
     Ok(())
 }
 
-fn pop_decoded_frame(state: &mut QuicStreamState) -> Option<protocol::S2CPacket> {
-    loop {
-        let unread = &state.recv_buffer[state.recv_offset..];
-        if unread.len() < 4 {
-            return None;
-        }
-
-        let len = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as usize;
-        if unread.len() < 4 + len {
-            return None;
-        }
-
-        let payload_start = state.recv_offset + 4;
-        let end = payload_start + len;
-        let decoded = protocol::decode_s2c(&state.recv_buffer[payload_start..end]).ok();
-        state.recv_offset = end;
-        maybe_compact_stream_buffer(state);
-
-        if let Some(packet) = decoded {
-            return Some(packet);
-        }
+fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.len() < 4 {
+        return None;
     }
+
+    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    if buffer.len() < 4 + len {
+        return None;
+    }
+
+    let payload = buffer[4..4 + len].to_vec();
+    buffer.drain(..4 + len);
+    Some(payload)
+}
+
+fn drain_framed_packets(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while let Some(frame) = pop_frame(buffer) {
+        frames.push(frame);
+    }
+    frames
 }
 
 fn cleanup_stream_if_closed(
@@ -722,27 +723,13 @@ fn cleanup_stream_if_closed(
     stream_id: u64,
 ) {
     let should_remove = if let Some(state) = stream_states.get(&stream_id) {
-        state.recv_offset >= state.recv_buffer.len()
-            && (state.recv_finished || conn.stream_finished(stream_id))
+        state.recv_buffer.is_empty() && (state.recv_finished || conn.stream_finished(stream_id))
     } else {
         false
     };
     if should_remove {
         stream_states.remove(&stream_id);
     }
-}
-
-fn maybe_compact_stream_buffer(state: &mut QuicStreamState) {
-    if state.recv_offset == 0 {
-        return;
-    }
-    if state.recv_offset < STREAM_COMPACT_THRESHOLD
-        && state.recv_offset * 2 < state.recv_buffer.len()
-    {
-        return;
-    }
-    state.recv_buffer.drain(..state.recv_offset);
-    state.recv_offset = 0;
 }
 
 fn compute_poll_wait(sessions: &[BotSession]) -> Duration {

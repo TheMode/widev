@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use uuid::Uuid;
+
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    InputType, PacketBundle, PacketEnvelope, PacketTarget, PredictionKind, S2CPacket, StreamID,
+    InputType, PacketBundle, PacketEnvelope, PacketTarget, PredictionKind, S2CPacket,
     TransformPredictionMask,
 };
 
@@ -31,7 +33,7 @@ struct ElementState {
 struct PlayerState {
     input: PlayerInput,
     element: ElementState,
-    control_stream_id: StreamID,
+    bootstrap_sequence_id: Uuid,
 }
 
 pub struct RedSquareGame {
@@ -49,11 +51,18 @@ impl RedSquareGame {
         ElementState { x: 120.0 + col * 60.0, y: 120.0 + row * 60.0 }
     }
 
+    fn new_player(client_id: ClientId) -> PlayerState {
+        PlayerState {
+            input: PlayerInput::default(),
+            element: Self::spawn_element(client_id),
+            bootstrap_sequence_id: Uuid::now_v7(),
+        }
+    }
+
     fn send_bootstrap(&mut self, state: &mut GameState, client_id: ClientId) {
         let Some(player) = self.players.get(&client_id) else {
             return;
         };
-        let stream_id = player.control_stream_id;
 
         let mut bundle = vec![
             S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
@@ -74,8 +83,7 @@ impl RedSquareGame {
 
         state.send(
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
-                .reliable()
-                .with_stream(stream_id),
+                .sequence(player.bootstrap_sequence_id),
         );
     }
 }
@@ -84,16 +92,7 @@ impl Game for RedSquareGame {
     fn on_event(&mut self, state: &mut GameState, event: NetworkEvent) {
         match event {
             NetworkEvent::ClientConnected(client_id) => {
-                let stream_id = state.create_stream(client_id).unwrap_or(3);
-                let element = Self::spawn_element(client_id);
-                self.players.insert(
-                    client_id,
-                    PlayerState {
-                        input: PlayerInput::default(),
-                        element,
-                        control_stream_id: stream_id,
-                    },
-                );
+                self.players.insert(client_id, Self::new_player(client_id));
 
                 self.send_bootstrap(state, client_id);
 
@@ -158,11 +157,8 @@ impl Game for RedSquareGame {
                 },
                 crate::packets::C2SPacket::InputValue { binding_id, value } => {
                     let pressed = value >= 0.5;
-                    let player = self.players.entry(client_id).or_insert(PlayerState {
-                        input: PlayerInput::default(),
-                        element: Self::spawn_element(client_id),
-                        control_stream_id: 3,
-                    });
+                    let player =
+                        self.players.entry(client_id).or_insert(Self::new_player(client_id));
                     let input = &mut player.input;
                     match binding_id {
                         1 => input.up = pressed,

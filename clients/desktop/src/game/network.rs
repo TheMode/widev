@@ -262,7 +262,8 @@ fn drain_datagrams(
     loop {
         match conn.dgram_recv(app_buf) {
             Ok(len) => {
-                datagrams.push(app_buf[..len].to_vec());
+                let mut framed = app_buf[..len].to_vec();
+                datagrams.extend(drain_framed_packets(&mut framed));
                 *had_activity = true;
             },
             Err(quiche::Error::Done) => break,
@@ -339,12 +340,17 @@ fn ingest_stream_data(
     }
     state.recv_finished |= fin;
 
-    let mut frames = Vec::new();
-    while let Some(frame) = pop_frame(&mut state.recv_buffer) {
-        frames.push(frame);
-    }
+    let frames = drain_framed_packets(&mut state.recv_buffer);
 
     cleanup_stream_if_closed(stream_states, conn, stream_id);
+    frames
+}
+
+fn drain_framed_packets(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while let Some(frame) = pop_frame(buffer) {
+        frames.push(frame);
+    }
     frames
 }
 

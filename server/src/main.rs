@@ -12,7 +12,6 @@ mod network;
 mod packets;
 
 use game::Game;
-use game::NetworkEvent;
 use game_state::GameState;
 use network::NetworkRuntime;
 
@@ -43,8 +42,8 @@ fn main() -> Result<()> {
         let dt = now.duration_since(last_tick);
         if dt >= game_state.tick_interval() {
             game.on_tick(&mut game_state, now, dt);
-            let envelopes = game_state.drain_outbox();
-            network.dispatch_envelopes(envelopes);
+            let messages = game_state.drain_outbox();
+            network.dispatch_messages(messages);
             last_tick = now;
         }
 
@@ -54,15 +53,6 @@ fn main() -> Result<()> {
 
 fn handle_network_events(network: &NetworkRuntime, state: &mut GameState, game: &mut dyn Game) {
     for event in network.drain_events() {
-        match &event {
-            NetworkEvent::ClientConnected(client_id) => {
-                state.connect_client(*client_id);
-            },
-            NetworkEvent::ClientDisconnected(client_id) => {
-                state.disconnect_client(*client_id);
-            },
-            NetworkEvent::ClientPacket { .. } => {},
-        }
         game.on_event(state, event);
     }
 }

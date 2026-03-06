@@ -11,19 +11,20 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
+use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
 use crate::packets::{
-    decode_c2s, encode_s2c, C2SPacket, PacketEnvelope, PacketPayload, PacketPriority, PacketTarget,
-    S2CPacket, StreamID,
+    decode_c2s, encode_s2c, C2SPacket, PacketControl, PacketEnvelope, PacketMessage, PacketOrder,
+    PacketPayload, PacketPriority, PacketTarget, S2CPacket,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_RECV_DATAGRAM_SIZE: usize = 65_535;
 const RECV_BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 const SERVER_CONN_ID_LEN: usize = quiche::MAX_CONN_ID_LEN;
+const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
-const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
 
@@ -53,8 +54,12 @@ fn detect_udp_capabilities(socket: &UdpSocket) -> io::Result<UdpCapabilities> {
 }
 
 enum IoCommand {
-    DispatchEnvelopes(Arc<[PacketEnvelope]>),
-    ReceivedDatagram { from: SocketAddr, dcid: Vec<u8>, data: Vec<u8> },
+    DispatchMessages(Arc<[PacketMessage]>),
+    ReceivedDatagram {
+        from: SocketAddr,
+        dcid: Vec<u8>,
+        data: Vec<u8>,
+    },
     Shutdown,
 }
 
@@ -193,13 +198,13 @@ impl NetworkRuntime {
         out
     }
 
-    pub fn dispatch_envelopes(&self, envelopes: Vec<PacketEnvelope>) {
-        if envelopes.is_empty() {
+    pub fn dispatch_messages(&self, messages: Vec<PacketMessage>) {
+        if messages.is_empty() {
             return;
         }
-        let shared: Arc<[PacketEnvelope]> = envelopes.into();
+        let shared: Arc<[PacketMessage]> = messages.into();
         for worker in &self.io_workers {
-            let _ = worker.sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
+            let _ = worker.sender.send(IoCommand::DispatchMessages(Arc::clone(&shared)));
         }
     }
 }
@@ -235,14 +240,15 @@ fn run_recv_thread(
     let mut batch = Vec::with_capacity(RECV_BATCH_SIZE);
 
     while running.load(Ordering::Relaxed) {
-        let batch_count = match recv_next_batch(&socket, &udp_state, &mut storage, &mut rx_meta, &mut batch) {
-            Ok(count) => count,
-            Err(err) => {
-                log::warn!("UDP receive failed on receive thread: {err}");
-                thread::sleep(IO_BACKPRESSURE_WAIT);
-                continue;
-            },
-        };
+        let batch_count =
+            match recv_next_batch(&socket, &udp_state, &mut storage, &mut rx_meta, &mut batch) {
+                Ok(count) => count,
+                Err(err) => {
+                    log::warn!("UDP receive failed on receive thread: {err}");
+                    thread::sleep(IO_BACKPRESSURE_WAIT);
+                    continue;
+                },
+            };
 
         if batch_count == 0 {
             thread::sleep(IO_BACKPRESSURE_WAIT);
@@ -259,11 +265,8 @@ fn run_recv_thread(
             } else {
                 worker_index_for_cid(&dcid, worker_senders.len())
             };
-            let _ = worker_senders[worker_index].send(IoCommand::ReceivedDatagram {
-                from,
-                dcid,
-                data,
-            });
+            let _ =
+                worker_senders[worker_index].send(IoCommand::ReceivedDatagram { from, dcid, data });
         }
     }
 
@@ -328,11 +331,9 @@ fn worker_index_for_addr(addr: SocketAddr, worker_count: usize) -> usize {
             (ip ^ port) % worker_count
         },
         SocketAddr::V6(addr) => {
-            let folded = addr
-                .ip()
-                .octets()
-                .chunks_exact(4)
-                .fold(0usize, |acc, chunk| acc ^ u32::from_be_bytes(chunk.try_into().unwrap()) as usize);
+            let folded = addr.ip().octets().chunks_exact(4).fold(0usize, |acc, chunk| {
+                acc ^ u32::from_be_bytes(chunk.try_into().unwrap()) as usize
+            });
             (folded ^ addr.port() as usize) % worker_count
         },
     }
@@ -447,8 +448,7 @@ fn process_sessions_tick(
         session.maybe_send_ping();
 
         if session.flush_stream_writes().is_err()
-            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams)
-                .is_err()
+            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams).is_err()
             || session.conn.is_closed()
         {
             disconnected.push(client_id);
@@ -606,9 +606,9 @@ fn compute_io_wait(
 
 fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
     match cmd {
-        IoCommand::DispatchEnvelopes(envelopes) => {
-            for envelope in envelopes.iter() {
-                dispatch_envelope_for_thread(shard, envelope);
+        IoCommand::DispatchMessages(messages) => {
+            for message in messages.iter() {
+                dispatch_message_for_thread(shard, message);
             }
         },
         IoCommand::ReceivedDatagram { from, dcid, data } => {
@@ -618,12 +618,7 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
     }
 }
 
-fn handle_received_datagram(
-    shard: &mut ShardState,
-    from: SocketAddr,
-    dcid: &[u8],
-    data: Vec<u8>,
-) {
+fn handle_received_datagram(shard: &mut ShardState, from: SocketAddr, dcid: &[u8], data: Vec<u8>) {
     if let Some(client_id) = shard.client_id_by_cid.get(dcid).copied() {
         let local_addr = shard.local_addr;
         let previous_addr = shard.sessions.get(&client_id).map(|session| session.client_addr);
@@ -649,15 +644,15 @@ fn handle_received_datagram(
         return;
     }
 
-    let Ok(client_id) = shard
-        .next_client_id
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-        if id == u32::MAX {
-            None
-        } else {
-            Some(id + 1)
-        }
-    }) else {
+    let Ok(client_id) =
+        shard.next_client_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            if id == u32::MAX {
+                None
+            } else {
+                Some(id + 1)
+            }
+        })
+    else {
         log::error!("exhausted global ClientId space; rejecting new connection from {from}");
         return;
     };
@@ -701,9 +696,7 @@ fn handle_add_connection(
 
     shard.sessions.insert(client_id, session);
     shard.client_id_by_addr.insert(client_addr, client_id);
-    shard
-        .client_id_by_cid
-        .insert(shard.sessions[&client_id].local_cid.clone(), client_id);
+    shard.client_id_by_cid.insert(shard.sessions[&client_id].local_cid.clone(), client_id);
     shard.refresh_quic_timeout(client_id);
     let _ = shard.event_tx.send(NetworkEvent::ClientConnected(client_id));
     log::info!("accepted connection from {client_addr} as client {client_id}");
@@ -719,23 +712,58 @@ fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<
     }
 }
 
+fn dispatch_message_for_thread(shard: &mut ShardState, message: &PacketMessage) {
+    match message {
+        PacketMessage::Envelope(envelope) => dispatch_envelope_for_thread(shard, envelope),
+        PacketMessage::Control(control) => dispatch_control_for_thread(shard, *control),
+    }
+}
+
 fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
     if !envelope_has_local_targets(shard, envelope.target) {
         return;
     }
 
-    let stream_id = envelope
-        .sync
-        .as_ref()
-        .map(|sync| sync.sequential_stream_id)
-        .unwrap_or(DEFAULT_RELIABLE_STREAM_ID);
+    if let Err(err) = envelope.validate() {
+        log::warn!("dropping invalid envelope: {err}");
+        return;
+    }
+
     let Some(serialized) = serialize_envelope_payload(&envelope.payload) else {
         return;
     };
 
     for_each_target_session_mut(shard, envelope.target, |session| {
-        send_serialized_envelope_to_session(session, stream_id, envelope.priority, &serialized);
+        session.send_envelope(envelope, &serialized);
     });
+}
+
+fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
+    match control {
+        PacketControl::SequenceClose { sequence_id } => {
+            for session in shard.sessions.values_mut() {
+                session.dispatch_message(SessionMessage::SequenceClose(sequence_id));
+            }
+        },
+        PacketControl::SequenceCloseAll { target } => {
+            if !envelope_has_local_targets(shard, target) {
+                return;
+            }
+
+            for_each_target_session_mut(shard, target, |session| {
+                session.dispatch_message(SessionMessage::SequenceCloseAll)
+            });
+        },
+        PacketControl::Barrier { target } => {
+            if !envelope_has_local_targets(shard, target) {
+                return;
+            }
+
+            for_each_target_session_mut(shard, target, |session| {
+                session.dispatch_message(SessionMessage::Barrier)
+            });
+        },
+    }
 }
 
 fn envelope_has_local_targets(shard: &ShardState, target: PacketTarget) -> bool {
@@ -782,27 +810,29 @@ fn for_each_target_session_mut(
     }
 }
 
-fn send_serialized_envelope_to_session(
-    session: &mut Session,
-    stream_id: StreamID,
-    priority: PacketPriority,
-    serialized: &SerializedEnvelopePayload,
-) {
-    if matches!(priority, PacketPriority::Droppable)
-        && !session.has_stream_budget(serialized.framed.len())
-    {
-        log::debug!(
-            "dropping envelope for client {} due to stream congestion budget",
-            session.client_id
-        );
-        return;
-    }
-
-    session.queue_stream_payloads(stream_id, serialized);
-}
-
+#[derive(Clone)]
 struct SerializedEnvelopePayload {
     framed: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct PendingOrderedEnvelope {
+    identifier: Option<Uuid>,
+    priority: PacketPriority,
+    order: PacketOrder,
+    serialized: SerializedEnvelopePayload,
+}
+
+enum SessionMessage {
+    Envelope(PendingOrderedEnvelope),
+    SequenceClose(Uuid),
+    SequenceCloseAll,
+    Barrier,
+}
+
+struct ResolvedOrder {
+    sequence_id: Option<Uuid>,
+    sequence_end: bool,
 }
 
 fn serialize_envelope_payload(payload: &PacketPayload) -> Option<SerializedEnvelopePayload> {
@@ -1092,6 +1122,11 @@ struct Session {
     client_addr: SocketAddr,
     local_cid: Vec<u8>,
     streams: HashMap<u64, QuicStreamState>,
+    next_server_uni_stream_id: u64,
+    sequence_streams: HashMap<Uuid, u64>,
+    blocked_messages: VecDeque<SessionMessage>,
+    inflight_message_count: usize,
+    barrier_active: bool,
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
@@ -1102,6 +1137,8 @@ struct Session {
 struct PendingStreamWrite {
     data: Vec<u8>,
     offset: usize,
+    fin: bool,
+    tracks_inflight: bool,
 }
 
 #[derive(Default)]
@@ -1112,13 +1149,23 @@ struct QuicStreamState {
 }
 
 impl Session {
-    fn new(client_id: ClientId, client_addr: SocketAddr, local_cid: Vec<u8>, conn: Connection) -> Self {
+    fn new(
+        client_id: ClientId,
+        client_addr: SocketAddr,
+        local_cid: Vec<u8>,
+        conn: Connection,
+    ) -> Self {
         Self {
             client_id,
             conn,
             client_addr,
             local_cid,
             streams: HashMap::new(),
+            next_server_uni_stream_id: FIRST_SERVER_UNI_STREAM_ID,
+            sequence_streams: HashMap::new(),
+            blocked_messages: VecDeque::new(),
+            inflight_message_count: 0,
+            barrier_active: false,
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
@@ -1165,6 +1212,13 @@ impl Session {
         }
     }
 
+    fn alloc_server_uni_stream_id(&mut self) -> u64 {
+        let stream_id = self.next_server_uni_stream_id;
+        self.next_server_uni_stream_id =
+            self.next_server_uni_stream_id.checked_add(4).expect("server uni stream id overflow");
+        stream_id
+    }
+
     fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
         let client_id = self.client_id;
         let state = self.stream_state_mut(stream_id, "rx");
@@ -1191,16 +1245,224 @@ impl Session {
         frames
     }
 
-    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &SerializedEnvelopePayload) {
+    fn send_envelope(&mut self, envelope: &PacketEnvelope, serialized: &SerializedEnvelopePayload) {
+        self.dispatch_message(SessionMessage::Envelope(PendingOrderedEnvelope {
+            identifier: envelope.identifier,
+            priority: envelope.priority,
+            order: envelope.order,
+            serialized: serialized.clone(),
+        }));
+    }
+
+    fn can_send_as_datagram(
+        &self,
+        envelope: &PacketEnvelope,
+        serialized: &SerializedEnvelopePayload,
+    ) -> bool {
+        let datagram_fits = self
+            .conn
+            .dgram_max_writable_len()
+            .is_some_and(|max_len| serialized.framed.len() <= max_len);
+
+        matches!(envelope.priority, PacketPriority::Droppable)
+            && matches!(envelope.order, PacketOrder::Independent)
+            && envelope.identifier.is_none()
+            && datagram_fits
+    }
+
+    fn send_datagram(&mut self, envelope: &PacketEnvelope, serialized: &SerializedEnvelopePayload) {
+        match self.conn.dgram_send(&serialized.framed) {
+            Ok(()) => {
+                log::debug!(
+                    "client {} sent envelope {:?} ({:?}) as datagram",
+                    self.client_id,
+                    envelope.identifier,
+                    envelope.order
+                );
+            },
+            Err(
+                quiche::Error::Done | quiche::Error::InvalidState | quiche::Error::BufferTooShort,
+            ) => {
+                log::debug!(
+                    "dropping datagram envelope for client {}: id={:?} order={:?}",
+                    self.client_id,
+                    envelope.identifier,
+                    envelope.order
+                );
+            },
+            Err(err) => {
+                log::debug!(
+                    "dropping datagram envelope for client {} after dgram_send error: {err:?}",
+                    self.client_id
+                );
+            },
+        }
+    }
+
+    fn dispatch_message(&mut self, message: SessionMessage) {
+        if self.barrier_active {
+            self.blocked_messages.push_back(message);
+            return;
+        }
+
+        self.dispatch_message_now(message);
+    }
+
+    fn dispatch_message_now(&mut self, message: SessionMessage) {
+        match message {
+            SessionMessage::Envelope(envelope) => {
+                let resolution = self.resolve_order(envelope.order);
+                self.dispatch_ordered_envelope(envelope, resolution);
+            },
+            SessionMessage::SequenceClose(sequence_id) => self.close_sequence(sequence_id),
+            SessionMessage::SequenceCloseAll => self.close_all_sequences(),
+            SessionMessage::Barrier => {
+                if self.inflight_message_count > 0 {
+                    self.barrier_active = true;
+                }
+            },
+        }
+    }
+
+    fn close_sequence(&mut self, sequence_id: Uuid) {
+        let Some(stream_id) = self.sequence_streams.remove(&sequence_id) else {
+            return;
+        };
+        log::debug!(
+            "client {} closing sequence {:?} on stream {}",
+            self.client_id,
+            sequence_id,
+            stream_id
+        );
+        self.queue_fin(stream_id);
+    }
+
+    fn close_all_sequences(&mut self) {
+        let stream_ids: Vec<u64> =
+            self.sequence_streams.drain().map(|(_, stream_id)| stream_id).collect();
+        for stream_id in stream_ids {
+            log::debug!("client {} closing sequence stream {}", self.client_id, stream_id);
+            self.queue_fin(stream_id);
+        }
+    }
+
+    fn maybe_release_barrier(&mut self) {
+        if !self.barrier_active || self.inflight_message_count > 0 {
+            return;
+        }
+
+        self.barrier_active = false;
+        while !self.barrier_active {
+            let Some(message) = self.blocked_messages.pop_front() else {
+                break;
+            };
+            self.dispatch_message_now(message);
+        }
+    }
+
+    fn resolve_order(&self, order: PacketOrder) -> ResolvedOrder {
+        match order {
+            PacketOrder::Independent => ResolvedOrder { sequence_id: None, sequence_end: false },
+            PacketOrder::Sequence(sequence_id) => {
+                ResolvedOrder { sequence_id: Some(sequence_id), sequence_end: false }
+            },
+            PacketOrder::SequenceEnd(sequence_id) => {
+                ResolvedOrder { sequence_id: Some(sequence_id), sequence_end: true }
+            },
+        }
+    }
+
+    fn dispatch_ordered_envelope(
+        &mut self,
+        envelope: PendingOrderedEnvelope,
+        resolution: ResolvedOrder,
+    ) {
+        let PendingOrderedEnvelope { identifier, priority, order, serialized } = envelope;
+        let ResolvedOrder { sequence_id, sequence_end } = resolution;
+
+        let transport_meta = PacketEnvelope {
+            identifier,
+            target: PacketTarget::Client(self.client_id),
+            payload: PacketPayload::Bundle(Vec::new()),
+            priority,
+            order,
+        };
+
+        if self.can_send_as_datagram(&transport_meta, &serialized) {
+            self.send_datagram(&transport_meta, &serialized);
+            self.maybe_release_barrier();
+            return;
+        }
+
+        if matches!(priority, PacketPriority::Droppable)
+            && !self.has_stream_budget(serialized.framed.len())
+        {
+            log::debug!(
+                "dropping envelope for client {} due to stream congestion budget",
+                self.client_id
+            );
+            self.maybe_release_barrier();
+            return;
+        }
+
+        let (stream_id, fin) = match sequence_id {
+            Some(sequence_id) => {
+                let stream_id =
+                    if let Some(stream_id) = self.sequence_streams.get(&sequence_id).copied() {
+                        stream_id
+                    } else {
+                        let stream_id = self.alloc_server_uni_stream_id();
+                        self.sequence_streams.insert(sequence_id, stream_id);
+                        stream_id
+                    };
+                if sequence_end {
+                    self.sequence_streams.remove(&sequence_id);
+                }
+                (stream_id, sequence_end)
+            },
+            None => (self.alloc_server_uni_stream_id(), true),
+        };
+
+        log::debug!(
+            "client {} opening server stream {} for envelope {:?} ({:?}, fin={})",
+            self.client_id,
+            stream_id,
+            identifier,
+            order,
+            fin
+        );
+        self.queue_stream_payloads(
+            stream_id,
+            &serialized,
+            fin,
+        );
+    }
+
+    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &SerializedEnvelopePayload, fin: bool) {
         if payload.framed.is_empty() {
             return;
         }
 
+        self.inflight_message_count = self.inflight_message_count.saturating_add(1);
         self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.framed.len());
         let state = self.stream_state_mut(stream_id, "tx");
-        state
-            .pending_writes
-            .push_back(PendingStreamWrite { data: payload.framed.clone(), offset: 0 });
+        state.pending_writes.push_back(PendingStreamWrite {
+            data: payload.framed.clone(),
+            offset: 0,
+            fin,
+            tracks_inflight: true,
+        });
+    }
+
+    fn queue_fin(&mut self, stream_id: u64) {
+        self.inflight_message_count = self.inflight_message_count.saturating_add(1);
+        let state = self.stream_state_mut(stream_id, "tx");
+        state.pending_writes.push_back(PendingStreamWrite {
+            data: Vec::new(),
+            offset: 0,
+            fin: true,
+            tracks_inflight: true,
+        });
     }
 
     fn has_stream_budget(&self, next_framed_len: usize) -> bool {
@@ -1222,7 +1484,8 @@ impl Session {
                     break;
                 };
 
-                match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], false) {
+                let send_fin = chunk.fin;
+                match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], send_fin) {
                     Ok(written) => {
                         chunk.offset += written;
                         self.queued_stream_bytes = self.queued_stream_bytes.saturating_sub(written);
@@ -1230,6 +1493,20 @@ impl Session {
                             self.requeue_pending_write(stream_id, chunk);
                             break;
                         }
+                        if chunk.tracks_inflight {
+                            self.inflight_message_count =
+                                self.inflight_message_count.saturating_sub(1);
+                            self.maybe_release_barrier();
+                        }
+                    },
+                    Err(quiche::Error::StreamLimit) => {
+                        log::debug!(
+                            "client {} hit peer stream limit while opening stream {}, retrying later",
+                            self.client_id,
+                            stream_id
+                        );
+                        self.requeue_pending_write(stream_id, chunk);
+                        break;
                     },
                     Err(quiche::Error::Done) => {
                         self.requeue_pending_write(stream_id, chunk);
@@ -1255,6 +1532,7 @@ impl Session {
         };
         if should_remove {
             self.streams.remove(&stream_id);
+            self.sequence_streams.retain(|_, id| *id != stream_id);
             log::debug!("server stream {} cleaned up for client {}", stream_id, self.client_id);
         }
     }

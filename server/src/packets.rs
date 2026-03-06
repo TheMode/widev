@@ -1,36 +1,46 @@
 include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 
 use std::time::Duration;
+use thiserror::Error;
 
 use crate::game::ClientId;
 
-pub type StreamID = u64;
 pub type ServerTick = u64;
 pub type ActionId = u64;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PacketPriority {
+    /// Default reliable delivery on the session's stream.
     #[default]
     Normal,
+    /// Drop instead of queueing when the session is over budget.
+    ///
+    /// If the envelope is `Independent`, has no identifier, and its encoded
+    /// payload fits a single writable QUIC datagram, the transport may send it
+    /// as a datagram instead of opening a stream.
     Droppable,
+    /// Hint that the packet is only useful if sent within this delay budget.
     MaxDelay(Duration),
+    /// Hint that the packet expires once the server reaches this tick.
     MaxTick(ServerTick),
+    /// Hint that nearby packets can be batched within this coalescing window.
     Coalesce(Duration),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ClientPacketMeta {
-    /// Client tick at which the payload should be interpreted.
-    pub execute_at_tick: Option<ServerTick>,
-    /// Client tick deadline after which the payload should be discarded.
-    pub read_deadline_tick: Option<ServerTick>,
-    /// Client-side action bundle identifier for deferred execution.
-    pub action_id: Option<ActionId>,
+pub enum PacketOrder {
+    /// No ordering relationship with any other packet.
+    #[default]
+    Independent,
+    /// Append this packet to the reused stream for this sequence.
+    Sequence(uuid::Uuid),
+    /// Append this packet to the reused stream for this sequence, then send FIN.
+    SequenceEnd(uuid::Uuid),
 }
 
 pub type PacketBundle = Vec<S2CPacket>;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum PacketTarget {
     Client(ClientId),
     Broadcast,
@@ -43,29 +53,50 @@ pub enum PacketPayload {
     Bundle(PacketBundle),
 }
 
-#[derive(Debug, Clone)]
-pub struct StreamSync {
-    pub sequential_stream_id: StreamID,
-    pub wait_for_fin_stream_ids: Vec<StreamID>,
+#[derive(Debug, Clone, Copy)]
+pub enum PacketControl {
+    SequenceClose {
+        sequence_id: uuid::Uuid,
+    },
+    SequenceCloseAll {
+        target: PacketTarget,
+    },
+    /// Block later messages for the target until all currently inflight
+    /// transport writes for that target have completed locally.
+    Barrier {
+        target: PacketTarget,
+    },
 }
 
 #[derive(Clone)]
 pub struct PacketEnvelope {
+    pub identifier: Option<uuid::Uuid>,
     pub target: PacketTarget,
     pub payload: PacketPayload,
     pub priority: PacketPriority,
-    pub client_meta: ClientPacketMeta,
-    pub sync: Option<StreamSync>,
+    pub order: PacketOrder,
+}
+
+#[derive(Clone)]
+pub enum PacketMessage {
+    Envelope(PacketEnvelope),
+    Control(PacketControl),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PacketEnvelopeValidationError {
+    #[error("droppable envelopes cannot have an identifier")]
+    DroppableWithIdentifier,
 }
 
 impl PacketEnvelope {
     pub fn new(target: PacketTarget, payload: PacketPayload) -> Self {
         Self {
+            identifier: None,
             target,
             payload,
             priority: PacketPriority::default(),
-            client_meta: ClientPacketMeta::default(),
-            sync: None,
+            order: PacketOrder::default(),
         }
     }
 
@@ -79,11 +110,6 @@ impl PacketEnvelope {
 
     pub fn droppable(mut self) -> Self {
         self.priority = PacketPriority::Droppable;
-        self
-    }
-
-    pub fn reliable(mut self) -> Self {
-        self.priority = PacketPriority::Normal;
         self
     }
 
@@ -102,16 +128,31 @@ impl PacketEnvelope {
         self
     }
 
-    pub fn with_stream_sync(mut self, dependencies: StreamSync) -> Self {
-        self.sync = Some(dependencies);
+    pub fn id(mut self, identifier: uuid::Uuid) -> Self {
+        self.identifier = Some(identifier);
         self
     }
 
-    pub fn with_stream(mut self, stream_id: StreamID) -> Self {
-        self.sync = Some(StreamSync {
-            sequential_stream_id: stream_id,
-            wait_for_fin_stream_ids: Vec::new(),
-        });
+    pub fn independent(mut self) -> Self {
+        self.order = PacketOrder::Independent;
         self
+    }
+
+    pub fn sequence(mut self, sequence_id: uuid::Uuid) -> Self {
+        self.order = PacketOrder::Sequence(sequence_id);
+        self
+    }
+
+    pub fn sequence_end(mut self, sequence_id: uuid::Uuid) -> Self {
+        self.order = PacketOrder::SequenceEnd(sequence_id);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), PacketEnvelopeValidationError> {
+        if matches!(self.priority, PacketPriority::Droppable) && self.identifier.is_some() {
+            return Err(PacketEnvelopeValidationError::DroppableWithIdentifier);
+        }
+
+        Ok(())
     }
 }
