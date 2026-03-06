@@ -3722,7 +3722,6 @@ dependencies = [
  "rand",
  "rcgen",
  "serde",
- "socket2",
 ]
 
 [[package]]

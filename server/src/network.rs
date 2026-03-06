@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use quiche::{Connection, RecvInfo};
 use rand::RngCore;
-use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::game::{ClientId, NetworkEvent};
 use crate::packets::{
@@ -22,78 +21,11 @@ use crate::packets::{
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_RECV_DATAGRAM_SIZE: usize = 65_535;
 const RECV_BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
+const SERVER_CONN_ID_LEN: usize = quiche::MAX_CONN_ID_LEN;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_RELIABLE_STREAM_ID: StreamID = 3;
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
-
-#[derive(Clone, Copy)]
-struct RecvMeta {
-    slot: usize,
-    offset: usize,
-    from: SocketAddr,
-    len: usize,
-}
-
-struct RecvBuffer {
-    socket: UdpSocket,
-    udp_state: quinn_udp::UdpSocketState,
-    storage: Vec<u8>,
-    metas: Vec<RecvMeta>,
-    rx_meta: Vec<quinn_udp::RecvMeta>,
-}
-
-impl RecvBuffer {
-    fn new(socket: UdpSocket) -> io::Result<Self> {
-        let udp_state = quinn_udp::UdpSocketState::new((&socket).into())?;
-        let storage = vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE];
-        let metas = Vec::with_capacity(RECV_BATCH_SIZE);
-        let rx_meta = vec![quinn_udp::RecvMeta::default(); RECV_BATCH_SIZE];
-        Ok(Self { socket, udp_state, storage, metas, rx_meta })
-    }
-
-    fn recv_next_batch(&mut self) -> io::Result<usize> {
-        self.metas.clear();
-
-        let received = {
-            let mut chunks = self.storage.chunks_mut(MAX_RECV_DATAGRAM_SIZE);
-            let mut bufs: [IoSliceMut<'_>; RECV_BATCH_SIZE] = std::array::from_fn(|_| {
-                IoSliceMut::new(chunks.next().expect("fixed receive chunk count"))
-            });
-
-            match self.udp_state.recv((&self.socket).into(), &mut bufs[..], &mut self.rx_meta) {
-                Ok(n) => n,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
-                Err(err) => return Err(err),
-            }
-        };
-
-        for slot in 0..received {
-            let meta = &self.rx_meta[slot];
-            let stride = meta.stride.max(1);
-            let mut offset = 0usize;
-
-            while offset < meta.len {
-                let len = (meta.len - offset).min(stride);
-                self.metas.push(RecvMeta { slot, offset, from: meta.addr, len });
-                offset += stride;
-            }
-        }
-
-        Ok(self.metas.len())
-    }
-
-    fn from(&self, index: usize) -> SocketAddr {
-        self.metas[index].from
-    }
-
-    fn packet(&self, index: usize) -> &[u8] {
-        let meta = self.metas[index];
-        let slot_start = meta.slot * MAX_RECV_DATAGRAM_SIZE;
-        let start = slot_start + meta.offset;
-        &self.storage[start..start + meta.len]
-    }
-}
 
 struct UdpCapabilities {
     batch_size: usize,
@@ -122,6 +54,7 @@ fn detect_udp_capabilities(socket: &UdpSocket) -> io::Result<UdpCapabilities> {
 
 enum IoCommand {
     DispatchEnvelopes(Arc<[PacketEnvelope]>),
+    ReceivedDatagram { from: SocketAddr, dcid: Vec<u8>, data: Vec<u8> },
     Shutdown,
 }
 
@@ -129,12 +62,11 @@ struct PacedDatagram {
     at: Instant,
     to: SocketAddr,
     bytes: Vec<u8>,
-    seq: u64,
 }
 
 impl PartialEq for PacedDatagram {
     fn eq(&self, other: &Self) -> bool {
-        self.at == other.at && self.seq == other.seq
+        self.at == other.at
     }
 }
 
@@ -149,7 +81,7 @@ impl PartialOrd for PacedDatagram {
 impl Ord for PacedDatagram {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse ordering so BinaryHeap pops the earliest datagram first.
-        other.at.cmp(&self.at).then_with(|| other.seq.cmp(&self.seq))
+        other.at.cmp(&self.at)
     }
 }
 
@@ -174,26 +106,29 @@ impl Ord for QuicTimeout {
 }
 
 pub struct NetworkRuntime {
-    io_shards: Vec<IoShardHandle>,
+    io_workers: Vec<IoWorkerHandle>,
+    recv_thread: Option<thread::JoinHandle<()>>,
     event_rx: mpsc::Receiver<NetworkEvent>,
     running: Arc<AtomicBool>,
 }
 
-struct IoShardHandle {
+struct IoWorkerHandle {
     sender: mpsc::Sender<IoCommand>,
     thread: thread::JoinHandle<()>,
 }
 
 impl NetworkRuntime {
     pub fn start(bind_addr: SocketAddr) -> Result<Self> {
-        let thread_count =
+        let worker_count =
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
 
-        let first_socket = bind_reuseport_udp_socket(bind_addr)
+        let socket = bind_udp_socket(bind_addr)
             .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
-        let local_addr = first_socket.local_addr().context("failed to read local addr")?;
-        log::info!("server listening on {local_addr} with {thread_count} I/O threads");
-        let caps = detect_udp_capabilities(&first_socket)
+        let local_addr = socket.local_addr().context("failed to read local addr")?;
+        log::info!(
+            "server listening on {local_addr} with 1 receive thread and {worker_count} I/O workers"
+        );
+        let caps = detect_udp_capabilities(&socket)
             .context("failed to detect UDP networking capabilities")?;
         log::info!(
             "network capabilities:\n  batch_read={} (batch_size={})\n  batch_write={}\n  gso={} (max_segments={})\n  gro={} (segments={})",
@@ -211,39 +146,43 @@ impl NetworkRuntime {
 
         let (event_tx, event_rx) = mpsc::channel::<NetworkEvent>();
 
-        let mut io_shards = Vec::with_capacity(thread_count);
-        let mut first_socket = Some(first_socket);
+        let mut io_workers = Vec::with_capacity(worker_count);
+        let mut worker_senders = Vec::with_capacity(worker_count);
 
-        for shard_id in 0..thread_count {
+        for worker_id in 0..worker_count {
             let (io_tx, io_rx) = mpsc::channel::<IoCommand>();
-
-            let socket = if shard_id == 0 {
-                first_socket.take().expect("first socket available")
-            } else {
-                bind_reuseport_udp_socket(local_addr)
-                    .context("failed to bind UDP socket for I/O shard")?
-            };
+            let worker_socket =
+                socket.try_clone().context("failed to clone UDP socket for I/O worker")?;
 
             let event_tx = event_tx.clone();
             let io_running = Arc::clone(&running);
             let next_client_id = Arc::clone(&next_client_id);
             let handle = thread::spawn(move || {
                 if let Err(err) = run_io_thread(
-                    shard_id,
-                    socket,
+                    worker_id,
+                    worker_count,
+                    worker_socket,
                     local_addr,
                     io_rx,
                     event_tx,
                     io_running,
                     next_client_id,
                 ) {
-                    log::error!("I/O thread {shard_id} crashed: {err:#}");
+                    log::error!("I/O worker {worker_id} crashed: {err:#}");
                 }
             });
-            io_shards.push(IoShardHandle { sender: io_tx, thread: handle });
+            worker_senders.push(io_tx.clone());
+            io_workers.push(IoWorkerHandle { sender: io_tx, thread: handle });
         }
 
-        Ok(Self { io_shards, event_rx, running })
+        let recv_running = Arc::clone(&running);
+        let recv_thread = thread::spawn(move || {
+            if let Err(err) = run_recv_thread(socket, worker_senders, recv_running) {
+                log::error!("receive thread crashed: {err:#}");
+            }
+        });
+
+        Ok(Self { io_workers, recv_thread: Some(recv_thread), event_rx, running })
     }
 
     pub fn drain_events(&self) -> Vec<NetworkEvent> {
@@ -259,8 +198,8 @@ impl NetworkRuntime {
             return;
         }
         let shared: Arc<[PacketEnvelope]> = envelopes.into();
-        for shard in &self.io_shards {
-            let _ = shard.sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
+        for worker in &self.io_workers {
+            let _ = worker.sender.send(IoCommand::DispatchEnvelopes(Arc::clone(&shared)));
         }
     }
 }
@@ -268,20 +207,140 @@ impl NetworkRuntime {
 impl Drop for NetworkRuntime {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        let io_shards = std::mem::take(&mut self.io_shards);
+        let io_workers = std::mem::take(&mut self.io_workers);
 
-        for shard in &io_shards {
-            let _ = shard.sender.send(IoCommand::Shutdown);
+        for worker in &io_workers {
+            let _ = worker.sender.send(IoCommand::Shutdown);
         }
 
-        for shard in io_shards {
-            let _ = shard.thread.join();
+        if let Some(recv_thread) = self.recv_thread.take() {
+            let _ = recv_thread.join();
+        }
+
+        for worker in io_workers {
+            let _ = worker.thread.join();
         }
     }
 }
 
+fn run_recv_thread(
+    socket: UdpSocket,
+    worker_senders: Vec<mpsc::Sender<IoCommand>>,
+    running: Arc<AtomicBool>,
+) -> Result<()> {
+    let udp_state = quinn_udp::UdpSocketState::new((&socket).into())
+        .context("failed to initialize receive thread UDP state")?;
+    let mut storage = vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE];
+    let mut rx_meta = vec![quinn_udp::RecvMeta::default(); RECV_BATCH_SIZE];
+    let mut batch = Vec::with_capacity(RECV_BATCH_SIZE);
+
+    while running.load(Ordering::Relaxed) {
+        let batch_count = match recv_next_batch(&socket, &udp_state, &mut storage, &mut rx_meta, &mut batch) {
+            Ok(count) => count,
+            Err(err) => {
+                log::warn!("UDP receive failed on receive thread: {err}");
+                thread::sleep(IO_BACKPRESSURE_WAIT);
+                continue;
+            },
+        };
+
+        if batch_count == 0 {
+            thread::sleep(IO_BACKPRESSURE_WAIT);
+            continue;
+        }
+
+        for index in 0..batch_count {
+            let (from, data) = &batch[index];
+            let from = *from;
+            let data = data.clone();
+            let dcid = packet_destination_cid(&data).unwrap_or_default();
+            let worker_index = if dcid.is_empty() {
+                worker_index_for_addr(from, worker_senders.len())
+            } else {
+                worker_index_for_cid(&dcid, worker_senders.len())
+            };
+            let _ = worker_senders[worker_index].send(IoCommand::ReceivedDatagram {
+                from,
+                dcid,
+                data,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn recv_next_batch(
+    socket: &UdpSocket,
+    udp_state: &quinn_udp::UdpSocketState,
+    storage: &mut [u8],
+    rx_meta: &mut [quinn_udp::RecvMeta],
+    batch: &mut Vec<(SocketAddr, Vec<u8>)>,
+) -> io::Result<usize> {
+    batch.clear();
+
+    let received = {
+        let mut chunks = storage.chunks_mut(MAX_RECV_DATAGRAM_SIZE);
+        let mut bufs: [IoSliceMut<'_>; RECV_BATCH_SIZE] = std::array::from_fn(|_| {
+            IoSliceMut::new(chunks.next().expect("fixed receive chunk count"))
+        });
+
+        match udp_state.recv(socket.into(), &mut bufs[..], rx_meta) {
+            Ok(n) => n,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(0),
+            Err(err) => return Err(err),
+        }
+    };
+
+    for (slot, meta) in rx_meta.iter().take(received).enumerate() {
+        let slot_start = slot * MAX_RECV_DATAGRAM_SIZE;
+        let stride = meta.stride.max(1);
+        let mut offset = 0usize;
+
+        while offset < meta.len {
+            let len = (meta.len - offset).min(stride);
+            let start = slot_start + offset;
+            batch.push((meta.addr, storage[start..start + len].to_vec()));
+            offset += stride;
+        }
+    }
+
+    Ok(batch.len())
+}
+
+fn packet_destination_cid(packet: &[u8]) -> Option<Vec<u8>> {
+    let mut hdr_buf = packet.to_vec();
+    let hdr = quiche::Header::from_slice(&mut hdr_buf, SERVER_CONN_ID_LEN).ok()?;
+    Some(hdr.dcid.as_ref().to_vec())
+}
+
+fn worker_index_for_cid(cid: &[u8], worker_count: usize) -> usize {
+    debug_assert!(worker_count > 0);
+    cid.iter().fold(0usize, |acc, byte| acc.wrapping_mul(131) ^ usize::from(*byte)) % worker_count
+}
+
+fn worker_index_for_addr(addr: SocketAddr, worker_count: usize) -> usize {
+    debug_assert!(worker_count > 0);
+    match addr {
+        SocketAddr::V4(addr) => {
+            let ip = u32::from_be_bytes(addr.ip().octets()) as usize;
+            let port = addr.port() as usize;
+            (ip ^ port) % worker_count
+        },
+        SocketAddr::V6(addr) => {
+            let folded = addr
+                .ip()
+                .octets()
+                .chunks_exact(4)
+                .fold(0usize, |acc, chunk| acc ^ u32::from_be_bytes(chunk.try_into().unwrap()) as usize);
+            (folded ^ addr.port() as usize) % worker_count
+        },
+    }
+}
+
 fn run_io_thread(
-    shard_id: usize,
+    worker_id: usize,
+    worker_count: usize,
     socket: UdpSocket,
     local_addr: SocketAddr,
     io_rx: mpsc::Receiver<IoCommand>,
@@ -289,22 +348,23 @@ fn run_io_thread(
     running: Arc<AtomicBool>,
     next_client_id: Arc<AtomicU32>,
 ) -> Result<()> {
-    let recv_socket = socket.try_clone().context("failed to clone UDP socket for I/O receiver")?;
     let send_udp_state = quinn_udp::UdpSocketState::new((&socket).into())
         .context("failed to initialize UDP sender state")?;
-    let mut recv_buffer =
-        RecvBuffer::new(recv_socket).context("failed to initialize quinn-udp receiver state")?;
-    let mut shard = ShardState::new(shard_id, local_addr, build_server_quic_config()?, event_tx);
+    let mut shard = ShardState::new(
+        worker_id,
+        worker_count,
+        local_addr,
+        build_server_quic_config()?,
+        event_tx,
+        next_client_id,
+    );
     let mut delayed_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
     let mut ready_datagrams: VecDeque<PacedDatagram> = VecDeque::new();
-    let mut next_paced_seq: u64 = 1;
 
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut app_buf = [0u8; 4096];
 
     while running.load(Ordering::Relaxed) {
-        drain_received_datagrams(&mut recv_buffer, &mut shard, next_client_id.as_ref());
-
         // Flush any previously queued datagrams whose pacing deadline has arrived.
         flush_due_paced_datagrams(
             &socket,
@@ -321,7 +381,6 @@ fn run_io_thread(
         if !recv_and_drain_io_commands(&io_rx, wait_for, &mut shard) {
             break;
         }
-        drain_received_datagrams(&mut recv_buffer, &mut shard, next_client_id.as_ref());
 
         let disconnected = process_sessions_tick(
             &mut shard,
@@ -329,7 +388,6 @@ fn run_io_thread(
             &mut send_buf,
             &mut delayed_datagrams,
             &mut ready_datagrams,
-            &mut next_paced_seq,
         );
 
         // Send datagrams generated by this iteration that are already due.
@@ -378,7 +436,6 @@ fn process_sessions_tick(
     send_buf: &mut [u8],
     delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
     ready_datagrams: &mut VecDeque<PacedDatagram>,
-    next_paced_seq: &mut u64,
 ) -> Vec<ClientId> {
     let mut disconnected = Vec::new();
     let mut touched_sessions = Vec::new();
@@ -390,7 +447,7 @@ fn process_sessions_tick(
         session.maybe_send_ping();
 
         if session.flush_stream_writes().is_err()
-            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams, next_paced_seq)
+            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams)
                 .is_err()
             || session.conn.is_closed()
         {
@@ -409,36 +466,45 @@ fn cleanup_disconnected_sessions(shard: &mut ShardState, disconnected: Vec<Clien
     for client_id in disconnected {
         if let Some(session) = shard.sessions.remove(&client_id) {
             shard.client_id_by_addr.remove(&session.client_addr);
+            shard.client_id_by_cid.remove(&session.local_cid);
             let _ = shard.event_tx.send(NetworkEvent::ClientDisconnected(client_id));
         }
     }
 }
 
 struct ShardState {
-    shard_id: usize,
+    worker_id: usize,
+    worker_count: usize,
     local_addr: SocketAddr,
     config: quiche::Config,
     sessions: HashMap<ClientId, Session>,
     client_id_by_addr: HashMap<SocketAddr, ClientId>,
+    client_id_by_cid: HashMap<Vec<u8>, ClientId>,
     quic_timeouts: BinaryHeap<QuicTimeout>,
     event_tx: mpsc::Sender<NetworkEvent>,
+    next_client_id: Arc<AtomicU32>,
 }
 
 impl ShardState {
     fn new(
-        shard_id: usize,
+        worker_id: usize,
+        worker_count: usize,
         local_addr: SocketAddr,
         config: quiche::Config,
         event_tx: mpsc::Sender<NetworkEvent>,
+        next_client_id: Arc<AtomicU32>,
     ) -> Self {
         Self {
-            shard_id,
+            worker_id,
+            worker_count,
             local_addr,
             config,
             sessions: HashMap::new(),
             client_id_by_addr: HashMap::new(),
+            client_id_by_cid: HashMap::new(),
             quic_timeouts: BinaryHeap::new(),
             event_tx,
+            next_client_id,
         }
     }
 
@@ -545,47 +611,31 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
                 dispatch_envelope_for_thread(shard, envelope);
             }
         },
+        IoCommand::ReceivedDatagram { from, dcid, data } => {
+            handle_received_datagram(shard, from, &dcid, data);
+        },
         IoCommand::Shutdown => {},
-    }
-}
-
-fn drain_received_datagrams(
-    recv_buffer: &mut RecvBuffer,
-    shard: &mut ShardState,
-    next_client_id: &AtomicU32,
-) {
-    loop {
-        let batch_count = match recv_buffer.recv_next_batch() {
-            Ok(count) => count,
-            Err(err) => {
-                log::warn!("UDP receive failed on shard {}: {err}", shard.shard_id);
-                break;
-            },
-        };
-        if batch_count == 0 {
-            break;
-        }
-
-        for index in 0..batch_count {
-            let from = recv_buffer.from(index);
-            let data = recv_buffer.packet(index).to_vec();
-            handle_received_datagram(shard, from, data, next_client_id);
-        }
     }
 }
 
 fn handle_received_datagram(
     shard: &mut ShardState,
     from: SocketAddr,
+    dcid: &[u8],
     data: Vec<u8>,
-    next_client_id: &AtomicU32,
 ) {
-    if let Some(client_id) = shard.client_id_by_addr.get(&from).copied() {
+    if let Some(client_id) = shard.client_id_by_cid.get(dcid).copied() {
         let local_addr = shard.local_addr;
+        let previous_addr = shard.sessions.get(&client_id).map(|session| session.client_addr);
         shard.with_session_and_refresh(client_id, |session| {
             let mut data = data;
+            session.client_addr = from;
             recv_on_session(session, &mut data, from, local_addr, "conn.recv");
         });
+        if let Some(previous_addr) = previous_addr.filter(|addr| *addr != from) {
+            shard.client_id_by_addr.remove(&previous_addr);
+        }
+        shard.client_id_by_addr.insert(from, client_id);
         return;
     }
 
@@ -599,7 +649,9 @@ fn handle_received_datagram(
         return;
     }
 
-    let Ok(client_id) = next_client_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+    let Ok(client_id) = shard
+        .next_client_id
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
         if id == u32::MAX {
             None
         } else {
@@ -627,9 +679,8 @@ fn handle_add_connection(
         return;
     }
 
-    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    rand::thread_rng().fill_bytes(&mut scid);
-    let scid = quiche::ConnectionId::from_ref(&scid);
+    let server_cid = generate_server_cid_for_worker(shard.worker_id, shard.worker_count);
+    let scid = quiche::ConnectionId::from_ref(&server_cid);
 
     let conn = match quiche::accept(&scid, None, shard.local_addr, client_addr, &mut shard.config) {
         Ok(conn) => conn,
@@ -639,7 +690,7 @@ fn handle_add_connection(
         },
     };
 
-    let mut session = Session::new(client_id, client_addr, conn);
+    let mut session = Session::new(client_id, client_addr, server_cid, conn);
     recv_on_session(
         &mut session,
         &mut pkt_buf,
@@ -650,9 +701,22 @@ fn handle_add_connection(
 
     shard.sessions.insert(client_id, session);
     shard.client_id_by_addr.insert(client_addr, client_id);
+    shard
+        .client_id_by_cid
+        .insert(shard.sessions[&client_id].local_cid.clone(), client_id);
     shard.refresh_quic_timeout(client_id);
     let _ = shard.event_tx.send(NetworkEvent::ClientConnected(client_id));
     log::info!("accepted connection from {client_addr} as client {client_id}");
+}
+
+fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<u8> {
+    let mut cid = vec![0u8; SERVER_CONN_ID_LEN];
+    loop {
+        rand::thread_rng().fill_bytes(&mut cid);
+        if worker_index_for_cid(&cid, worker_count) == worker_id {
+            return cid;
+        }
+    }
 }
 
 fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
@@ -780,6 +844,7 @@ fn pump_app_packets(
     app_buf: &mut [u8],
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
+    // Drain datagrams
     loop {
         match session.conn.dgram_recv(app_buf) {
             Ok(len) => {
@@ -790,6 +855,7 @@ fn pump_app_packets(
         }
     }
 
+    // Drain streams
     for stream_id in session.conn.readable() {
         loop {
             match session.conn.stream_recv(stream_id, app_buf) {
@@ -873,7 +939,6 @@ fn flush_quic(
     send_buf: &mut [u8],
     delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
     ready_datagrams: &mut VecDeque<PacedDatagram>,
-    next_paced_seq: &mut u64,
 ) -> Result<()> {
     let now = Instant::now();
     loop {
@@ -883,14 +948,12 @@ fn flush_quic(
                     at: send_info.at,
                     to: send_info.to,
                     bytes: send_buf[..len].to_vec(),
-                    seq: *next_paced_seq,
                 };
                 if datagram.at <= now {
                     ready_datagrams.push_back(datagram);
                 } else {
                     delayed_datagrams.push(datagram);
                 }
-                *next_paced_seq = next_paced_seq.wrapping_add(1).max(1);
             },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
@@ -906,6 +969,7 @@ fn flush_due_paced_datagrams(
     delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
     ready_datagrams: &mut VecDeque<PacedDatagram>,
 ) -> Result<()> {
+    // Append now due paced datagrams
     let now = Instant::now();
     while let Some(next) = delayed_datagrams.peek() {
         if next.at > now {
@@ -913,13 +977,12 @@ fn flush_due_paced_datagrams(
         }
         ready_datagrams.push_back(delayed_datagrams.pop().expect("heap top exists"));
     }
-
     if ready_datagrams.is_empty() {
         return Ok(());
     }
 
+    // Send ready datagrams
     let max_gso_segments = send_udp_state.max_gso_segments().max(1);
-
     while let Some(first) = ready_datagrams.front() {
         let destination = first.to;
         let segment_len = first.bytes.len();
@@ -963,30 +1026,10 @@ fn flush_due_paced_datagrams(
     Ok(())
 }
 
-fn bind_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
-    let domain = if bind_addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos"
-    ))]
-    socket.set_reuse_port(true)?;
-    socket.bind(&bind_addr.into())?;
+fn bind_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(bind_addr)?;
     socket.set_nonblocking(true)?;
-    Ok(socket.into())
+    Ok(socket)
 }
 
 fn build_server_quic_config() -> Result<quiche::Config> {
@@ -1047,6 +1090,7 @@ struct Session {
     client_id: ClientId,
     conn: Connection,
     client_addr: SocketAddr,
+    local_cid: Vec<u8>,
     streams: HashMap<u64, QuicStreamState>,
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
@@ -1068,11 +1112,12 @@ struct QuicStreamState {
 }
 
 impl Session {
-    fn new(client_id: ClientId, client_addr: SocketAddr, conn: Connection) -> Self {
+    fn new(client_id: ClientId, client_addr: SocketAddr, local_cid: Vec<u8>, conn: Connection) -> Self {
         Self {
             client_id,
             conn,
             client_addr,
+            local_cid,
             streams: HashMap::new(),
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
