@@ -1,5 +1,7 @@
 include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::game::ClientId;
@@ -22,6 +24,22 @@ pub enum PacketPriority {
     /// sends may be dropped instead of being queued when congestion budget is
     /// exhausted.
     Droppable,
+    /// Retry opportunistically until the delay budget expires.
+    ///
+    /// This uses the same congestion-sensitive send path as `Droppable`, but
+    /// instead of dropping immediately when the session is over budget or a
+    /// QUIC datagram is temporarily not writable, the transport may keep the
+    /// packet queued until `max_delay` elapses.
+    Deadline {
+        max_delay: Duration,
+    },
+    /// Keep the packet queued until enough serialized payload has accumulated.
+    ///
+    /// This is intended to reduce header overhead by waiting for a larger
+    /// packet-sized batch before releasing queued work.
+    Coalescing {
+        target_payload_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -88,6 +106,8 @@ pub enum PacketMessage {
 pub enum PacketEnvelopeValidationError {
     #[error("droppable envelopes cannot have an identifier")]
     DroppableWithIdentifier,
+    #[error("coalescing envelopes require a non-zero payload target")]
+    CoalescingWithZeroTarget,
 }
 
 impl PacketEnvelope {
@@ -111,6 +131,16 @@ impl PacketEnvelope {
 
     pub fn droppable(mut self) -> Self {
         self.priority = PacketPriority::Droppable;
+        self
+    }
+
+    pub fn deadline(mut self, max_delay: Duration) -> Self {
+        self.priority = PacketPriority::Deadline { max_delay };
+        self
+    }
+
+    pub fn coalescing(mut self, target_payload_bytes: usize) -> Self {
+        self.priority = PacketPriority::Coalescing { target_payload_bytes };
         self
     }
 
@@ -139,6 +169,40 @@ impl PacketEnvelope {
             return Err(PacketEnvelopeValidationError::DroppableWithIdentifier);
         }
 
+        if matches!(self.priority, PacketPriority::Coalescing { target_payload_bytes: 0 }) {
+            return Err(PacketEnvelopeValidationError::CoalescingWithZeroTarget);
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn droppable_cannot_have_identifier() {
+        let envelope =
+            PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
+                .droppable()
+                .id(uuid::Uuid::nil());
+
+        assert_eq!(
+            envelope.validate(),
+            Err(PacketEnvelopeValidationError::DroppableWithIdentifier)
+        );
+    }
+
+    #[test]
+    fn coalescing_requires_non_zero_target() {
+        let envelope =
+            PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
+                .coalescing(0);
+
+        assert_eq!(
+            envelope.validate(),
+            Err(PacketEnvelopeValidationError::CoalescingWithZeroTarget)
+        );
     }
 }

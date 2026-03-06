@@ -14,6 +14,9 @@ use rand::RngCore;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
+use crate::packet_scheduler::{
+    DispatchEnvelope, PacketScheduler, SchedulerAction, SchedulerCommand,
+};
 use crate::packets::{
     decode_c2s, encode_s2c, C2SPacket, PacketControl, PacketEnvelope, PacketMessage, PacketOrder,
     PacketPayload, PacketPriority, PacketTarget, S2CPacket,
@@ -460,12 +463,14 @@ fn process_sessions_tick(
     for (&client_id, session) in shard.sessions.iter_mut() {
         touched_sessions.push(client_id);
         pump_app_packets(session, app_buf, &shard.event_tx);
+        session.poll_scheduler();
         session.maybe_send_ping();
 
-        if session.flush_stream_writes().is_err()
-            || flush_quic(session, send_buf, delayed_datagrams, ready_datagrams).is_err()
-            || session.conn.is_closed()
-        {
+        let stream_flush_failed = session.flush_stream_writes().is_err();
+        session.poll_scheduler();
+        let quic_flush_failed =
+            flush_quic(session, send_buf, delayed_datagrams, ready_datagrams).is_err();
+        if stream_flush_failed || quic_flush_failed || session.conn.is_closed() {
             disconnected.push(client_id);
         }
     }
@@ -739,12 +744,12 @@ fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelop
         return;
     }
 
-    let Some(serialized) = serialize_envelope_payload(&envelope.payload) else {
+    let Some(framed) = encode_envelope_frames(&envelope.payload) else {
         return;
     };
 
     for_each_target_session_mut(shard, envelope.target, |session| {
-        session.send_envelope(envelope, &serialized);
+        session.send_envelope(envelope, &framed);
     });
 }
 
@@ -752,7 +757,7 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
     match control {
         PacketControl::SequenceClose { sequence_id } => {
             for session in shard.sessions.values_mut() {
-                session.dispatch_message(SessionMessage::SequenceClose(sequence_id));
+                session.dispatch_scheduler_command(SchedulerCommand::SequenceClose(sequence_id));
             }
         },
         PacketControl::SequenceCloseAll { target } => {
@@ -761,7 +766,7 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
             }
 
             for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_message(SessionMessage::SequenceCloseAll)
+                session.dispatch_scheduler_command(SchedulerCommand::SequenceCloseAll)
             });
         },
         PacketControl::Clear { target } => {
@@ -770,7 +775,7 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
             }
 
             for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_message(SessionMessage::Clear)
+                session.dispatch_scheduler_command(SchedulerCommand::Clear)
             });
         },
         PacketControl::Barrier { target } => {
@@ -779,7 +784,7 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
             }
 
             for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_message(SessionMessage::Barrier)
+                session.dispatch_scheduler_command(SchedulerCommand::Barrier)
             });
         },
     }
@@ -829,33 +834,18 @@ fn for_each_target_session_mut(
     }
 }
 
-#[derive(Clone)]
-struct SerializedEnvelopePayload {
-    framed: Vec<u8>,
+enum EnvelopeDispatchResult {
+    Sent,
+    DeferredByCongestion,
+    Dropped,
 }
 
-#[derive(Clone)]
-struct PendingOrderedEnvelope {
-    identifier: Option<Uuid>,
-    priority: PacketPriority,
-    order: PacketOrder,
-    serialized: SerializedEnvelopePayload,
+struct StreamTarget {
+    stream_id: u64,
+    fin: bool,
 }
 
-enum SessionMessage {
-    Envelope(PendingOrderedEnvelope),
-    SequenceClose(Uuid),
-    SequenceCloseAll,
-    Clear,
-    Barrier,
-}
-
-struct ResolvedOrder {
-    sequence_id: Option<Uuid>,
-    sequence_end: bool,
-}
-
-fn serialize_envelope_payload(payload: &PacketPayload) -> Option<SerializedEnvelopePayload> {
+fn encode_envelope_frames(payload: &PacketPayload) -> Option<Vec<u8>> {
     let mut framed = Vec::new();
 
     match payload {
@@ -886,7 +876,7 @@ fn serialize_envelope_payload(payload: &PacketPayload) -> Option<SerializedEnvel
         return None;
     }
 
-    Some(SerializedEnvelopePayload { framed })
+    Some(framed)
 }
 
 fn pump_app_packets(
@@ -1144,9 +1134,8 @@ struct Session {
     streams: HashMap<u64, QuicStreamState>,
     next_server_uni_stream_id: u64,
     sequence_streams: HashMap<Uuid, u64>,
-    blocked_messages: VecDeque<SessionMessage>,
+    scheduler: PacketScheduler,
     inflight_message_count: usize,
-    barrier_active: bool,
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
@@ -1183,9 +1172,8 @@ impl Session {
             streams: HashMap::new(),
             next_server_uni_stream_id: FIRST_SERVER_UNI_STREAM_ID,
             sequence_streams: HashMap::new(),
-            blocked_messages: VecDeque::new(),
+            scheduler: PacketScheduler::new(),
             inflight_message_count: 0,
-            barrier_active: false,
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
@@ -1265,33 +1253,93 @@ impl Session {
         frames
     }
 
-    fn send_envelope(&mut self, envelope: &PacketEnvelope, serialized: &SerializedEnvelopePayload) {
-        self.dispatch_message(SessionMessage::Envelope(PendingOrderedEnvelope {
+    fn send_envelope(&mut self, envelope: &PacketEnvelope, framed: &[u8]) {
+        self.dispatch_scheduler_command(SchedulerCommand::Envelope(DispatchEnvelope {
             identifier: envelope.identifier,
             priority: envelope.priority,
             order: envelope.order,
-            serialized: serialized.clone(),
+            framed: framed.to_vec(),
         }));
     }
 
-    fn can_send_as_datagram(
-        &self,
-        envelope: &PacketEnvelope,
-        serialized: &SerializedEnvelopePayload,
-    ) -> bool {
+    fn dispatch_scheduler_command(&mut self, command: SchedulerCommand) {
+        let actions = self.scheduler.push(command, Instant::now());
+        self.execute_scheduler_actions(actions);
+    }
+
+    fn poll_scheduler(&mut self) {
+        let actions = self.scheduler.poll(Instant::now(), false);
+        self.execute_scheduler_actions(actions);
+    }
+
+    fn execute_scheduler_actions(&mut self, mut actions: Vec<SchedulerAction>) {
+        let mut index = 0usize;
+        while index < actions.len() {
+            let action = actions[index].clone();
+            if let Some(follow_up) = self.execute_scheduler_action(action) {
+                actions.extend(follow_up);
+            }
+            index += 1;
+        }
+    }
+
+    fn execute_scheduler_action(
+        &mut self,
+        action: SchedulerAction,
+    ) -> Option<Vec<SchedulerAction>> {
+        match action {
+            SchedulerAction::DispatchEnvelope { envelope, force_flush } => {
+                match self.dispatch_ordered_envelope(envelope.clone(), force_flush) {
+                    EnvelopeDispatchResult::Sent | EnvelopeDispatchResult::Dropped => None,
+                    EnvelopeDispatchResult::DeferredByCongestion => {
+                        self.scheduler.requeue_deferred(envelope, Instant::now());
+                        None
+                    },
+                }
+            },
+            SchedulerAction::CloseSequence(sequence_id) => {
+                self.close_sequence(sequence_id);
+                None
+            },
+            SchedulerAction::CloseAllSequences => {
+                self.close_all_sequences();
+                None
+            },
+            SchedulerAction::ClearTransportState => {
+                self.clear_transport_state();
+                None
+            },
+            SchedulerAction::BeginBarrier => {
+                if self.inflight_message_count == 0 {
+                    Some(self.scheduler.on_inflight_drained(Instant::now()))
+                } else {
+                    None
+                }
+            },
+            SchedulerAction::DropEnvelope { envelope, reason } => {
+                log::debug!(
+                    "dropping scheduled envelope for client {}: id={:?} order={:?} reason={:?}",
+                    self.client_id,
+                    envelope.identifier,
+                    envelope.order,
+                    reason
+                );
+                None
+            },
+        }
+    }
+
+    fn can_send_as_datagram(&self, envelope: &DispatchEnvelope) -> bool {
         let datagram_fits = self
             .conn
             .dgram_max_writable_len()
-            .is_some_and(|max_len| serialized.framed.len() <= max_len);
+            .is_some_and(|max_len| envelope.payload_len() <= max_len);
 
-        matches!(envelope.priority, PacketPriority::Droppable)
-            && matches!(envelope.order, PacketOrder::Independent)
-            && envelope.identifier.is_none()
-            && datagram_fits
+        envelope.is_datagram_eligible() && datagram_fits
     }
 
-    fn send_datagram(&mut self, envelope: &PacketEnvelope, serialized: &SerializedEnvelopePayload) {
-        match self.conn.dgram_send(&serialized.framed) {
+    fn send_datagram(&mut self, envelope: &DispatchEnvelope) -> EnvelopeDispatchResult {
+        match self.conn.dgram_send(&envelope.framed) {
             Ok(()) => {
                 log::debug!(
                     "client {} sent envelope {:?} ({:?}) as datagram",
@@ -1299,48 +1347,34 @@ impl Session {
                     envelope.identifier,
                     envelope.order
                 );
+                EnvelopeDispatchResult::Sent
             },
             Err(
                 quiche::Error::Done | quiche::Error::InvalidState | quiche::Error::BufferTooShort,
             ) => {
+                let result = match envelope.priority {
+                    PacketPriority::Deadline { .. } => EnvelopeDispatchResult::DeferredByCongestion,
+                    _ => EnvelopeDispatchResult::Dropped,
+                };
                 log::debug!(
-                    "dropping datagram envelope for client {}: id={:?} order={:?}",
+                    "{} datagram envelope for client {}: id={:?} order={:?}",
+                    match result {
+                        EnvelopeDispatchResult::DeferredByCongestion => "deferring",
+                        EnvelopeDispatchResult::Dropped => "dropping",
+                        EnvelopeDispatchResult::Sent => "sent",
+                    },
                     self.client_id,
                     envelope.identifier,
                     envelope.order
                 );
+                result
             },
             Err(err) => {
                 log::debug!(
                     "dropping datagram envelope for client {} after dgram_send error: {err:?}",
                     self.client_id
                 );
-            },
-        }
-    }
-
-    fn dispatch_message(&mut self, message: SessionMessage) {
-        if self.barrier_active && !matches!(&message, SessionMessage::Clear) {
-            self.blocked_messages.push_back(message);
-            return;
-        }
-
-        self.dispatch_message_now(message);
-    }
-
-    fn dispatch_message_now(&mut self, message: SessionMessage) {
-        match message {
-            SessionMessage::Envelope(envelope) => {
-                let resolution = self.resolve_order(envelope.order);
-                self.dispatch_ordered_envelope(envelope, resolution);
-            },
-            SessionMessage::SequenceClose(sequence_id) => self.close_sequence(sequence_id),
-            SessionMessage::SequenceCloseAll => self.close_all_sequences(),
-            SessionMessage::Clear => self.clear_backlog_and_sequences(),
-            SessionMessage::Barrier => {
-                if self.inflight_message_count > 0 {
-                    self.barrier_active = true;
-                }
+                EnvelopeDispatchResult::Dropped
             },
         }
     }
@@ -1363,15 +1397,10 @@ impl Session {
         self.reset_streams(stream_ids, "resetting sequence stream");
     }
 
-    fn clear_backlog_and_sequences(&mut self) {
-        self.blocked_messages.clear();
-        self.barrier_active = false;
-
+    fn clear_transport_state(&mut self) {
         let mut stream_ids = self.take_all_sequence_stream_ids();
         stream_ids.extend(self.pending_write_stream_ids());
         self.reset_streams(stream_ids, "clearing backlog with reset on stream");
-
-        self.maybe_release_barrier();
     }
 
     fn take_all_sequence_stream_ids(&mut self) -> Vec<u64> {
@@ -1397,82 +1426,53 @@ impl Session {
         }
     }
 
-    fn maybe_release_barrier(&mut self) {
-        if !self.barrier_active || self.inflight_message_count > 0 {
-            return;
-        }
-
-        self.barrier_active = false;
-        while !self.barrier_active {
-            let Some(message) = self.blocked_messages.pop_front() else {
-                break;
-            };
-            self.dispatch_message_now(message);
-        }
-    }
-
-    fn resolve_order(&self, order: PacketOrder) -> ResolvedOrder {
-        match order {
-            PacketOrder::Independent => ResolvedOrder { sequence_id: None, sequence_end: false },
-            PacketOrder::Sequence(sequence_id) => {
-                ResolvedOrder { sequence_id: Some(sequence_id), sequence_end: false }
-            },
-            PacketOrder::SequenceEnd(sequence_id) => {
-                ResolvedOrder { sequence_id: Some(sequence_id), sequence_end: true }
-            },
-        }
-    }
-
     fn dispatch_ordered_envelope(
         &mut self,
-        envelope: PendingOrderedEnvelope,
-        resolution: ResolvedOrder,
-    ) {
-        let PendingOrderedEnvelope { identifier, priority, order, serialized } = envelope;
-        let ResolvedOrder { sequence_id, sequence_end } = resolution;
+        envelope: DispatchEnvelope,
+        force_flush: bool,
+    ) -> EnvelopeDispatchResult {
+        let DispatchEnvelope { identifier, priority, order, framed } = envelope;
+        let transport_meta = DispatchEnvelope { identifier, priority, order, framed };
 
-        let transport_meta = PacketEnvelope {
-            identifier,
-            target: PacketTarget::Client(self.client_id),
-            payload: PacketPayload::Bundle(Vec::new()),
-            priority,
-            order,
-        };
-
-        if self.can_send_as_datagram(&transport_meta, &serialized) {
-            self.send_datagram(&transport_meta, &serialized);
-            self.maybe_release_barrier();
-            return;
+        if self.can_send_as_datagram(&transport_meta) {
+            match self.send_datagram(&transport_meta) {
+                EnvelopeDispatchResult::Sent => {
+                    return EnvelopeDispatchResult::Sent;
+                },
+                EnvelopeDispatchResult::DeferredByCongestion if !force_flush => {
+                    return EnvelopeDispatchResult::DeferredByCongestion;
+                },
+                EnvelopeDispatchResult::Dropped if !force_flush => {
+                    return EnvelopeDispatchResult::Dropped;
+                },
+                EnvelopeDispatchResult::DeferredByCongestion | EnvelopeDispatchResult::Dropped => {
+                },
+            }
         }
 
-        if matches!(priority, PacketPriority::Droppable)
-            && !self.has_stream_budget(serialized.framed.len())
+        if transport_meta.is_droppable()
+            && !self.has_stream_budget(transport_meta.framed.len())
+            && !force_flush
         {
             log::debug!(
                 "dropping envelope for client {} due to stream congestion budget",
                 self.client_id
             );
-            self.maybe_release_barrier();
-            return;
+            return EnvelopeDispatchResult::Dropped;
         }
 
-        let (stream_id, fin) = match sequence_id {
-            Some(sequence_id) => {
-                let stream_id =
-                    if let Some(stream_id) = self.sequence_streams.get(&sequence_id).copied() {
-                        stream_id
-                    } else {
-                        let stream_id = self.alloc_server_uni_stream_id();
-                        self.sequence_streams.insert(sequence_id, stream_id);
-                        stream_id
-                    };
-                if sequence_end {
-                    self.sequence_streams.remove(&sequence_id);
-                }
-                (stream_id, sequence_end)
-            },
-            None => (self.alloc_server_uni_stream_id(), true),
-        };
+        if transport_meta.is_deadline()
+            && !self.has_stream_budget(transport_meta.framed.len())
+            && !force_flush
+        {
+            log::debug!(
+                "deferring deadline envelope for client {} due to stream congestion budget",
+                self.client_id
+            );
+            return EnvelopeDispatchResult::DeferredByCongestion;
+        }
+
+        let StreamTarget { stream_id, fin } = self.resolve_stream_target(order);
 
         log::debug!(
             "client {} opening server stream {} for envelope {:?} ({:?}, fin={})",
@@ -1482,24 +1482,46 @@ impl Session {
             order,
             fin
         );
-        self.queue_stream_payloads(stream_id, &serialized, fin);
+        self.queue_stream_payloads(stream_id, &transport_meta.framed, fin);
+        EnvelopeDispatchResult::Sent
     }
 
-    fn queue_stream_payloads(
-        &mut self,
-        stream_id: u64,
-        payload: &SerializedEnvelopePayload,
-        fin: bool,
-    ) {
-        if payload.framed.is_empty() {
+    fn resolve_stream_target(&mut self, order: PacketOrder) -> StreamTarget {
+        match order {
+            PacketOrder::Independent => {
+                StreamTarget { stream_id: self.alloc_server_uni_stream_id(), fin: true }
+            },
+            PacketOrder::Sequence(sequence_id) => {
+                StreamTarget { stream_id: self.sequence_stream_id(sequence_id), fin: false }
+            },
+            PacketOrder::SequenceEnd(sequence_id) => {
+                let stream_id = self.sequence_stream_id(sequence_id);
+                self.sequence_streams.remove(&sequence_id);
+                StreamTarget { stream_id, fin: true }
+            },
+        }
+    }
+
+    fn sequence_stream_id(&mut self, sequence_id: Uuid) -> u64 {
+        if let Some(stream_id) = self.sequence_streams.get(&sequence_id).copied() {
+            stream_id
+        } else {
+            let stream_id = self.alloc_server_uni_stream_id();
+            self.sequence_streams.insert(sequence_id, stream_id);
+            stream_id
+        }
+    }
+
+    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &[u8], fin: bool) {
+        if payload.is_empty() {
             return;
         }
 
         self.inflight_message_count = self.inflight_message_count.saturating_add(1);
-        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.framed.len());
+        self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.len());
         let state = self.stream_state_mut(stream_id, "tx");
         state.pending_writes.push_back(PendingStreamWrite {
-            data: payload.framed.clone(),
+            data: payload.to_vec(),
             offset: 0,
             fin,
             tracks_inflight: true,
@@ -1570,7 +1592,10 @@ impl Session {
                         if chunk.tracks_inflight {
                             self.inflight_message_count =
                                 self.inflight_message_count.saturating_sub(1);
-                            self.maybe_release_barrier();
+                            if self.inflight_message_count == 0 {
+                                let actions = self.scheduler.on_inflight_drained(Instant::now());
+                                self.execute_scheduler_actions(actions);
+                            }
                         }
                     },
                     Err(quiche::Error::StreamLimit) => {

@@ -8,6 +8,7 @@ mod game;
 mod game_state;
 mod games;
 mod network;
+mod packet_scheduler;
 #[allow(dead_code)]
 mod packets;
 
