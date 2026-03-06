@@ -49,13 +49,7 @@ impl RecvBuffer {
         let storage = vec![0u8; RECV_BATCH_SIZE * MAX_RECV_DATAGRAM_SIZE];
         let metas = Vec::with_capacity(RECV_BATCH_SIZE);
         let rx_meta = vec![quinn_udp::RecvMeta::default(); RECV_BATCH_SIZE];
-        Ok(Self {
-            socket,
-            udp_state,
-            storage,
-            metas,
-            rx_meta,
-        })
+        Ok(Self { socket, udp_state, storage, metas, rx_meta })
     }
 
     fn recv_next_batch(&mut self) -> io::Result<usize> {
@@ -246,10 +240,7 @@ impl NetworkRuntime {
                     log::error!("I/O thread {shard_id} crashed: {err:#}");
                 }
             });
-            io_shards.push(IoShardHandle {
-                sender: io_tx,
-                thread: handle,
-            });
+            io_shards.push(IoShardHandle { sender: io_tx, thread: handle });
         }
 
         Ok(Self { io_shards, event_rx, running })
@@ -312,11 +303,7 @@ fn run_io_thread(
     let mut app_buf = [0u8; 4096];
 
     while running.load(Ordering::Relaxed) {
-        drain_received_datagrams(
-            &mut recv_buffer,
-            &mut shard,
-            next_client_id.as_ref(),
-        );
+        drain_received_datagrams(&mut recv_buffer, &mut shard, next_client_id.as_ref());
 
         // Flush any previously queued datagrams whose pacing deadline has arrived.
         flush_due_paced_datagrams(
@@ -334,11 +321,7 @@ fn run_io_thread(
         if !recv_and_drain_io_commands(&io_rx, wait_for, &mut shard) {
             break;
         }
-        drain_received_datagrams(
-            &mut recv_buffer,
-            &mut shard,
-            next_client_id.as_ref(),
-        );
+        drain_received_datagrams(&mut recv_buffer, &mut shard, next_client_id.as_ref());
 
         let disconnected = process_sessions_tick(
             &mut shard,
@@ -896,17 +879,17 @@ fn flush_quic(
     loop {
         match session.conn.send(send_buf) {
             Ok((len, send_info)) => {
-                push_paced_datagram(
-                    delayed_datagrams,
-                    ready_datagrams,
-                    now,
-                    PacedDatagram {
-                        at: send_info.at,
-                        to: send_info.to,
-                        bytes: send_buf[..len].to_vec(),
-                        seq: *next_paced_seq,
-                    },
-                );
+                let datagram = PacedDatagram {
+                    at: send_info.at,
+                    to: send_info.to,
+                    bytes: send_buf[..len].to_vec(),
+                    seq: *next_paced_seq,
+                };
+                if datagram.at <= now {
+                    ready_datagrams.push_back(datagram);
+                } else {
+                    delayed_datagrams.push(datagram);
+                }
                 *next_paced_seq = next_paced_seq.wrapping_add(1).max(1);
             },
             Err(quiche::Error::Done) => break,
@@ -978,19 +961,6 @@ fn flush_due_paced_datagrams(
     }
 
     Ok(())
-}
-
-fn push_paced_datagram(
-    delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
-    ready_datagrams: &mut VecDeque<PacedDatagram>,
-    now: Instant,
-    datagram: PacedDatagram,
-) {
-    if datagram.at <= now {
-        ready_datagrams.push_back(datagram);
-    } else {
-        delayed_datagrams.push(datagram);
-    }
 }
 
 fn bind_reuseport_udp_socket(bind_addr: SocketAddr) -> io::Result<UdpSocket> {
