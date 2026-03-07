@@ -750,33 +750,29 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
             }
         },
         PacketControl::SequenceCloseAll { target } => {
-            if !envelope_has_local_targets(shard, target) {
-                return;
-            }
-
-            for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_scheduler_command(SchedulerCommand::SequenceCloseAll)
-            });
+            dispatch_control_to_target(shard, target, SchedulerCommand::SequenceCloseAll);
         },
         PacketControl::Clear { target } => {
-            if !envelope_has_local_targets(shard, target) {
-                return;
-            }
-
-            for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_scheduler_command(SchedulerCommand::Clear)
-            });
+            dispatch_control_to_target(shard, target, SchedulerCommand::Clear);
         },
         PacketControl::Barrier { target } => {
-            if !envelope_has_local_targets(shard, target) {
-                return;
-            }
-
-            for_each_target_session_mut(shard, target, |session| {
-                session.dispatch_scheduler_command(SchedulerCommand::Barrier)
-            });
+            dispatch_control_to_target(shard, target, SchedulerCommand::Barrier);
         },
     }
+}
+
+fn dispatch_control_to_target(
+    shard: &mut ShardState,
+    target: PacketTarget,
+    command: SchedulerCommand,
+) {
+    if !envelope_has_local_targets(shard, target) {
+        return;
+    }
+
+    for_each_target_session_mut(shard, target, |session| {
+        session.dispatch_scheduler_command(command.clone())
+    });
 }
 
 fn envelope_has_local_targets(shard: &ShardState, target: PacketTarget) -> bool {
