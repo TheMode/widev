@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quiche::RecvInfo;
-use rand::RngCore;
+use rand::Rng;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(5);
@@ -55,7 +55,7 @@ impl QuicClient {
         let mut config = build_client_quic_config()?;
 
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-        rand::thread_rng().fill_bytes(&mut scid);
+        rand::rng().fill_bytes(&mut scid);
         let scid = quiche::ConnectionId::from_ref(&scid);
 
         let conn =

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use quiche::{Connection, RecvInfo};
-use rand::RngCore;
+use rand::Rng;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
@@ -725,7 +725,7 @@ fn handle_add_connection(
 fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<u8> {
     let mut cid = vec![0u8; SERVER_CONN_ID_LEN];
     loop {
-        rand::thread_rng().fill_bytes(&mut cid);
+        rand::rng().fill_bytes(&mut cid);
         if worker_index_for_cid(&cid, worker_count) == worker_id {
             return cid;
         }
@@ -1115,7 +1115,7 @@ fn ensure_dev_certs(cert_dir: &Path) -> Result<()> {
     let certified_key = rcgen::generate_simple_self_signed(vec!["widev.local".to_string()])
         .context("failed to generate self-signed cert")?;
     let cert_pem = certified_key.cert.pem();
-    let key_pem = certified_key.key_pair.serialize_pem();
+    let key_pem = certified_key.signing_key.serialize_pem();
 
     fs::write(&cert_path, cert_pem)
         .with_context(|| format!("failed to write {}", cert_path.display()))?;

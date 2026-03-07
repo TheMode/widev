@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use mio::{Events, Interest, Poll, Token};
 use quiche::RecvInfo;
-use rand::RngCore;
+use rand::Rng;
 
 pub mod protocol;
 
@@ -496,7 +496,7 @@ fn create_bot_session(
 
     let mut quic_config = build_client_quic_config()?;
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    rand::thread_rng().fill_bytes(&mut scid);
+    rand::rng().fill_bytes(&mut scid);
     let scid = quiche::ConnectionId::from_ref(&scid);
 
     let conn = quiche::connect(

@@ -104,7 +104,7 @@ impl CodegenBackend for RustBackend {
         }
 
         for enum_def in &schema.enums {
-            out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n");
+            out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
             out.push_str(&format!("pub enum {} {{\n", enum_def.name));
             for variant in &enum_def.variants {
                 out.push_str(&format!("    {},\n", variant));
@@ -112,7 +112,7 @@ impl CodegenBackend for RustBackend {
             out.push_str("}\n\n");
         }
 
-        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
+        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
         out.push_str("pub enum C2SPacket {\n");
         for packet in &schema.common {
             out.push_str(&format_variant(packet));
@@ -122,7 +122,7 @@ impl CodegenBackend for RustBackend {
         }
         out.push_str("}\n\n");
 
-        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\n");
+        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
         out.push_str("pub enum S2CPacket {\n");
         for packet in &schema.common {
             out.push_str(&format_variant(packet));
@@ -133,23 +133,23 @@ impl CodegenBackend for RustBackend {
         out.push_str("}\n\n");
 
         out.push_str(
-            "pub fn encode_c2s(packet: &C2SPacket) -> Result<Vec<u8>, bincode::Error> {\n",
+            "pub fn encode_c2s(packet: &C2SPacket) -> wincode::WriteResult<Vec<u8>> {\n",
         );
-        out.push_str("    bincode::serialize(packet)\n");
+        out.push_str("    wincode::serialize(packet)\n");
         out.push_str("}\n\n");
 
-        out.push_str("pub fn decode_c2s(bytes: &[u8]) -> Result<C2SPacket, bincode::Error> {\n");
-        out.push_str("    bincode::deserialize(bytes)\n");
+        out.push_str("pub fn decode_c2s(bytes: &[u8]) -> wincode::ReadResult<C2SPacket> {\n");
+        out.push_str("    wincode::deserialize(bytes)\n");
         out.push_str("}\n\n");
 
         out.push_str(
-            "pub fn encode_s2c(packet: &S2CPacket) -> Result<Vec<u8>, bincode::Error> {\n",
+            "pub fn encode_s2c(packet: &S2CPacket) -> wincode::WriteResult<Vec<u8>> {\n",
         );
-        out.push_str("    bincode::serialize(packet)\n");
+        out.push_str("    wincode::serialize(packet)\n");
         out.push_str("}\n\n");
 
-        out.push_str("pub fn decode_s2c(bytes: &[u8]) -> Result<S2CPacket, bincode::Error> {\n");
-        out.push_str("    bincode::deserialize(bytes)\n");
+        out.push_str("pub fn decode_s2c(bytes: &[u8]) -> wincode::ReadResult<S2CPacket> {\n");
+        out.push_str("    wincode::deserialize(bytes)\n");
         out.push_str("}\n");
 
         Ok(out)
@@ -174,7 +174,7 @@ fn format_variant(packet: &PacketDef) -> String {
 fn format_bitmask(bitmask: &BitmaskDef) -> String {
     let mut out = String::new();
     out.push_str(
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n",
     );
     out.push_str("#[repr(transparent)]\n");
     out.push_str(&format!("pub struct {}(pub {});\n", bitmask.name, bitmask.ty));

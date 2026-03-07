@@ -7,10 +7,10 @@ pub(super) use packets::{
     C2SPacket, Color, InputType, PredictionKind, S2CPacket, SurfaceId, TransformPredictionMask,
 };
 
-pub(super) fn encode_c2s(packet: &C2SPacket) -> Result<Vec<u8>, bincode::Error> {
+pub(super) fn encode_c2s(packet: &C2SPacket) -> wincode::WriteResult<Vec<u8>> {
     packets::encode_c2s(packet)
 }
 
-pub(super) fn decode_s2c(bytes: &[u8]) -> Result<S2CPacket, bincode::Error> {
+pub(super) fn decode_s2c(bytes: &[u8]) -> wincode::ReadResult<S2CPacket> {
     packets::decode_s2c(bytes)
 }
