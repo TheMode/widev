@@ -78,9 +78,9 @@
     },
     {
       "name": "SurfaceList",
-      "description": "List of currently available client surfaces (id, name, width, height).",
+      "description": "List of currently available client surfaces (id, width, height).",
       "fields": [
-        { "name": "surfaces", "type": "Vec<(SurfaceId, String, u32, u32)>" }
+        { "name": "surfaces", "type": "Vec<(SurfaceId, u32, u32)>" }
       ]
     },
     {

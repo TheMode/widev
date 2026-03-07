@@ -268,12 +268,8 @@ impl App {
         self.game.tick_network()?;
         if self.game.is_connected() && !self.render_cache.surface_list_sent {
             let size = window.inner_size();
-            self.game.send_surface_list(vec![(
-                MAIN_SURFACE_ID,
-                "main".to_string(),
-                size.width,
-                size.height,
-            )])?;
+            self.game
+                .send_surface_list(vec![(MAIN_SURFACE_ID, size.width, size.height)])?;
             self.render_cache.surface_list_sent = true;
             self.render_cache.last_reported_surface_size = Some((size.width, size.height));
         }

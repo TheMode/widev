@@ -281,7 +281,7 @@ impl ClientGame {
 
     pub(super) fn send_surface_list(
         &mut self,
-        surfaces: Vec<(protocol::SurfaceId, String, u32, u32)>,
+        surfaces: Vec<(protocol::SurfaceId, u32, u32)>,
     ) -> Result<()> {
         if !self.net.is_established() {
             return Ok(());
