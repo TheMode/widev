@@ -558,6 +558,16 @@ impl ShardState {
         }
     }
 
+    fn register_session(&mut self, client_id: ClientId, session: Session) {
+        let client_addr = session.client_addr;
+        let local_cid = session.local_cid.clone();
+        self.sessions.insert(client_id, session);
+        self.client_id_by_addr.insert(client_addr, client_id);
+        self.client_id_by_cid.insert(local_cid, client_id);
+        self.refresh_quic_timeout(client_id);
+        let _ = self.event_tx.send(NetworkEvent::ClientConnected(client_id));
+    }
+
     fn process_due_quic_timeouts(&mut self) {
         loop {
             let Some(next) = self.peek_next_quic_timeout().copied() else {
@@ -703,11 +713,7 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
         "conn.recv after accept",
     );
 
-    shard.sessions.insert(client_id, session);
-    shard.client_id_by_addr.insert(client_addr, client_id);
-    shard.client_id_by_cid.insert(shard.sessions[&client_id].local_cid.clone(), client_id);
-    shard.refresh_quic_timeout(client_id);
-    let _ = shard.event_tx.send(NetworkEvent::ClientConnected(client_id));
+    shard.register_session(client_id, session);
     log::info!("accepted connection from {client_addr} as client {client_id}");
 }
 
