@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -92,125 +93,122 @@ impl CodegenBackend for RustBackend {
     fn generate(&self, schema: &Schema) -> Result<String> {
         let mut out = String::new();
 
+        macro_rules! line {
+            () => {
+                out.push('\n');
+            };
+            ($text:expr) => {
+                out.push_str($text);
+                out.push('\n');
+            };
+            ($fmt:expr, $($arg:tt)*) => {
+                writeln!(&mut out, $fmt, $($arg)*).expect("writing to String should not fail");
+            };
+        }
+
         for typedef_def in &schema.typedefs {
-            out.push_str(&format!("pub type {} = {};\n", typedef_def.name, typedef_def.ty));
+            line!("pub type {} = {};", typedef_def.name, typedef_def.ty);
         }
         if !schema.typedefs.is_empty() {
-            out.push('\n');
+            line!();
         }
 
         for bitmask_def in &schema.bitmasks {
-            out.push_str(&format_bitmask(bitmask_def));
+            line!(
+                r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
+            );
+            line!("#[repr(transparent)]");
+            line!("pub struct {}(pub {});", bitmask_def.name, bitmask_def.ty);
+            line!("impl {} {{", bitmask_def.name);
+            line!("    pub const NONE: Self = Self(0);");
+            for flag in &bitmask_def.flags {
+                line!("    pub const {}: Self = Self({});", to_upper_snake(&flag.name), flag.value);
+            }
+            line!("    pub fn bits(self) -> {} {{", bitmask_def.ty);
+            line!("        self.0");
+            line!("    }");
+            line!("    pub fn contains(self, other: Self) -> bool {");
+            line!("        (self.0 & other.0) == other.0");
+            line!("    }");
+            line!("}");
+            line!();
+            line!("impl std::ops::BitOr for {} {{", bitmask_def.name);
+            line!("    type Output = Self;");
+            line!("    fn bitor(self, rhs: Self) -> Self::Output {");
+            line!("        Self(self.0 | rhs.0)");
+            line!("    }");
+            line!("}");
+            line!();
+            line!("impl std::ops::BitOrAssign for {} {{", bitmask_def.name);
+            line!("    fn bitor_assign(&mut self, rhs: Self) {");
+            line!("        self.0 |= rhs.0;");
+            line!("    }");
+            line!("}");
+            line!();
         }
 
         for enum_def in &schema.enums {
-            out.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
-            out.push_str(&format!("pub enum {} {{\n", enum_def.name));
+            line!(
+                r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
+            );
+            line!("pub enum {} {{", enum_def.name);
             for variant in &enum_def.variants {
-                out.push_str(&format!("    {},\n", variant));
+                line!("    {},", variant);
             }
-            out.push_str("}\n\n");
+            line!("}");
+            line!();
         }
 
-        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
-        out.push_str("pub enum C2SPacket {\n");
-        for packet in &schema.common {
-            out.push_str(&format_variant(packet));
+        for (name, packets) in [
+            ("C2SPacket", schema.common.iter().chain(schema.c2s.iter())),
+            ("S2CPacket", schema.common.iter().chain(schema.s2c.iter())),
+        ] {
+            line!(
+                r#"#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
+            );
+            line!("pub enum {} {{", name);
+            for packet in packets {
+                if packet.fields.is_empty() {
+                    line!("    {},", packet.name);
+                } else {
+                    line!("    {} {{", packet.name);
+                    for field in &packet.fields {
+                        line!("        {}: {},", field.name, field.ty);
+                    }
+                    line!("    },");
+                }
+            }
+            line!("}");
+            line!();
         }
-        for packet in &schema.c2s {
-            out.push_str(&format_variant(packet));
+
+        macro_rules! codec_fns {
+            ($encode:ident, $decode:ident, $packet:ident) => {
+                out.push_str(concat!(
+                    "pub fn ",
+                    stringify!($encode),
+                    "(packet: &",
+                    stringify!($packet),
+                    ") -> wincode::WriteResult<Vec<u8>> {\n",
+                    "    wincode::serialize(packet)\n",
+                    "}\n\n",
+                    "pub fn ",
+                    stringify!($decode),
+                    "(bytes: &[u8]) -> wincode::ReadResult<",
+                    stringify!($packet),
+                    "> {\n",
+                    "    wincode::deserialize(bytes)\n",
+                    "}\n\n",
+                ));
+            };
         }
-        out.push_str("}\n\n");
 
-        out.push_str("#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n");
-        out.push_str("pub enum S2CPacket {\n");
-        for packet in &schema.common {
-            out.push_str(&format_variant(packet));
-        }
-        for packet in &schema.s2c {
-            out.push_str(&format_variant(packet));
-        }
-        out.push_str("}\n\n");
-
-        out.push_str(
-            "pub fn encode_c2s(packet: &C2SPacket) -> wincode::WriteResult<Vec<u8>> {\n",
-        );
-        out.push_str("    wincode::serialize(packet)\n");
-        out.push_str("}\n\n");
-
-        out.push_str("pub fn decode_c2s(bytes: &[u8]) -> wincode::ReadResult<C2SPacket> {\n");
-        out.push_str("    wincode::deserialize(bytes)\n");
-        out.push_str("}\n\n");
-
-        out.push_str(
-            "pub fn encode_s2c(packet: &S2CPacket) -> wincode::WriteResult<Vec<u8>> {\n",
-        );
-        out.push_str("    wincode::serialize(packet)\n");
-        out.push_str("}\n\n");
-
-        out.push_str("pub fn decode_s2c(bytes: &[u8]) -> wincode::ReadResult<S2CPacket> {\n");
-        out.push_str("    wincode::deserialize(bytes)\n");
-        out.push_str("}\n");
+        codec_fns!(encode_c2s, decode_c2s, C2SPacket);
+        codec_fns!(encode_s2c, decode_s2c, S2CPacket);
+        out.truncate(out.trim_end().len());
 
         Ok(out)
     }
-}
-
-fn format_variant(packet: &PacketDef) -> String {
-    let mut out = String::new();
-    if packet.fields.is_empty() {
-        out.push_str(&format!("    {},\n", packet.name));
-        return out;
-    }
-
-    out.push_str(&format!("    {} {{\n", packet.name));
-    for field in &packet.fields {
-        out.push_str(&format!("        {}: {},\n", field.name, field.ty));
-    }
-    out.push_str("    },\n");
-    out
-}
-
-fn format_bitmask(bitmask: &BitmaskDef) -> String {
-    let mut out = String::new();
-    out.push_str(
-        "#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]\n",
-    );
-    out.push_str("#[repr(transparent)]\n");
-    out.push_str(&format!("pub struct {}(pub {});\n", bitmask.name, bitmask.ty));
-    out.push_str(&format!("impl {} {{\n", bitmask.name));
-    out.push_str("    pub const NONE: Self = Self(0);\n");
-    for flag in &bitmask.flags {
-        out.push_str(&format!(
-            "    pub const {}: Self = Self({});\n",
-            to_upper_snake(&flag.name),
-            flag.value
-        ));
-    }
-    out.push_str("    pub fn bits(self) -> ");
-    out.push_str(&bitmask.ty);
-    out.push_str(" {\n");
-    out.push_str("        self.0\n");
-    out.push_str("    }\n");
-    out.push_str("    pub fn contains(self, other: Self) -> bool {\n");
-    out.push_str("        (self.0 & other.0) == other.0\n");
-    out.push_str("    }\n");
-    out.push_str("}\n\n");
-
-    out.push_str(&format!("impl std::ops::BitOr for {} {{\n", bitmask.name));
-    out.push_str("    type Output = Self;\n");
-    out.push_str("    fn bitor(self, rhs: Self) -> Self::Output {\n");
-    out.push_str("        Self(self.0 | rhs.0)\n");
-    out.push_str("    }\n");
-    out.push_str("}\n\n");
-
-    out.push_str(&format!("impl std::ops::BitOrAssign for {} {{\n", bitmask.name));
-    out.push_str("    fn bitor_assign(&mut self, rhs: Self) {\n");
-    out.push_str("        self.0 |= rhs.0;\n");
-    out.push_str("    }\n");
-    out.push_str("}\n\n");
-
-    out
 }
 
 fn to_upper_snake(value: &str) -> String {
