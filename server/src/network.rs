@@ -14,12 +14,14 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
+use crate::packet_codec::{
+    decode_c2s_packet, serialize_envelope_frames, serialize_s2c_packet, DecodedC2SPacket,
+};
 use crate::packet_scheduler::{
     DispatchEnvelope, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
 use crate::packets::{
-    decode_c2s, encode_s2c, C2SPacket, PacketControl, PacketEnvelope, PacketMessage, PacketOrder,
-    PacketPayload, PacketPriority, PacketTarget, S2CPacket,
+    PacketControl, PacketEnvelope, PacketMessage, PacketOrder, PacketPriority, PacketTarget,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -744,7 +746,7 @@ fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelop
         return;
     }
 
-    let Some(framed) = encode_envelope_frames(&envelope.payload) else {
+    let Some(framed) = serialize_envelope_frames(&envelope.payload) else {
         return;
     };
 
@@ -845,40 +847,6 @@ struct StreamTarget {
     fin: bool,
 }
 
-fn encode_envelope_frames(payload: &PacketPayload) -> Option<Vec<u8>> {
-    let mut framed = Vec::new();
-
-    match payload {
-        PacketPayload::Single(packet) => {
-            let Ok(encoded) = encode_s2c(packet) else {
-                return None;
-            };
-            framed.reserve(4 + encoded.len());
-            framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            framed.extend_from_slice(&encoded);
-        },
-        PacketPayload::Bundle(bundle) => {
-            if bundle.is_empty() {
-                return None;
-            }
-
-            for packet in bundle {
-                let Ok(encoded) = encode_s2c(packet) else {
-                    continue;
-                };
-                framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-                framed.extend_from_slice(&encoded);
-            }
-        },
-    }
-
-    if framed.is_empty() {
-        return None;
-    }
-
-    Some(framed)
-}
-
 fn pump_app_packets(
     session: &mut Session,
     app_buf: &mut [u8],
@@ -920,25 +888,14 @@ fn decode_and_forward_c2s(
     bytes: &[u8],
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
-    let Ok(packet) = decode_c2s(bytes) else {
-        return;
-    };
-    if handle_c2s_control_packet(session, &packet) {
-        return;
-    }
-    let _ = event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
-}
-
-fn handle_c2s_control_packet(session: &mut Session, packet: &C2SPacket) -> bool {
-    match packet {
-        C2SPacket::Ping { nonce } => {
-            if let Ok(bytes) = encode_s2c(&S2CPacket::Pong { nonce: *nonce }) {
+    match decode_c2s_packet(bytes) {
+        Some(DecodedC2SPacket::Ping { nonce }) => {
+            if let Some(bytes) = serialize_s2c_packet(&crate::packets::S2CPacket::Pong { nonce }) {
                 let _ = session.conn.dgram_send(&bytes);
             }
-            true
         },
-        C2SPacket::Pong { nonce } => {
-            if let Some(sent_at) = session.pending_ping_nonces.remove(nonce) {
+        Some(DecodedC2SPacket::Pong { nonce }) => {
+            if let Some(sent_at) = session.pending_ping_nonces.remove(&nonce) {
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
                 let quiche_rtt_ms = session
                     .conn
@@ -953,9 +910,12 @@ fn handle_c2s_control_packet(session: &mut Session, packet: &C2SPacket) -> bool 
                     quiche_rtt_ms
                 );
             }
-            true
         },
-        _ => false,
+        Some(DecodedC2SPacket::Packet(packet)) => {
+            let _ =
+                event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
+        },
+        None => {},
     }
 }
 
@@ -1195,7 +1155,7 @@ impl Session {
         self.pending_ping_nonces.insert(nonce, Instant::now());
         self.last_ping_sent_at = Instant::now();
 
-        if let Ok(bytes) = encode_s2c(&S2CPacket::Ping { nonce }) {
+        if let Some(bytes) = serialize_s2c_packet(&crate::packets::S2CPacket::Ping { nonce }) {
             let _ = self.conn.dgram_send(&bytes);
         }
     }
