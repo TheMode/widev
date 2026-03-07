@@ -653,15 +653,19 @@ fn handle_received_datagram(shard: &mut ShardState, from: SocketAddr, dcid: &[u8
             shard.client_id_by_addr.remove(&previous_addr);
         }
         shard.client_id_by_addr.insert(from, client_id);
-        return;
+    } else {
+        handle_add_connection(shard, from, data);
     }
+}
 
-    // Only initial packets create new sessions.
-    let mut hdr_buf = data.clone();
-    let hdr = match quiche::Header::from_slice(&mut hdr_buf, quiche::MAX_CONN_ID_LEN) {
+fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initial_packet: Vec<u8>) {
+    let mut pkt_buf = initial_packet;
+    let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
         Ok(h) => h,
         Err(_) => return,
     };
+
+    // Only Initial packets are allowed to create a fresh QUIC session.
     if hdr.ty != quiche::Type::Initial {
         return;
     }
@@ -675,26 +679,9 @@ fn handle_received_datagram(shard: &mut ShardState, from: SocketAddr, dcid: &[u8
             }
         })
     else {
-        log::error!("exhausted global ClientId space; rejecting new connection from {from}");
+        log::error!("exhausted global ClientId space; rejecting new connection from {client_addr}");
         return;
     };
-    handle_add_connection(shard, client_id, from, data);
-}
-
-fn handle_add_connection(
-    shard: &mut ShardState,
-    client_id: ClientId,
-    client_addr: SocketAddr,
-    initial_packet: Vec<u8>,
-) {
-    let mut pkt_buf = initial_packet;
-    let hdr = match quiche::Header::from_slice(&mut pkt_buf, quiche::MAX_CONN_ID_LEN) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    if hdr.ty != quiche::Type::Initial {
-        return;
-    }
 
     let server_cid = generate_server_cid_for_worker(shard.worker_id, shard.worker_count);
     let scid = quiche::ConnectionId::from_ref(&server_cid);
