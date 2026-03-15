@@ -81,6 +81,30 @@ impl RedSquareGame {
                 });
         bundle.extend(binding_packets);
 
+        let snapshots: Vec<ClientId> = self.players.keys().copied().collect();
+        for element_id in snapshots {
+            let Some(other_player) = self.players.get(&element_id) else {
+                continue;
+            };
+            bundle.push(S2CPacket::ElementAdd { element_id });
+            bundle.push(S2CPacket::ElementSetColor {
+                element_id,
+                color: if element_id == client_id { OWN_PLAYER_COLOR } else { OTHER_PLAYER_COLOR },
+            });
+            bundle.push(S2CPacket::ElementSetTransformPrediction {
+                element_id,
+                enabled: true,
+                affected_mask: TransformPredictionMask::TRANSLATION,
+                kind: PredictionKind::Interpolation,
+            });
+            bundle.push(S2CPacket::ElementMove {
+                element_id,
+                x: other_player.element.x,
+                y: other_player.element.y,
+            });
+        }
+        bundle.push(S2CPacket::Join {});
+
         state.send(
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
                 .sequence(player.bootstrap_sequence_id),
@@ -96,32 +120,6 @@ impl Game for RedSquareGame {
 
                 self.send_bootstrap(state, client_id);
 
-                let snapshots: Vec<ClientId> = self.players.keys().copied().collect();
-                let mut snapshot_bundle: PacketBundle = Vec::new();
-                for element_id in snapshots {
-                    snapshot_bundle.push(S2CPacket::ElementAdd { element_id });
-                    snapshot_bundle.push(S2CPacket::ElementSetColor {
-                        element_id,
-                        color: if element_id == client_id {
-                            OWN_PLAYER_COLOR
-                        } else {
-                            OTHER_PLAYER_COLOR
-                        },
-                    });
-                    snapshot_bundle.push(S2CPacket::ElementSetTransformPrediction {
-                        element_id,
-                        enabled: true,
-                        affected_mask: TransformPredictionMask::TRANSLATION,
-                        kind: PredictionKind::Interpolation,
-                    });
-                }
-                if !snapshot_bundle.is_empty() {
-                    state.send(PacketEnvelope::bundle(
-                        PacketTarget::Client(client_id),
-                        snapshot_bundle,
-                    ));
-                }
-
                 let mut bundle: PacketBundle = Vec::new();
                 bundle.extend([
                     S2CPacket::ElementAdd { element_id: client_id },
@@ -131,6 +129,11 @@ impl Game for RedSquareGame {
                         enabled: true,
                         affected_mask: TransformPredictionMask::TRANSLATION,
                         kind: PredictionKind::Interpolation,
+                    },
+                    S2CPacket::ElementMove {
+                        element_id: client_id,
+                        x: self.players[&client_id].element.x,
+                        y: self.players[&client_id].element.y,
                     },
                 ]);
                 state

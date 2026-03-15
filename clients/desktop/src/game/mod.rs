@@ -149,6 +149,7 @@ impl ElementState {
 pub(super) struct ClientGame {
     net: network::QuicClient,
     sent_hello: bool,
+    joined: bool,
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
     game_name: String,
@@ -173,6 +174,7 @@ impl ClientGame {
         Ok(Self {
             net: network::QuicClient::connect(server_addr)?,
             sent_hello: false,
+            joined: false,
             server_cert_fingerprint: None,
             elements: HashMap::new(),
             game_name: "widev desktop POC".to_string(),
@@ -273,6 +275,10 @@ impl ClientGame {
 
     pub(super) fn game_name(&self) -> &str {
         &self.game_name
+    }
+
+    pub(super) fn is_joined(&self) -> bool {
+        self.joined
     }
 
     pub(super) fn is_connected(&self) -> bool {
@@ -518,6 +524,12 @@ impl ClientGame {
             },
             protocol::S2CPacket::SetGameName { name } => {
                 self.game_name = name;
+            },
+            protocol::S2CPacket::Join {} => {
+                if !self.joined {
+                    self.joined = true;
+                    log::info!("join received; client can initialize surfaces and render");
+                }
             },
             protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
                 self.apply_surface_dimension_lock(surface_id, width, height);

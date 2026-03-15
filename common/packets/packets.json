@@ -109,6 +109,11 @@
       ]
     },
     {
+      "name": "Join",
+      "description": "Signal that the client has enough session state to initialize local surfaces and begin rendering.",
+      "fields": []
+    },
+    {
       "name": "SurfaceLockDimensions",
       "description": "Lock a surface to a specific width and height.",
       "fields": [

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, PredefinedMenuItem, Submenu};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{DeviceEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 #[cfg(target_os = "macos")]
@@ -156,6 +156,43 @@ impl App {
         Ok(())
     }
 
+    fn pump_network_until_join(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
+
+        self.game.tick_network()?;
+        if self.game.is_joined() {
+            self.create_window_and_renderer(event_loop)?;
+        }
+        Ok(())
+    }
+
+    fn sync_surface_constraints(&mut self) {
+        let surface = self.game.surface_state(MAIN_SURFACE_ID);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_surface_constraints(
+                surface.dimension_lock,
+                surface.aspect_ratio_lock,
+                surface.clear_background,
+            );
+        }
+    }
+
+    fn send_initial_surface_list(&mut self, size: PhysicalSize<u32>) -> Result<()> {
+        if !self.game.is_connected()
+            || !self.game.is_joined()
+            || self.render_cache.surface_list_sent
+        {
+            return Ok(());
+        }
+
+        self.game.send_surface_list(vec![(MAIN_SURFACE_ID, size.width, size.height)])?;
+        self.render_cache.surface_list_sent = true;
+        self.render_cache.last_reported_surface_size = Some((size.width, size.height));
+        Ok(())
+    }
+
     fn rebuild_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         self.renderer = None;
         self.window = None;
@@ -266,21 +303,9 @@ impl App {
 
         self.input_capture.poll_gamepads();
         self.game.tick_network()?;
-        if self.game.is_connected() && !self.render_cache.surface_list_sent {
-            let size = window.inner_size();
-            self.game
-                .send_surface_list(vec![(MAIN_SURFACE_ID, size.width, size.height)])?;
-            self.render_cache.surface_list_sent = true;
-            self.render_cache.last_reported_surface_size = Some((size.width, size.height));
-        }
+        self.send_initial_surface_list(window.inner_size())?;
+        self.sync_surface_constraints();
         let surface = self.game.surface_state(MAIN_SURFACE_ID);
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_surface_constraints(
-                surface.dimension_lock,
-                surface.aspect_ratio_lock,
-                surface.clear_background,
-            );
-        }
 
         let mut overlay_states = Vec::new();
         let mut overlay_text = Vec::new();
@@ -361,11 +386,7 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        if let Err(err) = self.create_window_and_renderer(event_loop) {
+        if let Err(err) = self.pump_network_until_join(event_loop) {
             log::error!("{err:#}");
             event_loop.exit();
             return;
@@ -382,6 +403,11 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_menu_events(event_loop);
+        if let Err(err) = self.pump_network_until_join(event_loop) {
+            log::error!("client network error before join: {err:#}");
+            event_loop.exit();
+            return;
+        }
         self.update_control_flow(event_loop);
     }
 
