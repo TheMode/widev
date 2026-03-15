@@ -53,6 +53,88 @@ pub(super) struct SurfaceState {
     pub(super) clear_background: Option<protocol::Color>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientPhase {
+    Connecting,
+    Handshaking,
+    JoinedPendingWindow,
+    Running,
+}
+
+struct SessionBootstrap {
+    game_name: String,
+    surfaces: HashMap<protocol::SurfaceId, SurfaceState>,
+}
+
+impl SessionBootstrap {
+    fn new() -> Self {
+        Self { game_name: "widev desktop POC".to_string(), surfaces: HashMap::new() }
+    }
+
+    fn game_name(&self) -> &str {
+        &self.game_name
+    }
+
+    fn surface_state(&self, surface_id: protocol::SurfaceId) -> SurfaceState {
+        self.surfaces.get(&surface_id).copied().unwrap_or_default()
+    }
+
+    fn set_game_name(&mut self, name: String) {
+        self.game_name = name;
+    }
+
+    fn surface_state_mut(&mut self, surface_id: protocol::SurfaceId) -> &mut SurfaceState {
+        self.surfaces.entry(surface_id).or_default()
+    }
+
+    fn apply_surface_dimension_lock(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        width: u32,
+        height: u32,
+    ) {
+        let state = self.surface_state_mut(surface_id);
+        if width == 0 || height == 0 {
+            state.dimension_lock = None;
+            log::info!("surface {surface_id} dimension lock removed");
+            return;
+        }
+        state.dimension_lock = Some((width, height));
+        log::info!("surface {surface_id} dimension lock: {}x{}", width, height);
+    }
+
+    fn apply_surface_aspect_ratio_lock(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        numerator: u32,
+        denominator: u32,
+    ) {
+        let state = self.surface_state_mut(surface_id);
+        if numerator == 0 || denominator == 0 {
+            state.aspect_ratio_lock = None;
+            log::info!("surface {surface_id} aspect-ratio lock removed");
+            return;
+        }
+        state.aspect_ratio_lock = Some((numerator, denominator));
+        log::info!("surface {surface_id} aspect-ratio lock: {}/{}", numerator, denominator);
+    }
+
+    fn apply_surface_clear_background(
+        &mut self,
+        surface_id: protocol::SurfaceId,
+        color: protocol::Color,
+    ) {
+        self.surface_state_mut(surface_id).clear_background = Some(color);
+        log::info!(
+            "surface {surface_id} background clear color (oklch): [{:.3}, {:.3}, {:.2}, {:.3}]",
+            color[0],
+            color[1],
+            color[2],
+            color[3]
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ElementState {
     visible: bool,
@@ -148,15 +230,13 @@ impl ElementState {
 
 pub(super) struct ClientGame {
     net: network::QuicClient,
-    sent_hello: bool,
-    joined: bool,
+    phase: ClientPhase,
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
-    game_name: String,
+    bootstrap: SessionBootstrap,
     bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
     pending_prediction: HashMap<u32, PredictionConfig>,
-    surfaces: HashMap<protocol::SurfaceId, SurfaceState>,
     pending_ping_nonces: HashMap<u64, Instant>,
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
@@ -173,15 +253,13 @@ impl ClientGame {
     pub(super) fn new(server_addr: SocketAddr) -> Result<Self> {
         Ok(Self {
             net: network::QuicClient::connect(server_addr)?,
-            sent_hello: false,
-            joined: false,
+            phase: ClientPhase::Connecting,
             server_cert_fingerprint: None,
             elements: HashMap::new(),
-            game_name: "widev desktop POC".to_string(),
+            bootstrap: SessionBootstrap::new(),
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
             pending_prediction: HashMap::new(),
-            surfaces: HashMap::new(),
             pending_ping_nonces: HashMap::new(),
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
@@ -200,7 +278,7 @@ impl ClientGame {
             }
         }
 
-        if self.net.is_established() && !self.sent_hello {
+        if self.net.is_established() && self.phase == ClientPhase::Connecting {
             let hello = protocol::C2SPacket::ClientHello {
                 client_name: "desktop-client".to_string(),
                 capabilities: CLIENT_CAPABILITIES
@@ -209,7 +287,7 @@ impl ClientGame {
                     .collect(),
             };
             self.send_c2s(hello)?;
-            self.sent_hello = true;
+            self.phase = ClientPhase::Handshaking;
             log::info!("connected to server {}", self.net.server_addr());
         }
         self.maybe_send_ping()?;
@@ -274,11 +352,11 @@ impl ClientGame {
     }
 
     pub(super) fn game_name(&self) -> &str {
-        &self.game_name
+        self.bootstrap.game_name()
     }
 
-    pub(super) fn is_joined(&self) -> bool {
-        self.joined
+    pub(super) fn phase(&self) -> ClientPhase {
+        self.phase
     }
 
     pub(super) fn is_connected(&self) -> bool {
@@ -289,10 +367,7 @@ impl ClientGame {
         &mut self,
         surfaces: Vec<(protocol::SurfaceId, u32, u32)>,
     ) -> Result<()> {
-        if !self.net.is_established() {
-            return Ok(());
-        }
-        self.send_c2s(protocol::C2SPacket::SurfaceList { surfaces })
+        self.send_when_connected(protocol::C2SPacket::SurfaceList { surfaces })
     }
 
     pub(super) fn send_surface_resized(
@@ -301,14 +376,17 @@ impl ClientGame {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        if !self.net.is_established() {
-            return Ok(());
-        }
-        self.send_c2s(protocol::C2SPacket::SurfaceResized { surface_id, width, height })
+        self.send_when_connected(protocol::C2SPacket::SurfaceResized { surface_id, width, height })
     }
 
     pub(super) fn surface_state(&self, surface_id: protocol::SurfaceId) -> SurfaceState {
-        self.surfaces.get(&surface_id).copied().unwrap_or_default()
+        self.bootstrap.surface_state(surface_id)
+    }
+
+    pub(super) fn mark_window_running(&mut self) {
+        if self.phase == ClientPhase::JoinedPendingWindow {
+            self.phase = ClientPhase::Running;
+        }
     }
 
     pub(super) fn latency_snapshot(&self) -> LatencySnapshot {
@@ -351,57 +429,6 @@ impl ClientGame {
         } else {
             log::info!("found {cached} cached binding(s) for this server cert");
         }
-    }
-
-    fn surface_state_mut(&mut self, surface_id: protocol::SurfaceId) -> &mut SurfaceState {
-        self.surfaces.entry(surface_id).or_default()
-    }
-
-    fn apply_surface_dimension_lock(
-        &mut self,
-        surface_id: protocol::SurfaceId,
-        width: u32,
-        height: u32,
-    ) {
-        let state = self.surface_state_mut(surface_id);
-        if width == 0 || height == 0 {
-            state.dimension_lock = None;
-            log::info!("surface {surface_id} dimension lock removed");
-            return;
-        }
-        state.dimension_lock = Some((width, height));
-        log::info!("surface {surface_id} dimension lock: {}x{}", width, height);
-    }
-
-    fn apply_surface_aspect_ratio_lock(
-        &mut self,
-        surface_id: protocol::SurfaceId,
-        numerator: u32,
-        denominator: u32,
-    ) {
-        let state = self.surface_state_mut(surface_id);
-        if numerator == 0 || denominator == 0 {
-            state.aspect_ratio_lock = None;
-            log::info!("surface {surface_id} aspect-ratio lock removed");
-            return;
-        }
-        state.aspect_ratio_lock = Some((numerator, denominator));
-        log::info!("surface {surface_id} aspect-ratio lock: {}/{}", numerator, denominator);
-    }
-
-    fn apply_surface_clear_background(
-        &mut self,
-        surface_id: protocol::SurfaceId,
-        color: protocol::Color,
-    ) {
-        self.surface_state_mut(surface_id).clear_background = Some(color);
-        log::info!(
-            "surface {surface_id} background clear color (oklch): [{:.3}, {:.3}, {:.2}, {:.3}]",
-            color[0],
-            color[1],
-            color[2],
-            color[3]
-        );
     }
 
     fn apply_transform_prediction(
@@ -523,22 +550,22 @@ impl ClientGame {
                 }
             },
             protocol::S2CPacket::SetGameName { name } => {
-                self.game_name = name;
+                self.bootstrap.set_game_name(name);
             },
             protocol::S2CPacket::Join {} => {
-                if !self.joined {
-                    self.joined = true;
+                if !matches!(self.phase, ClientPhase::JoinedPendingWindow | ClientPhase::Running) {
+                    self.phase = ClientPhase::JoinedPendingWindow;
                     log::info!("join received; client can initialize surfaces and render");
                 }
             },
             protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
-                self.apply_surface_dimension_lock(surface_id, width, height);
+                self.bootstrap.apply_surface_dimension_lock(surface_id, width, height);
             },
             protocol::S2CPacket::SurfaceLockAspectRatio { surface_id, numerator, denominator } => {
-                self.apply_surface_aspect_ratio_lock(surface_id, numerator, denominator);
+                self.bootstrap.apply_surface_aspect_ratio_lock(surface_id, numerator, denominator);
             },
             protocol::S2CPacket::SurfaceClearBackground { surface_id, color } => {
-                self.apply_surface_clear_background(surface_id, color);
+                self.bootstrap.apply_surface_clear_background(surface_id, color);
             },
             protocol::S2CPacket::ElementSetTransformPrediction {
                 element_id,
@@ -571,6 +598,13 @@ impl ClientGame {
 
     fn send_binding_ack(&mut self, binding_id: u16) -> Result<()> {
         self.send_c2s(protocol::C2SPacket::BindingAssigned { binding_id })
+    }
+
+    fn send_when_connected(&mut self, packet: protocol::C2SPacket) -> Result<()> {
+        if self.net.is_established() {
+            self.send_c2s(packet)?;
+        }
+        Ok(())
     }
 
     fn send_c2s(&mut self, packet: protocol::C2SPacket) -> Result<()> {
