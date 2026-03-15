@@ -21,7 +21,8 @@ use crate::packet_scheduler::{
     DispatchEnvelope, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
 use crate::packets::{
-    PacketControl, PacketEnvelope, PacketMessage, PacketOrder, PacketPriority, PacketTarget,
+    DropReason, PacketControl, PacketEnvelope, PacketMessage, PacketOrder, PacketPriority,
+    PacketTarget,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -704,7 +705,8 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
         },
     };
 
-    let mut session = Session::new(client_id, client_addr, server_cid, conn);
+    let mut session =
+        Session::new(client_id, client_addr, server_cid, shard.event_tx.clone(), conn);
     recv_on_session(
         &mut session,
         &mut pkt_buf,
@@ -739,7 +741,7 @@ fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelop
         return;
     }
 
-    let Some(framed) = serialize_envelope_frames(&envelope.payload) else {
+    let Some(framed) = serialize_envelope_frames(envelope) else {
         return;
     };
 
@@ -828,7 +830,7 @@ fn for_each_target_session_mut(
 enum EnvelopeDispatchResult {
     Sent,
     DeferredByCongestion,
-    Dropped,
+    Dropped(DropReason),
 }
 
 struct StreamTarget {
@@ -899,6 +901,13 @@ fn decode_and_forward_c2s(
                     quiche_rtt_ms
                 );
             }
+        },
+        Some(DecodedC2SPacket::Packet(crate::packets::C2SPacket::Receipt { envelope_id })) => {
+            let _ = event_tx.send(NetworkEvent::DeliveryUpdate {
+                client_id: session.client_id,
+                envelope_id,
+                outcome: crate::packets::DeliveryOutcome::ClientProcessed,
+            });
         },
         Some(DecodedC2SPacket::Packet(packet)) => {
             let _ =
@@ -1077,6 +1086,7 @@ fn ensure_dev_certs(cert_dir: &Path) -> Result<()> {
 
 struct Session {
     client_id: ClientId,
+    event_tx: mpsc::Sender<NetworkEvent>,
     conn: Connection,
     client_addr: SocketAddr,
     local_cid: Vec<u8>,
@@ -1097,6 +1107,7 @@ struct PendingStreamWrite {
     offset: usize,
     fin: bool,
     tracks_inflight: bool,
+    transport_receipt_id: Option<crate::packets::EnvelopeId>,
 }
 
 #[derive(Default)]
@@ -1111,10 +1122,12 @@ impl Session {
         client_id: ClientId,
         client_addr: SocketAddr,
         local_cid: Vec<u8>,
+        event_tx: mpsc::Sender<NetworkEvent>,
         conn: Connection,
     ) -> Self {
         Self {
             client_id,
+            event_tx,
             conn,
             client_addr,
             local_cid,
@@ -1204,9 +1217,10 @@ impl Session {
 
     fn send_envelope(&mut self, envelope: &PacketEnvelope, framed: &[u8]) {
         self.dispatch_scheduler_command(SchedulerCommand::Envelope(DispatchEnvelope {
-            identifier: envelope.identifier,
+            id: envelope.id,
             priority: envelope.priority,
             order: envelope.order,
+            delivery: envelope.delivery,
             framed: framed.to_vec(),
         }));
     }
@@ -1239,7 +1253,15 @@ impl Session {
         match action {
             SchedulerAction::DispatchEnvelope { envelope, force_flush } => {
                 match self.dispatch_ordered_envelope(envelope.clone(), force_flush) {
-                    EnvelopeDispatchResult::Sent | EnvelopeDispatchResult::Dropped => None,
+                    EnvelopeDispatchResult::Sent => None,
+                    EnvelopeDispatchResult::Dropped(reason) => {
+                        self.emit_delivery_update(
+                            envelope.delivery,
+                            envelope.id,
+                            crate::packets::DeliveryOutcome::TransportDropped { reason },
+                        );
+                        None
+                    },
                     EnvelopeDispatchResult::DeferredByCongestion => {
                         self.scheduler.requeue_deferred(envelope, Instant::now());
                         None
@@ -1266,10 +1288,15 @@ impl Session {
                 }
             },
             SchedulerAction::DropEnvelope { envelope, reason } => {
+                self.emit_delivery_update(
+                    envelope.delivery,
+                    envelope.id,
+                    crate::packets::DeliveryOutcome::TransportDropped { reason },
+                );
                 log::debug!(
                     "dropping scheduled envelope for client {}: id={:?} order={:?} reason={:?}",
                     self.client_id,
-                    envelope.identifier,
+                    envelope.id,
                     envelope.order,
                     reason
                 );
@@ -1290,10 +1317,15 @@ impl Session {
     fn send_datagram(&mut self, envelope: &DispatchEnvelope) -> EnvelopeDispatchResult {
         match self.conn.dgram_send(&envelope.framed) {
             Ok(()) => {
+                self.emit_delivery_update(
+                    envelope.delivery,
+                    envelope.id,
+                    crate::packets::DeliveryOutcome::TransportDelivered,
+                );
                 log::debug!(
                     "client {} sent envelope {:?} ({:?}) as datagram",
                     self.client_id,
-                    envelope.identifier,
+                    envelope.id,
                     envelope.order
                 );
                 EnvelopeDispatchResult::Sent
@@ -1303,17 +1335,17 @@ impl Session {
             ) => {
                 let result = match envelope.priority {
                     PacketPriority::Deadline { .. } => EnvelopeDispatchResult::DeferredByCongestion,
-                    _ => EnvelopeDispatchResult::Dropped,
+                    _ => EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected),
                 };
                 log::debug!(
                     "{} datagram envelope for client {}: id={:?} order={:?}",
                     match result {
                         EnvelopeDispatchResult::DeferredByCongestion => "deferring",
-                        EnvelopeDispatchResult::Dropped => "dropping",
+                        EnvelopeDispatchResult::Dropped(_) => "dropping",
                         EnvelopeDispatchResult::Sent => "sent",
                     },
                     self.client_id,
-                    envelope.identifier,
+                    envelope.id,
                     envelope.order
                 );
                 result
@@ -1323,7 +1355,7 @@ impl Session {
                     "dropping datagram envelope for client {} after dgram_send error: {err:?}",
                     self.client_id
                 );
-                EnvelopeDispatchResult::Dropped
+                EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected)
             },
         }
     }
@@ -1380,8 +1412,8 @@ impl Session {
         envelope: DispatchEnvelope,
         force_flush: bool,
     ) -> EnvelopeDispatchResult {
-        let DispatchEnvelope { identifier, priority, order, framed } = envelope;
-        let transport_meta = DispatchEnvelope { identifier, priority, order, framed };
+        let DispatchEnvelope { id, priority, order, delivery, framed } = envelope;
+        let transport_meta = DispatchEnvelope { id, priority, order, delivery, framed };
 
         if self.can_send_as_datagram(&transport_meta) {
             match self.send_datagram(&transport_meta) {
@@ -1391,11 +1423,11 @@ impl Session {
                 EnvelopeDispatchResult::DeferredByCongestion if !force_flush => {
                     return EnvelopeDispatchResult::DeferredByCongestion;
                 },
-                EnvelopeDispatchResult::Dropped if !force_flush => {
-                    return EnvelopeDispatchResult::Dropped;
+                EnvelopeDispatchResult::Dropped(reason) if !force_flush => {
+                    return EnvelopeDispatchResult::Dropped(reason);
                 },
-                EnvelopeDispatchResult::DeferredByCongestion | EnvelopeDispatchResult::Dropped => {
-                },
+                EnvelopeDispatchResult::DeferredByCongestion
+                | EnvelopeDispatchResult::Dropped(_) => {},
             }
         }
 
@@ -1407,7 +1439,7 @@ impl Session {
                 "dropping envelope for client {} due to stream congestion budget",
                 self.client_id
             );
-            return EnvelopeDispatchResult::Dropped;
+            return EnvelopeDispatchResult::Dropped(DropReason::CongestionBudgetExceeded);
         }
 
         if transport_meta.is_deadline()
@@ -1427,11 +1459,22 @@ impl Session {
             "client {} opening server stream {} for envelope {:?} ({:?}, fin={})",
             self.client_id,
             stream_id,
-            identifier,
+            id,
             order,
             fin
         );
-        self.queue_stream_payloads(stream_id, &transport_meta.framed, fin);
+        self.queue_stream_payloads(
+            stream_id,
+            &transport_meta.framed,
+            fin,
+            matches!(
+                transport_meta.delivery,
+                crate::packets::DeliveryPolicy::ObserveTransport
+                    | crate::packets::DeliveryPolicy::RequireClientReceipt
+            )
+            .then_some(transport_meta.id)
+            .flatten(),
+        );
         EnvelopeDispatchResult::Sent
     }
 
@@ -1461,7 +1504,13 @@ impl Session {
         }
     }
 
-    fn queue_stream_payloads(&mut self, stream_id: u64, payload: &[u8], fin: bool) {
+    fn queue_stream_payloads(
+        &mut self,
+        stream_id: u64,
+        payload: &[u8],
+        fin: bool,
+        transport_receipt_id: Option<crate::packets::EnvelopeId>,
+    ) {
         if payload.is_empty() {
             return;
         }
@@ -1474,6 +1523,7 @@ impl Session {
             offset: 0,
             fin,
             tracks_inflight: true,
+            transport_receipt_id,
         });
     }
 
@@ -1539,6 +1589,13 @@ impl Session {
                             break;
                         }
                         if chunk.tracks_inflight {
+                            if let Some(envelope_id) = chunk.transport_receipt_id {
+                                let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
+                                    client_id: self.client_id,
+                                    envelope_id,
+                                    outcome: crate::packets::DeliveryOutcome::TransportDelivered,
+                                });
+                            }
                             self.inflight_message_count =
                                 self.inflight_message_count.saturating_sub(1);
                             if self.inflight_message_count == 0 {
@@ -1583,6 +1640,25 @@ impl Session {
             self.sequence_streams.retain(|_, id| *id != stream_id);
             log::debug!("server stream {} cleaned up for client {}", stream_id, self.client_id);
         }
+    }
+
+    fn emit_delivery_update(
+        &self,
+        delivery: crate::packets::DeliveryPolicy,
+        id: Option<crate::packets::EnvelopeId>,
+        outcome: crate::packets::DeliveryOutcome,
+    ) {
+        if delivery == crate::packets::DeliveryPolicy::None {
+            return;
+        }
+        let Some(envelope_id) = id else {
+            return;
+        };
+        let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
+            client_id: self.client_id,
+            envelope_id,
+            outcome,
+        });
     }
 }
 

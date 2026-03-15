@@ -6,8 +6,8 @@ use uuid::Uuid;
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    InputType, PacketBundle, PacketEnvelope, PacketTarget, PredictionKind, S2CPacket,
-    TransformPredictionMask,
+    DeliveryOutcome, DeliveryPolicy, InputType, PacketBundle, PacketEnvelope, PacketTarget,
+    PredictionKind, S2CPacket, TransformPredictionMask,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -63,6 +63,8 @@ impl RedSquareGame {
         let Some(player) = self.players.get(&client_id) else {
             return;
         };
+        let bootstrap_sequence_id = player.bootstrap_sequence_id;
+        let envelope_id = state.alloc_envelope_id();
 
         let mut bundle = vec![
             S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
@@ -107,7 +109,9 @@ impl RedSquareGame {
 
         state.send(
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
-                .sequence(player.bootstrap_sequence_id),
+                .id(envelope_id)
+                .delivery(DeliveryPolicy::RequireClientReceipt)
+                .sequence(bootstrap_sequence_id),
         );
     }
 }
@@ -140,6 +144,21 @@ impl Game for RedSquareGame {
                     .send(PacketEnvelope::bundle(PacketTarget::BroadcastExcept(client_id), bundle));
 
                 log::info!("client {client_id} connected");
+            },
+            NetworkEvent::DeliveryUpdate { client_id, envelope_id, outcome } => match outcome {
+                DeliveryOutcome::TransportDelivered => {
+                    log::info!(
+                        "transport delivered envelope {envelope_id:032x} to client {client_id}"
+                    );
+                },
+                DeliveryOutcome::TransportDropped { reason } => {
+                    log::info!(
+                            "transport dropped envelope {envelope_id:032x} for client {client_id}: {reason:?}"
+                        );
+                },
+                DeliveryOutcome::ClientProcessed => {
+                    log::info!("client {client_id} processed envelope {envelope_id:032x}");
+                },
             },
             NetworkEvent::ClientDisconnected(client_id) => {
                 self.players.remove(&client_id);
@@ -181,8 +200,7 @@ impl Game for RedSquareGame {
                         height
                     );
                 },
-                crate::packets::C2SPacket::Ping { .. } | crate::packets::C2SPacket::Pong { .. } => {
-                },
+                _ => {},
             },
         }
     }

@@ -3,17 +3,12 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use crate::packets::{PacketOrder, PacketPriority};
+use crate::packets::{DeliveryPolicy, DropReason, EnvelopeId, PacketOrder, PacketPriority};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OrderDomain {
     Independent,
     Sequence(Uuid),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DropReason {
-    ExpiredDeadline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,9 +20,10 @@ enum QueueHeadAction {
 
 #[derive(Clone)]
 pub struct DispatchEnvelope {
-    pub identifier: Option<Uuid>,
+    pub id: Option<EnvelopeId>,
     pub priority: PacketPriority,
     pub order: PacketOrder,
+    pub delivery: DeliveryPolicy,
     pub framed: Vec<u8>,
 }
 
@@ -39,7 +35,7 @@ impl DispatchEnvelope {
     pub fn is_datagram_eligible(&self) -> bool {
         matches!(self.priority, PacketPriority::Droppable | PacketPriority::Deadline { .. })
             && matches!(self.order, PacketOrder::Independent)
-            && self.identifier.is_none()
+            && self.id.is_none()
     }
 
     pub fn is_droppable(&self) -> bool {
@@ -369,7 +365,13 @@ mod tests {
         order: PacketOrder,
         framed_len: usize,
     ) -> DispatchEnvelope {
-        DispatchEnvelope { identifier: None, priority, order, framed: vec![0; framed_len] }
+        DispatchEnvelope {
+            id: None,
+            priority,
+            order,
+            delivery: DeliveryPolicy::None,
+            framed: vec![0; framed_len],
+        }
     }
 
     #[test]

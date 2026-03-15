@@ -53,6 +53,32 @@ pub enum PacketOrder {
     SequenceEnd(uuid::Uuid),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeliveryPolicy {
+    #[default]
+    None,
+    /// Emit a server-side transport outcome when the envelope is delivered or dropped.
+    ObserveTransport,
+    /// Emit transport outcomes and also require a client receipt after the full envelope is applied.
+    RequireClientReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    TransportDelivered,
+    TransportDropped {
+        reason: DropReason,
+    },
+    ClientProcessed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    ExpiredDeadline,
+    CongestionBudgetExceeded,
+    DatagramRejected,
+}
+
 pub type PacketBundle = Vec<S2CPacket>;
 
 #[derive(Debug, Clone, Copy)]
@@ -89,11 +115,12 @@ pub enum PacketControl {
 
 #[derive(Clone)]
 pub struct PacketEnvelope {
-    pub identifier: Option<uuid::Uuid>,
+    pub id: Option<EnvelopeId>,
     pub target: PacketTarget,
     pub payload: PacketPayload,
     pub priority: PacketPriority,
     pub order: PacketOrder,
+    pub delivery: DeliveryPolicy,
 }
 
 #[derive(Clone)]
@@ -104,8 +131,12 @@ pub enum PacketMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum PacketEnvelopeValidationError {
-    #[error("droppable envelopes cannot have an identifier")]
-    DroppableWithIdentifier,
+    #[error("droppable envelopes cannot have an id")]
+    DroppableWithId,
+    #[error("delivery-tracked envelopes require an id")]
+    DeliveryRequiresId,
+    #[error("droppable envelopes cannot require a client receipt")]
+    DroppableWithClientReceipt,
     #[error("coalescing envelopes require a non-zero payload target")]
     CoalescingWithZeroTarget,
 }
@@ -113,11 +144,12 @@ pub enum PacketEnvelopeValidationError {
 impl PacketEnvelope {
     pub fn new(target: PacketTarget, payload: PacketPayload) -> Self {
         Self {
-            identifier: None,
+            id: None,
             target,
             payload,
             priority: PacketPriority::default(),
             order: PacketOrder::default(),
+            delivery: DeliveryPolicy::default(),
         }
     }
 
@@ -144,8 +176,13 @@ impl PacketEnvelope {
         self
     }
 
-    pub fn id(mut self, identifier: uuid::Uuid) -> Self {
-        self.identifier = Some(identifier);
+    pub fn id(mut self, id: EnvelopeId) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn delivery(mut self, delivery: DeliveryPolicy) -> Self {
+        self.delivery = delivery;
         self
     }
 
@@ -165,8 +202,23 @@ impl PacketEnvelope {
     }
 
     pub fn validate(&self) -> Result<(), PacketEnvelopeValidationError> {
-        if matches!(self.priority, PacketPriority::Droppable) && self.identifier.is_some() {
-            return Err(PacketEnvelopeValidationError::DroppableWithIdentifier);
+        let tracks_delivery = matches!(
+            self.delivery,
+            DeliveryPolicy::ObserveTransport | DeliveryPolicy::RequireClientReceipt
+        );
+
+        if matches!(self.priority, PacketPriority::Droppable) && self.id.is_some() {
+            return Err(PacketEnvelopeValidationError::DroppableWithId);
+        }
+
+        if tracks_delivery && self.id.is_none() {
+            return Err(PacketEnvelopeValidationError::DeliveryRequiresId);
+        }
+
+        if matches!(self.priority, PacketPriority::Droppable)
+            && self.delivery == DeliveryPolicy::RequireClientReceipt
+        {
+            return Err(PacketEnvelopeValidationError::DroppableWithClientReceipt);
         }
 
         if matches!(self.priority, PacketPriority::Coalescing { target_payload_bytes: 0 }) {
@@ -186,11 +238,40 @@ mod tests {
         let envelope =
             PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
                 .droppable()
-                .id(uuid::Uuid::nil());
+                .id(1);
+
+        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DroppableWithId));
+    }
+
+    #[test]
+    fn client_receipt_requires_id() {
+        let envelope =
+            PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
+                .delivery(DeliveryPolicy::RequireClientReceipt);
+
+        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DeliveryRequiresId));
+    }
+
+    #[test]
+    fn transport_observation_requires_id() {
+        let envelope =
+            PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
+                .delivery(DeliveryPolicy::ObserveTransport);
+
+        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DeliveryRequiresId));
+    }
+
+    #[test]
+    fn droppable_cannot_require_client_receipt() {
+        let envelope =
+            PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
+                .droppable()
+                .id(1)
+                .delivery(DeliveryPolicy::RequireClientReceipt);
 
         assert_eq!(
             envelope.validate(),
-            Err(PacketEnvelopeValidationError::DroppableWithIdentifier)
+            Err(PacketEnvelopeValidationError::DroppableWithClientReceipt)
         );
     }
 

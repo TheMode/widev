@@ -11,6 +11,11 @@
       "type": "u32"
     },
     {
+      "name": "EnvelopeId",
+      "description": "Unique identifier for one server envelope, used for client receipts.",
+      "type": "u128"
+    },
+    {
       "name": "Color",
       "description": "OKLCH + alpha packed as [L, C, H_degrees, A].",
       "type": "[f32; 4]"
@@ -90,6 +95,13 @@
         { "name": "surface_id", "type": "SurfaceId" },
         { "name": "width", "type": "u32" },
         { "name": "height", "type": "u32" }
+      ]
+    },
+    {
+      "name": "Receipt",
+      "description": "Acknowledgement sent after the client has applied every packet in a receipt-requesting envelope.",
+      "fields": [
+        { "name": "envelope_id", "type": "EnvelopeId" }
       ]
     }
   ],

@@ -640,10 +640,15 @@ fn process_datagrams(
             Ok(len) => {
                 let mut framed = app_buf[..len].to_vec();
                 for frame in drain_framed_packets(&mut framed) {
-                    let Ok(packet) = protocol::decode_s2c(&frame) else {
+                    let Some(envelope) = protocol::decode_envelope(&frame) else {
                         continue;
                     };
-                    handle_s2c_packet(session, packet)?;
+                    for packet in envelope.packets {
+                        handle_s2c_packet(session, packet)?;
+                    }
+                    if let Some(envelope_id) = envelope.receipt_id {
+                        session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
+                    }
                 }
                 *had_activity = true;
             },
@@ -672,10 +677,15 @@ fn process_streams(
                     };
 
                     for frame in frames {
-                        let Ok(packet) = protocol::decode_s2c(&frame) else {
+                        let Some(envelope) = protocol::decode_envelope(&frame) else {
                             continue;
                         };
-                        handle_s2c_packet(session, packet)?;
+                        for packet in envelope.packets {
+                            handle_s2c_packet(session, packet)?;
+                        }
+                        if let Some(envelope_id) = envelope.receipt_id {
+                            session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
+                        }
                     }
 
                     cleanup_stream_if_closed(&mut session.stream_states, &session.conn, stream_id);

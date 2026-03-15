@@ -273,8 +273,14 @@ impl ClientGame {
         self.ensure_server_identity_logged();
 
         for bytes in incoming.datagrams.into_iter().chain(incoming.streams) {
-            if let Ok(packet) = protocol::decode_s2c(&bytes) {
+            let Some(envelope) = protocol::decode_envelope(&bytes) else {
+                continue;
+            };
+            for packet in envelope.packets {
                 self.handle_server_packet(packet)?;
+            }
+            if let Some(envelope_id) = envelope.receipt_id {
+                self.send_when_connected(protocol::C2SPacket::Receipt { envelope_id })?;
             }
         }
 
