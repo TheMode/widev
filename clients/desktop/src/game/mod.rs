@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -9,12 +9,14 @@ use sha2::{Digest, Sha256};
 mod app;
 mod bindings;
 mod network;
+mod packet_chain;
 #[allow(dead_code)]
 mod packets {
     include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 }
 mod persistence;
 use self::packets as protocol;
+use self::packet_chain::PacketChain;
 mod renderer;
 
 const LERP_ALPHA: f32 = 0.35;
@@ -305,8 +307,7 @@ pub(super) struct ClientGame {
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
     resources: HashMap<protocol::MessageId, ClientResource>,
-    pending_messages: VecDeque<protocol::decode::DecodedServerMessage>,
-    processed_message_ids: HashSet<u128>,
+    packet_chain: PacketChain,
     bootstrap: SessionBootstrap,
     bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
@@ -332,8 +333,7 @@ impl ClientGame {
             server_cert_fingerprint: None,
             elements: HashMap::new(),
             resources: HashMap::new(),
-            pending_messages: VecDeque::new(),
-            processed_message_ids: HashSet::new(),
+            packet_chain: PacketChain::new(),
             bootstrap: SessionBootstrap::new(),
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
@@ -355,7 +355,7 @@ impl ClientGame {
             let Some(message) = protocol::decode::server_message(&bytes) else {
                 continue;
             };
-            self.pending_messages.push_back(message);
+            self.packet_chain.push(message);
         }
         self.process_ready_messages()?;
 
@@ -730,35 +730,12 @@ impl ClientGame {
     }
 
     fn process_ready_messages(&mut self) -> Result<()> {
-        loop {
-            let mut progressed = false;
-            let mut remaining = VecDeque::new();
-
-            while let Some(message) = self.pending_messages.pop_front() {
-                let dependency_id = match &message {
-                    protocol::decode::DecodedServerMessage::Envelope(envelope) => envelope.dependency_id,
-                    protocol::decode::DecodedServerMessage::Resource(resource) => resource.dependency_id,
-                };
-                if !self.dependency_satisfied(dependency_id) {
-                    remaining.push_back(message);
-                    continue;
-                }
-
-                self.apply_decoded_message(message)?;
-                progressed = true;
-            }
-
-            self.pending_messages = remaining;
-            if !progressed {
-                break;
-            }
+        let ready_messages =
+            self.packet_chain.drain_ready(|resource_id| self.resources.contains_key(&resource_id));
+        for message in ready_messages {
+            self.apply_decoded_message(message)?;
         }
-
         Ok(())
-    }
-
-    fn dependency_satisfied(&self, dependency_id: Option<protocol::MessageId>) -> bool {
-        dependency_id.is_none_or(|id| self.processed_message_ids.contains(&id))
     }
 
     fn apply_decoded_message(
@@ -775,14 +752,9 @@ impl ClientGame {
                 for packet in envelope.packets {
                     self.handle_server_packet(packet)?;
                 }
-
-                if let Some(id) = envelope.id {
-                    self.processed_message_ids.insert(id);
-                }
             },
             protocol::decode::DecodedServerMessage::Resource(resource) => {
                 self.store_resource(resource.id, resource.resource_type, resource.usage_count, resource.blob)?;
-                self.processed_message_ids.insert(resource.id);
             },
         }
 
