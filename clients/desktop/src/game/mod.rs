@@ -8,8 +8,12 @@ use sha2::{Digest, Sha256};
 mod app;
 mod bindings;
 mod network;
+#[allow(dead_code)]
+mod packets {
+    include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
+}
 mod persistence;
-mod protocol;
+use self::packets as protocol;
 mod renderer;
 
 const LERP_ALPHA: f32 = 0.35;
@@ -233,7 +237,7 @@ pub(super) struct ClientGame {
     phase: ClientPhase,
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
-    pending_envelopes: VecDeque<protocol::DecodedEnvelope>,
+    pending_envelopes: VecDeque<protocol::decode::DecodedEnvelope>,
     processed_envelope_ids: HashSet<protocol::EnvelopeId>,
     bootstrap: SessionBootstrap,
     bindings: bindings::BindingState,
@@ -277,7 +281,7 @@ impl ClientGame {
         self.ensure_server_identity_logged();
 
         for bytes in incoming.datagrams.into_iter().chain(incoming.streams) {
-            let Some(envelope) = protocol::decode_envelope(&bytes) else {
+            let Some(envelope) = protocol::decode::s2c_envelope(&bytes) else {
                 continue;
             };
             self.pending_envelopes.push_back(envelope);
@@ -630,7 +634,10 @@ impl ClientGame {
         dependency_id.is_none_or(|id| self.processed_envelope_ids.contains(&id))
     }
 
-    fn apply_decoded_envelope(&mut self, envelope: protocol::DecodedEnvelope) -> Result<()> {
+    fn apply_decoded_envelope(
+        &mut self,
+        envelope: protocol::decode::DecodedEnvelope,
+    ) -> Result<()> {
         for packet in envelope.packets {
             self.handle_server_packet(packet)?;
         }

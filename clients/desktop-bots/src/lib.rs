@@ -13,7 +13,12 @@ use mio::{Events, Interest, Poll, Token};
 use quiche::RecvInfo;
 use rand::Rng;
 
-pub mod protocol;
+#[allow(dead_code)]
+pub mod packets {
+    include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
+}
+
+pub use self::packets as protocol;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const MAX_WORKER_POLL_WAIT: Duration = Duration::from_millis(10);
@@ -78,7 +83,7 @@ struct BotSession {
     pending_send: Option<PendingDatagram>,
     conn: quiche::Connection,
     stream_states: HashMap<u64, QuicStreamState>,
-    pending_envelopes: VecDeque<protocol::DecodedEnvelope>,
+    pending_envelopes: VecDeque<protocol::decode::DecodedEnvelope>,
     processed_envelope_ids: HashSet<protocol::EnvelopeId>,
     flow: Box<dyn BotFlow>,
     outgoing: Vec<protocol::C2SPacket>,
@@ -644,7 +649,7 @@ fn process_datagrams(
             Ok(len) => {
                 let mut framed = app_buf[..len].to_vec();
                 for frame in drain_framed_packets(&mut framed) {
-                    let Some(envelope) = protocol::decode_envelope(&frame) else {
+                    let Some(envelope) = protocol::decode::s2c_envelope(&frame) else {
                         continue;
                     };
                     queue_envelope(session, envelope)?;
@@ -676,7 +681,7 @@ fn process_streams(
                     };
 
                     for frame in frames {
-                        let Some(envelope) = protocol::decode_envelope(&frame) else {
+                        let Some(envelope) = protocol::decode::s2c_envelope(&frame) else {
                             continue;
                         };
                         queue_envelope(session, envelope)?;
@@ -779,7 +784,10 @@ fn handle_s2c_packet(session: &mut BotSession, packet: protocol::S2CPacket) -> R
     session.flow.on_server_packet(&mut ctx, &packet)
 }
 
-fn queue_envelope(session: &mut BotSession, envelope: protocol::DecodedEnvelope) -> Result<()> {
+fn queue_envelope(
+    session: &mut BotSession,
+    envelope: protocol::decode::DecodedEnvelope,
+) -> Result<()> {
     session.pending_envelopes.push_back(envelope);
     process_ready_envelopes(session)
 }
@@ -814,7 +822,7 @@ fn dependency_satisfied(session: &BotSession, dependency_id: Option<protocol::En
 
 fn apply_decoded_envelope(
     session: &mut BotSession,
-    envelope: protocol::DecodedEnvelope,
+    envelope: protocol::decode::DecodedEnvelope,
 ) -> Result<()> {
     for packet in envelope.packets {
         handle_s2c_packet(session, packet)?;

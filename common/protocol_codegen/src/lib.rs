@@ -93,123 +93,225 @@ impl CodegenBackend for RustBackend {
     fn generate(&self, schema: &Schema) -> Result<String> {
         let mut out = String::new();
 
-        macro_rules! line {
-            () => {
-                out.push('\n');
-            };
-            ($text:expr) => {
-                out.push_str($text);
-                out.push('\n');
-            };
-            ($fmt:expr, $($arg:tt)*) => {
-                writeln!(&mut out, $fmt, $($arg)*).expect("writing to String should not fail");
-            };
-        }
-
         for typedef_def in &schema.typedefs {
-            line!("pub type {} = {};", typedef_def.name, typedef_def.ty);
+            writeln!(&mut out, "pub type {} = {};", typedef_def.name, typedef_def.ty)
+                .expect("writing to String should not fail");
         }
         if !schema.typedefs.is_empty() {
-            line!();
+            out.push('\n');
         }
 
         for bitmask_def in &schema.bitmasks {
-            line!(
-                r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
-            );
-            line!("#[repr(transparent)]");
-            line!("pub struct {}(pub {});", bitmask_def.name, bitmask_def.ty);
-            line!("impl {} {{", bitmask_def.name);
-            line!("    pub const NONE: Self = Self(0);");
-            for flag in &bitmask_def.flags {
-                line!("    pub const {}: Self = Self({});", to_upper_snake(&flag.name), flag.value);
-            }
-            line!("    pub fn bits(self) -> {} {{", bitmask_def.ty);
-            line!("        self.0");
-            line!("    }");
-            line!("    pub fn contains(self, other: Self) -> bool {");
-            line!("        (self.0 & other.0) == other.0");
-            line!("    }");
-            line!("}");
-            line!();
-            line!("impl std::ops::BitOr for {} {{", bitmask_def.name);
-            line!("    type Output = Self;");
-            line!("    fn bitor(self, rhs: Self) -> Self::Output {");
-            line!("        Self(self.0 | rhs.0)");
-            line!("    }");
-            line!("}");
-            line!();
-            line!("impl std::ops::BitOrAssign for {} {{", bitmask_def.name);
-            line!("    fn bitor_assign(&mut self, rhs: Self) {");
-            line!("        self.0 |= rhs.0;");
-            line!("    }");
-            line!("}");
-            line!();
+            write_bitmask(&mut out, bitmask_def);
         }
 
         for enum_def in &schema.enums {
-            line!(
-                r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
-            );
-            line!("pub enum {} {{", enum_def.name);
-            for variant in &enum_def.variants {
-                line!("    {},", variant);
-            }
-            line!("}");
-            line!();
+            write_plain_enum(&mut out, enum_def);
         }
 
         for (name, packets) in [
             ("C2SPacket", schema.common.iter().chain(schema.c2s.iter())),
             ("S2CPacket", schema.common.iter().chain(schema.s2c.iter())),
         ] {
-            line!(
-                r#"#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#
-            );
-            line!("pub enum {} {{", name);
-            for packet in packets {
-                if packet.fields.is_empty() {
-                    line!("    {},", packet.name);
-                } else {
-                    line!("    {} {{", packet.name);
-                    for field in &packet.fields {
-                        line!("        {}: {},", field.name, field.ty);
-                    }
-                    line!("    },");
-                }
-            }
-            line!("}");
-            line!();
+            write_packet_enum(&mut out, name, packets);
         }
 
-        macro_rules! codec_fns {
-            ($encode:ident, $decode:ident, $packet:ident) => {
-                out.push_str(concat!(
-                    "pub fn ",
-                    stringify!($encode),
-                    "(packet: &",
-                    stringify!($packet),
-                    ") -> wincode::WriteResult<Vec<u8>> {\n",
-                    "    wincode::serialize(packet)\n",
-                    "}\n\n",
-                    "pub fn ",
-                    stringify!($decode),
-                    "(bytes: &[u8]) -> wincode::ReadResult<",
-                    stringify!($packet),
-                    "> {\n",
-                    "    wincode::deserialize(bytes)\n",
-                    "}\n\n",
-                ));
-            };
+        write_codec_fn(&mut out, "encode_c2s", "decode_c2s", "C2SPacket");
+        write_codec_fn(&mut out, "encode_s2c", "decode_s2c", "S2CPacket");
+
+        if schema.typedefs.iter().any(|typedef_def| typedef_def.name == "EnvelopeId") {
+            write_decode_module(&mut out);
         }
 
-        codec_fns!(encode_c2s, decode_c2s, C2SPacket);
-        codec_fns!(encode_s2c, decode_s2c, S2CPacket);
         out.truncate(out.trim_end().len());
 
         Ok(out)
     }
 }
+
+fn write_bitmask(out: &mut String, bitmask_def: &BitmaskDef) {
+    writeln!(out, "{SCHEMA_DERIVE}").expect("writing to String should not fail");
+    writeln!(out, "#[repr(transparent)]").expect("writing to String should not fail");
+    writeln!(out, "pub struct {}(pub {});", bitmask_def.name, bitmask_def.ty)
+        .expect("writing to String should not fail");
+    writeln!(out, "impl {} {{", bitmask_def.name).expect("writing to String should not fail");
+    writeln!(out, "    pub const NONE: Self = Self(0);")
+        .expect("writing to String should not fail");
+    for flag in &bitmask_def.flags {
+        writeln!(out, "    pub const {}: Self = Self({});", to_upper_snake(&flag.name), flag.value)
+            .expect("writing to String should not fail");
+    }
+    writeln!(out, "    pub fn bits(self) -> {} {{", bitmask_def.ty)
+        .expect("writing to String should not fail");
+    writeln!(out, "        self.0").expect("writing to String should not fail");
+    writeln!(out, "    }}").expect("writing to String should not fail");
+    writeln!(out, "    pub fn contains(self, other: Self) -> bool {{")
+        .expect("writing to String should not fail");
+    writeln!(out, "        (self.0 & other.0) == other.0")
+        .expect("writing to String should not fail");
+    writeln!(out, "    }}").expect("writing to String should not fail");
+    writeln!(out, "}}").expect("writing to String should not fail");
+    writeln!(out).expect("writing to String should not fail");
+    writeln!(out, "impl std::ops::BitOr for {} {{", bitmask_def.name)
+        .expect("writing to String should not fail");
+    writeln!(out, "    type Output = Self;").expect("writing to String should not fail");
+    writeln!(out, "    fn bitor(self, rhs: Self) -> Self::Output {{")
+        .expect("writing to String should not fail");
+    writeln!(out, "        Self(self.0 | rhs.0)").expect("writing to String should not fail");
+    writeln!(out, "    }}").expect("writing to String should not fail");
+    writeln!(out, "}}").expect("writing to String should not fail");
+    writeln!(out).expect("writing to String should not fail");
+    writeln!(out, "impl std::ops::BitOrAssign for {} {{", bitmask_def.name)
+        .expect("writing to String should not fail");
+    writeln!(out, "    fn bitor_assign(&mut self, rhs: Self) {{")
+        .expect("writing to String should not fail");
+    writeln!(out, "        self.0 |= rhs.0;").expect("writing to String should not fail");
+    writeln!(out, "    }}").expect("writing to String should not fail");
+    writeln!(out, "}}").expect("writing to String should not fail");
+    writeln!(out).expect("writing to String should not fail");
+}
+
+fn write_plain_enum(out: &mut String, enum_def: &EnumDef) {
+    writeln!(out, "{SCHEMA_DERIVE}").expect("writing to String should not fail");
+    writeln!(out, "pub enum {} {{", enum_def.name).expect("writing to String should not fail");
+    for variant in &enum_def.variants {
+        writeln!(out, "    {},", variant).expect("writing to String should not fail");
+    }
+    writeln!(out, "}}").expect("writing to String should not fail");
+    writeln!(out).expect("writing to String should not fail");
+}
+
+fn write_packet_enum<'a>(
+    out: &mut String,
+    name: &str,
+    packets: impl IntoIterator<Item = &'a PacketDef>,
+) {
+    writeln!(out, "{PACKET_DERIVE}").expect("writing to String should not fail");
+    writeln!(out, "pub enum {} {{", name).expect("writing to String should not fail");
+    for packet in packets {
+        if packet.fields.is_empty() {
+            writeln!(out, "    {},", packet.name).expect("writing to String should not fail");
+            continue;
+        }
+
+        writeln!(out, "    {} {{", packet.name).expect("writing to String should not fail");
+        for field in &packet.fields {
+            writeln!(out, "        {}: {},", field.name, field.ty)
+                .expect("writing to String should not fail");
+        }
+        writeln!(out, "    }},").expect("writing to String should not fail");
+    }
+    writeln!(out, "}}").expect("writing to String should not fail");
+    writeln!(out).expect("writing to String should not fail");
+}
+
+fn write_codec_fn(out: &mut String, encode_name: &str, decode_name: &str, packet_name: &str) {
+    writeln!(
+        out,
+        "\
+pub fn {encode_name}(packet: &{packet_name}) -> wincode::WriteResult<Vec<u8>> {{
+    wincode::serialize(packet)
+}}
+
+pub fn {decode_name}(bytes: &[u8]) -> wincode::ReadResult<{packet_name}> {{
+    wincode::deserialize(bytes)
+}}
+"
+    )
+    .expect("writing to String should not fail");
+}
+
+fn write_decode_module(out: &mut String) {
+    writeln!(
+        out,
+        "{}",
+        r#"
+pub mod decode {
+    use super::{decode_s2c, EnvelopeId, S2CPacket};
+
+    #[derive(Debug, Clone)]
+    pub struct DecodedEnvelope {
+        pub id: Option<EnvelopeId>,
+        pub receipt_id: Option<EnvelopeId>,
+        pub dependency_id: Option<EnvelopeId>,
+        pub packets: Vec<S2CPacket>,
+    }
+
+    pub fn s2c_envelope(bytes: &[u8]) -> Option<DecodedEnvelope> {
+        const ENVELOPE_VERSION: u8 = 1;
+        const FLAG_HAS_ID: u8 = 1 << 0;
+        const FLAG_CLIENT_PROCESSED_RECEIPT: u8 = 1 << 1;
+        const FLAG_HAS_DEPENDENCY: u8 = 1 << 2;
+
+        if bytes.len() < 2 || bytes[0] != ENVELOPE_VERSION {
+            return None;
+        }
+
+        let flags = bytes[1];
+        let mut cursor = 2usize;
+        let id = if flags & FLAG_HAS_ID != 0 {
+            read_envelope_id(bytes, &mut cursor)
+        } else {
+            None
+        };
+        let receipt_id = if flags & FLAG_CLIENT_PROCESSED_RECEIPT != 0 {
+            Some(id?)
+        } else {
+            None
+        };
+        let dependency_id = if flags & FLAG_HAS_DEPENDENCY != 0 {
+            read_envelope_id(bytes, &mut cursor)
+        } else {
+            None
+        };
+        let mut packets = Vec::new();
+        while cursor < bytes.len() {
+            let frame = read_frame(bytes, &mut cursor)?;
+            packets.push(decode_s2c(frame).ok()?);
+        }
+        if packets.is_empty() {
+            return None;
+        }
+        Some(DecodedEnvelope { id, receipt_id, dependency_id, packets })
+    }
+
+    fn read_envelope_id(bytes: &[u8], cursor: &mut usize) -> Option<EnvelopeId> {
+        if bytes.len() < *cursor + 16 {
+            return None;
+        }
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&bytes[*cursor..*cursor + 16]);
+        *cursor += 16;
+        Some(u128::from_be_bytes(raw))
+    }
+
+    fn read_frame<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+        if bytes.len() < *cursor + 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes([
+            bytes[*cursor],
+            bytes[*cursor + 1],
+            bytes[*cursor + 2],
+            bytes[*cursor + 3],
+        ]) as usize;
+        *cursor += 4;
+        if bytes.len() < *cursor + len {
+            return None;
+        }
+        let payload = &bytes[*cursor..*cursor + len];
+        *cursor += len;
+        Some(payload)
+    }
+}
+"#
+    )
+    .expect("writing to String should not fail");
+}
+
+const SCHEMA_DERIVE: &str = r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
+
+const PACKET_DERIVE: &str = r#"#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
 
 fn to_upper_snake(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 4);
