@@ -7,6 +7,11 @@ pub fn serialize_s2c_packet(packet: &S2CPacket) -> Option<Vec<u8>> {
     encode_s2c(packet).ok()
 }
 
+pub fn serialize_s2c_packet_message(packet: &S2CPacket) -> Option<Vec<u8>> {
+    let envelope = PacketEnvelope::single(crate::packets::PacketTarget::Broadcast, packet.clone());
+    serialize_packet_message(&PacketMessage::Envelope(envelope))
+}
+
 pub fn serialize_packet_message(message: &PacketMessage) -> Option<Vec<u8>> {
     match message {
         PacketMessage::Envelope(envelope) => {

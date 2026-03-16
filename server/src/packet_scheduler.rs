@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
+use crate::network_trace::{DispatchTraceMeta, SchedulerTraceEvent};
 use crate::packets::{
     DeliveryPolicy, DropReason, MessageId, PacketMeta, PacketOrder, PacketPriority,
 };
@@ -32,6 +33,7 @@ pub struct DispatchMessage {
     pub id: Option<MessageId>,
     pub meta: PacketMeta,
     pub framed: Vec<u8>,
+    pub trace: DispatchTraceMeta,
 }
 
 impl DispatchMessage {
@@ -40,8 +42,9 @@ impl DispatchMessage {
         id: Option<MessageId>,
         meta: PacketMeta,
         framed: Vec<u8>,
+        trace: DispatchTraceMeta,
     ) -> Self {
-        Self { kind, id, meta, framed }
+        Self { kind, id, meta, framed, trace }
     }
 
     pub fn priority(&self) -> PacketPriority {
@@ -96,6 +99,10 @@ impl DispatchMessage {
             DispatchKind::Resource => "resource",
         }
     }
+
+    pub fn trace(&self) -> &DispatchTraceMeta {
+        &self.trace
+    }
 }
 
 #[derive(Clone)]
@@ -135,6 +142,7 @@ pub struct PacketScheduler {
     deferred_sequences: HashMap<Uuid, VecDeque<ScheduledMessage>>,
     blocked_commands: VecDeque<SchedulerCommand>,
     barrier_pending: bool,
+    trace_events: Vec<SchedulerTraceEvent>,
 }
 
 impl PacketScheduler {
@@ -144,6 +152,7 @@ impl PacketScheduler {
             deferred_sequences: HashMap::new(),
             blocked_commands: VecDeque::new(),
             barrier_pending: false,
+            trace_events: Vec::new(),
         }
     }
 
@@ -153,15 +162,25 @@ impl PacketScheduler {
             self.deferred_sequences.clear();
             self.blocked_commands.clear();
             self.barrier_pending = false;
+            self.trace_events.push(SchedulerTraceEvent::ClearedTransportState);
             return vec![SchedulerAction::ClearTransportState];
         }
 
         if self.barrier_pending {
+            self.trace_events.push(SchedulerTraceEvent::BlockedByBarrier {
+                flow_id: command_flow_id(&command),
+                command: command_name(&command),
+            });
             self.blocked_commands.push_back(command);
             return Vec::new();
         }
 
         if self.conflicts_with_deferred(&command) {
+            self.trace_events.push(SchedulerTraceEvent::BlockedByDeferred {
+                flow_id: command_flow_id(&command),
+                command: command_name(&command),
+                order_domain: command_order_domain(&command),
+            });
             self.blocked_commands.push_back(command);
             return Vec::new();
         }
@@ -180,12 +199,17 @@ impl PacketScheduler {
     pub fn on_inflight_drained(&mut self, now: Instant) -> Vec<SchedulerAction> {
         if self.barrier_pending {
             self.barrier_pending = false;
+            self.trace_events.push(SchedulerTraceEvent::BarrierReleased);
         }
         self.poll(now, false)
     }
 
     pub fn requeue_deferred_message(&mut self, message: DispatchMessage, now: Instant) {
         let scheduled = ScheduledMessage::new(message, now);
+        self.trace_events.push(SchedulerTraceEvent::RequeuedCongestion {
+            trace: scheduled.message.trace().clone(),
+            queued_messages: self.queue_len_for_domain(scheduled.message.domain()) + 1,
+        });
         match scheduled.message.domain() {
             OrderDomain::Independent => insert_requeued(&mut self.deferred_independent, scheduled),
             OrderDomain::Sequence(sequence_id) => {
@@ -202,6 +226,10 @@ impl PacketScheduler {
             || !self.blocked_commands.is_empty()
     }
 
+    pub fn take_trace_events(&mut self) -> Vec<SchedulerTraceEvent> {
+        std::mem::take(&mut self.trace_events)
+    }
+
     fn process_command_now(
         &mut self,
         command: SchedulerCommand,
@@ -210,6 +238,14 @@ impl PacketScheduler {
         match command {
             SchedulerCommand::Message(message) => {
                 if should_initially_defer(message.priority()) {
+                    let queue_name = queue_name(message.domain());
+                    let queued_messages = self.queue_len_for_domain(message.domain()) + 1;
+                    self.trace_events.push(SchedulerTraceEvent::DeferredInitial {
+                        trace: message.trace().clone(),
+                        policy: priority_name(message.priority()),
+                        queue_name,
+                        queued_messages,
+                    });
                     self.enqueue_deferred_message(message, now);
                     self.poll(now, false)
                 } else {
@@ -223,6 +259,7 @@ impl PacketScheduler {
             SchedulerCommand::Barrier => {
                 let mut actions = self.pump_deferred(now, true);
                 self.barrier_pending = true;
+                self.trace_events.push(SchedulerTraceEvent::BarrierBegin);
                 actions.push(SchedulerAction::BeginBarrier);
                 actions
             },
@@ -261,6 +298,17 @@ impl PacketScheduler {
         }
     }
 
+    fn queue_len_for_domain(&self, domain: OrderDomain) -> usize {
+        match domain {
+            OrderDomain::Independent => self.deferred_independent.len(),
+            OrderDomain::Sequence(sequence_id) => self
+                .deferred_sequences
+                .get(&sequence_id)
+                .map(|queue| queue.len())
+                .unwrap_or(0),
+        }
+    }
+
     fn pump_deferred(&mut self, now: Instant, force_flush: bool) -> Vec<SchedulerAction> {
         let mut actions = self.pump_deferred_queue(None, now, force_flush);
         let sequence_ids: Vec<Uuid> = self.deferred_sequences.keys().copied().collect();
@@ -289,6 +337,11 @@ impl PacketScheduler {
                     let Some(scheduled) = queue.pop_front() else {
                         break;
                     };
+                    self.trace_events.push(SchedulerTraceEvent::Dropped {
+                        trace: scheduled.message.trace().clone(),
+                        reason,
+                        queue_name: queue_name(scheduled.message.domain()),
+                    });
                     actions
                         .push(SchedulerAction::DropMessage { message: scheduled.message, reason });
                 },
@@ -296,6 +349,11 @@ impl PacketScheduler {
                     let Some(scheduled) = queue.pop_front() else {
                         break;
                     };
+                    self.trace_events.push(SchedulerTraceEvent::DispatchReady {
+                        trace: scheduled.message.trace().clone(),
+                        force_flush,
+                        queue_name: queue_name(scheduled.message.domain()),
+                    });
                     actions.push(SchedulerAction::DispatchMessage {
                         message: scheduled.message,
                         force_flush,
@@ -335,6 +393,49 @@ impl PacketScheduler {
         }
 
         actions
+    }
+}
+
+fn command_name(command: &SchedulerCommand) -> &'static str {
+    match command {
+        SchedulerCommand::Message(_) => "message",
+        SchedulerCommand::SequenceClose(_) => "sequence_close",
+        SchedulerCommand::SequenceCloseAll => "sequence_close_all",
+        SchedulerCommand::Clear => "clear",
+        SchedulerCommand::Barrier => "barrier",
+    }
+}
+
+fn command_flow_id(command: &SchedulerCommand) -> Option<u64> {
+    match command {
+        SchedulerCommand::Message(message) => Some(message.trace().flow_id),
+        _ => None,
+    }
+}
+
+fn command_order_domain(command: &SchedulerCommand) -> String {
+    match command {
+        SchedulerCommand::Message(message) => format!("{:?}", message.domain()),
+        SchedulerCommand::SequenceClose(sequence_id) => format!("Sequence({sequence_id})"),
+        SchedulerCommand::SequenceCloseAll => "AllSequences".to_string(),
+        SchedulerCommand::Clear => "All".to_string(),
+        SchedulerCommand::Barrier => "Independent".to_string(),
+    }
+}
+
+fn queue_name(domain: OrderDomain) -> &'static str {
+    match domain {
+        OrderDomain::Independent => "independent",
+        OrderDomain::Sequence(_) => "sequence",
+    }
+}
+
+fn priority_name(priority: PacketPriority) -> &'static str {
+    match priority {
+        PacketPriority::Normal => "normal",
+        PacketPriority::Droppable => "droppable",
+        PacketPriority::Deadline { .. } => "deadline",
+        PacketPriority::Coalescing { .. } => "coalescing",
     }
 }
 
@@ -449,6 +550,13 @@ mod tests {
                 delivery: DeliveryPolicy::None,
             },
             framed: vec![0; framed_len],
+            trace: DispatchTraceMeta {
+                flow_id: 1,
+                packet_label: "test".to_string(),
+                message_id: id,
+                payload_bytes: framed_len,
+                target_label: "Broadcast".to_string(),
+            },
         }
     }
 

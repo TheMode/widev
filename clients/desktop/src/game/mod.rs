@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -23,7 +24,6 @@ mod renderer;
 const LERP_ALPHA: f32 = 0.35;
 const PREDICTION_CORRECTION_ALPHA: f32 = 0.12;
 const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
-const PING_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_SMOOTHING_ALPHA: f64 = 0.06;
 const PLAYER_SIZE: f32 = 32.0;
 const DEFAULT_ELEMENT_TINT: protocol::Color = [1.0, 0.0, 0.0, 1.0];
@@ -317,9 +317,6 @@ pub(super) struct ClientGame {
     bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
     pending_prediction: HashMap<u32, PredictionConfig>,
-    pending_ping_nonces: HashMap<u64, Instant>,
-    next_ping_nonce: u64,
-    last_ping_sent_at: Instant,
     smoothed_path_rtt: Option<Duration>,
     render_revision: u64,
 }
@@ -343,9 +340,6 @@ impl ClientGame {
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
             pending_prediction: HashMap::new(),
-            pending_ping_nonces: HashMap::new(),
-            next_ping_nonce: 1,
-            last_ping_sent_at: Instant::now(),
             smoothed_path_rtt: None,
             render_revision: 0,
         })
@@ -356,10 +350,7 @@ impl ClientGame {
 
         self.ensure_server_identity_logged();
 
-        for bytes in incoming.datagrams.into_iter().chain(incoming.streams) {
-            let Some(message) = protocol::decode::server_message(&bytes) else {
-                continue;
-            };
+        for message in incoming.messages {
             self.packet_chain.push(message);
         }
         self.process_ready_messages()?;
@@ -376,7 +367,6 @@ impl ClientGame {
             self.phase = ClientPhase::Handshaking;
             log::info!("connected to server {}", self.net.server_addr());
         }
-        self.maybe_send_ping()?;
         self.update_smoothed_latency();
 
         for element in self.elements.values_mut() {
@@ -389,8 +379,6 @@ impl ClientGame {
     pub(super) fn handle_network_change(&mut self) -> Result<()> {
         self.net.handle_network_change()?;
         self.smoothed_path_rtt = None;
-        self.pending_ping_nonces.clear();
-        self.last_ping_sent_at = Instant::now();
         Ok(())
     }
 
@@ -496,6 +484,13 @@ impl ClientGame {
 
     pub(super) fn latency_snapshot(&self) -> LatencySnapshot {
         LatencySnapshot { connected: self.net.is_established(), quiche_rtt: self.smoothed_path_rtt }
+    }
+
+    pub(super) fn set_network_waker(
+        &mut self,
+        wake_notifier: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.net.set_wake_notifier(wake_notifier);
     }
 
     fn update_smoothed_latency(&mut self) {
@@ -673,30 +668,28 @@ impl ClientGame {
         }
     }
 
+    fn reset_scene(&mut self) {
+        let removed_elements: Vec<(u32, Option<protocol::MessageId>)> = self
+            .elements
+            .drain()
+            .map(|(element_id, element)| (element_id, element.texture_id))
+            .collect();
+        for (element_id, texture_id) in removed_elements {
+            if let Some(resource_id) = texture_id {
+                self.release_resource_binding(resource_id, element_id);
+            }
+        }
+        self.pending_prediction.clear();
+        self.bump_render_revision();
+        log::info!("scene reset");
+    }
+
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
                 log::info!("server tick rate: {tick_rate_hz}Hz");
             },
-            protocol::S2CPacket::Ping { nonce } => {
-                self.send_c2s(protocol::C2SPacket::Pong { nonce })?;
-            },
-            protocol::S2CPacket::Pong { nonce } => {
-                if let Some(sent_at) = self.pending_ping_nonces.remove(&nonce) {
-                    let rtt = sent_at.elapsed();
-                    let rtt_ms = rtt.as_secs_f64() * 1000.0;
-                    let quiche_rtt_ms = self
-                        .net
-                        .path_rtt()
-                        .map(|rtt| rtt.as_secs_f64() * 1000.0)
-                        .unwrap_or_default();
-                    log::debug!(
-                        "client latency: {:.2}ms (quiche_rtt={:.2}ms)",
-                        rtt_ms,
-                        quiche_rtt_ms
-                    );
-                }
-            },
+            protocol::S2CPacket::Ping { .. } | protocol::S2CPacket::Pong { .. } => {},
             protocol::S2CPacket::SetGameName { name } => {
                 self.bootstrap.set_game_name(name);
             },
@@ -705,6 +698,9 @@ impl ClientGame {
                     self.phase = ClientPhase::JoinedPendingWindow;
                     log::info!("join received; client can initialize surfaces and render");
                 }
+            },
+            protocol::S2CPacket::ResetScene {} => {
+                self.reset_scene();
             },
             protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
                 self.bootstrap.apply_surface_dimension_lock(surface_id, width, height);
@@ -792,7 +788,7 @@ impl ClientGame {
         }
 
         if let Some(message_id) = receipt_id {
-            self.send_when_connected(protocol::C2SPacket::Receipt { message_id })?;
+            self.send_c2s(protocol::C2SPacket::Receipt { message_id })?;
         }
 
         Ok(())
@@ -810,25 +806,8 @@ impl ClientGame {
     }
 
     fn send_c2s(&mut self, packet: protocol::C2SPacket) -> Result<()> {
-        if let Ok(bytes) = protocol::encode_c2s(&packet) {
-            self.net.send_datagram(&bytes)?;
-        }
+        self.net.send_packet(packet)?;
         Ok(())
-    }
-
-    fn maybe_send_ping(&mut self) -> Result<()> {
-        if !self.net.is_established() {
-            return Ok(());
-        }
-        if self.last_ping_sent_at.elapsed() < PING_INTERVAL {
-            return Ok(());
-        }
-
-        let nonce = self.next_ping_nonce;
-        self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1).max(1);
-        self.pending_ping_nonces.insert(nonce, Instant::now());
-        self.last_ping_sent_at = Instant::now();
-        self.send_c2s(protocol::C2SPacket::Ping { nonce })
     }
 
     fn store_resource(

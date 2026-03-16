@@ -14,7 +14,10 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
-use crate::packet_codec::{decode_c2s_packet, serialize_packet_message, serialize_s2c_packet};
+use crate::network_trace::{DispatchTraceMeta, NetworkTracer, SessionSnapshot, SessionTracer};
+use crate::packet_codec::{
+    decode_c2s_packet, serialize_packet_message, serialize_s2c_packet_message,
+};
 use crate::packet_scheduler::{
     DispatchKind, DispatchMessage, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
@@ -133,6 +136,7 @@ impl NetworkRuntime {
     pub fn start(bind_addr: SocketAddr) -> Result<Self> {
         let worker_count =
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1);
+        let tracer = NetworkTracer::from_env();
 
         let socket = bind_udp_socket(bind_addr)
             .with_context(|| format!("failed to bind UDP socket at {bind_addr}"))?;
@@ -169,6 +173,7 @@ impl NetworkRuntime {
             let event_tx = event_tx.clone();
             let io_running = Arc::clone(&running);
             let next_client_id = Arc::clone(&next_client_id);
+            let worker_tracer = Arc::clone(&tracer);
             let handle = thread::spawn(move || {
                 if let Err(err) = run_io_thread(
                     worker_id,
@@ -179,6 +184,7 @@ impl NetworkRuntime {
                     event_tx,
                     io_running,
                     next_client_id,
+                    worker_tracer,
                 ) {
                     log::error!("I/O worker {worker_id} crashed: {err:#}");
                 }
@@ -376,6 +382,7 @@ fn run_io_thread(
     event_tx: mpsc::Sender<NetworkEvent>,
     running: Arc<AtomicBool>,
     next_client_id: Arc<AtomicU32>,
+    tracer: Arc<NetworkTracer>,
 ) -> Result<()> {
     let send_udp_state = quinn_udp::UdpSocketState::new((&socket).into())
         .context("failed to initialize UDP sender state")?;
@@ -386,6 +393,7 @@ fn run_io_thread(
         build_server_quic_config()?,
         event_tx,
         next_client_id,
+        tracer,
     );
     let mut delayed_datagrams: BinaryHeap<PacedDatagram> = BinaryHeap::new();
     let mut ready_datagrams: VecDeque<PacedDatagram> = VecDeque::new();
@@ -475,12 +483,17 @@ fn process_sessions_tick(
         pump_app_packets(session, app_buf, &shard.event_tx);
         session.poll_scheduler();
         session.maybe_send_ping();
+        session.maybe_log_network_snapshot();
 
         let stream_flush_failed = session.flush_stream_writes().is_err();
         session.poll_scheduler();
         let quic_flush_failed =
             flush_quic(session, send_buf, delayed_datagrams, ready_datagrams).is_err();
-        if stream_flush_failed || quic_flush_failed || session.conn.is_closed() {
+        if stream_flush_failed
+            || quic_flush_failed
+            || session.conn.is_closed()
+            || session.disconnect_requested
+        {
             disconnected.push(client_id);
         }
     }
@@ -509,6 +522,7 @@ struct ShardState {
     worker_count: usize,
     local_addr: SocketAddr,
     config: quiche::Config,
+    tracer: Arc<NetworkTracer>,
     sessions: HashMap<ClientId, Session>,
     client_id_by_cid: HashMap<Vec<u8>, ClientId>,
     quic_timeouts: BinaryHeap<QuicTimeout>,
@@ -524,12 +538,14 @@ impl ShardState {
         config: quiche::Config,
         event_tx: mpsc::Sender<NetworkEvent>,
         next_client_id: Arc<AtomicU32>,
+        tracer: Arc<NetworkTracer>,
     ) -> Self {
         Self {
             worker_id,
             worker_count,
             local_addr,
             config,
+            tracer,
             sessions: HashMap::new(),
             client_id_by_cid: HashMap::new(),
             quic_timeouts: BinaryHeap::new(),
@@ -735,7 +751,8 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
         },
     };
 
-    let mut session = Session::new(client_id, client_addr, shard.event_tx.clone(), conn);
+    let mut session =
+        Session::new(client_id, client_addr, shard.event_tx.clone(), Arc::clone(&shard.tracer), conn);
     recv_on_session(
         &mut session,
         &mut pkt_buf,
@@ -840,6 +857,7 @@ fn dispatch_control_for_thread(shard: &mut ShardState, control: PacketControl) {
     match control {
         PacketControl::SequenceClose { sequence_id } => {
             for session in shard.sessions.values_mut() {
+                session.tracer.on_control(control);
                 session.dispatch_scheduler_command(SchedulerCommand::SequenceClose(sequence_id));
             }
         },
@@ -865,6 +883,15 @@ fn dispatch_control_to_target(
     }
 
     for_each_target_session_mut(shard, target, |session| {
+        session.tracer.on_control(match &command {
+            SchedulerCommand::SequenceClose(sequence_id) => PacketControl::SequenceClose {
+                sequence_id: *sequence_id,
+            },
+            SchedulerCommand::SequenceCloseAll => PacketControl::SequenceCloseAll { target },
+            SchedulerCommand::Clear => PacketControl::Clear { target },
+            SchedulerCommand::Barrier => PacketControl::Barrier { target },
+            SchedulerCommand::Message(_) => return,
+        });
         session.dispatch_scheduler_command(command.clone())
     });
 }
@@ -933,7 +960,7 @@ fn pump_app_packets(
     loop {
         match session.conn.dgram_recv(app_buf) {
             Ok(len) => {
-                decode_and_forward_c2s(session, &app_buf[..len], event_tx);
+                decode_and_forward_c2s(session, &app_buf[..len], "datagram", event_tx);
             },
             Err(quiche::Error::Done) => break,
             Err(_) => break,
@@ -947,7 +974,7 @@ fn pump_app_packets(
                 Ok((len, fin)) => {
                     let frames = session.ingest_stream_data(stream_id, &app_buf[..len], fin);
                     for frame in frames {
-                        decode_and_forward_c2s(session, &frame, event_tx);
+                        decode_and_forward_c2s(session, &frame, "stream", event_tx);
                     }
                     if fin {
                         break;
@@ -963,15 +990,24 @@ fn pump_app_packets(
 fn decode_and_forward_c2s(
     session: &mut Session,
     bytes: &[u8],
+    transport: &str,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match decode_c2s_packet(bytes) {
         Some(crate::packets::C2SPacket::Ping { nonce }) => {
-            if let Some(bytes) = serialize_s2c_packet(&crate::packets::S2CPacket::Pong { nonce }) {
+            session
+                .tracer
+                .on_rx_packet(transport, bytes.len(), &crate::packets::C2SPacket::Ping { nonce });
+            if let Some(bytes) =
+                serialize_s2c_packet_message(&crate::packets::S2CPacket::Pong { nonce })
+            {
                 let _ = session.conn.dgram_send(&bytes);
             }
         },
         Some(crate::packets::C2SPacket::Pong { nonce }) => {
+            session
+                .tracer
+                .on_rx_packet(transport, bytes.len(), &crate::packets::C2SPacket::Pong { nonce });
             if let Some(sent_at) = session.pending_ping_nonces.remove(&nonce) {
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
                 let quiche_rtt_ms = session
@@ -989,17 +1025,35 @@ fn decode_and_forward_c2s(
             }
         },
         Some(crate::packets::C2SPacket::Receipt { message_id }) => {
+            session.tracer.on_rx_packet(
+                transport,
+                bytes.len(),
+                &crate::packets::C2SPacket::Receipt { message_id },
+            );
+            session
+                .tracer
+                .on_transport_outcome(message_id, crate::packets::DeliveryOutcome::ClientProcessed);
             let _ = event_tx.send(NetworkEvent::DeliveryUpdate {
                 client_id: session.client_id,
                 message_id,
                 outcome: crate::packets::DeliveryOutcome::ClientProcessed,
             });
         },
+        Some(crate::packets::C2SPacket::Disconnect {}) => {
+            session.tracer.on_rx_packet(
+                transport,
+                bytes.len(),
+                &crate::packets::C2SPacket::Disconnect {},
+            );
+            session.disconnect_requested = true;
+            let _ = session.conn.close(true, 0, b"client_disconnect");
+        },
         Some(packet) => {
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet);
             let _ =
                 event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
         },
-        None => {},
+        None => session.tracer.on_rx_decode_failed(transport, bytes.len()),
     }
 }
 
@@ -1175,6 +1229,7 @@ fn ensure_dev_certs(cert_dir: &Path) -> Result<()> {
 struct Session {
     client_id: ClientId,
     event_tx: mpsc::Sender<NetworkEvent>,
+    tracer: SessionTracer,
     conn: Connection,
     client_addr: SocketAddr,
     tracked_scids: HashSet<Vec<u8>>,
@@ -1187,6 +1242,7 @@ struct Session {
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
     queued_stream_bytes: usize,
+    disconnect_requested: bool,
     timeout_generation: u64,
 }
 
@@ -1196,6 +1252,7 @@ struct PendingStreamWrite {
     fin: bool,
     tracks_inflight: bool,
     transport_receipt_id: Option<crate::packets::MessageId>,
+    trace: DispatchTraceMeta,
 }
 
 #[derive(Default)]
@@ -1210,12 +1267,14 @@ impl Session {
         client_id: ClientId,
         client_addr: SocketAddr,
         event_tx: mpsc::Sender<NetworkEvent>,
+        tracer: Arc<NetworkTracer>,
         conn: Connection,
     ) -> Self {
         let tracked_scids = conn.source_ids().map(|cid| cid.as_ref().to_vec()).collect();
         Self {
             client_id,
             event_tx,
+            tracer: SessionTracer::new(tracer, client_id),
             conn,
             client_addr,
             tracked_scids,
@@ -1228,6 +1287,7 @@ impl Session {
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
             queued_stream_bytes: 0,
+            disconnect_requested: false,
             timeout_generation: 0,
         }
     }
@@ -1245,8 +1305,11 @@ impl Session {
         self.pending_ping_nonces.insert(nonce, Instant::now());
         self.last_ping_sent_at = Instant::now();
 
-        if let Some(bytes) = serialize_s2c_packet(&crate::packets::S2CPacket::Ping { nonce }) {
+        if let Some(bytes) =
+            serialize_s2c_packet_message(&crate::packets::S2CPacket::Ping { nonce })
+        {
             let _ = self.conn.dgram_send(&bytes);
+            self.tracer.on_keepalive_ping(bytes.len(), nonce);
         }
     }
 
@@ -1304,30 +1367,36 @@ impl Session {
     }
 
     fn send_envelope(&mut self, envelope: &PacketEnvelope, framed: &[u8]) {
+        let trace = self.tracer.register_envelope(envelope, framed.len());
         self.dispatch_scheduler_command(SchedulerCommand::Message(DispatchMessage::new(
             DispatchKind::Envelope,
             envelope.id,
             envelope.meta,
             framed.to_vec(),
+            trace,
         )));
     }
 
     fn send_resource(&mut self, resource: &PacketResource, framed: &[u8]) {
+        let trace = self.tracer.register_resource(resource, framed.len());
         self.dispatch_scheduler_command(SchedulerCommand::Message(DispatchMessage::new(
             DispatchKind::Resource,
             Some(resource.id),
             resource.meta,
             framed.to_vec(),
+            trace,
         )));
     }
 
     fn dispatch_scheduler_command(&mut self, command: SchedulerCommand) {
         let actions = self.scheduler.push(command, Instant::now());
+        self.drain_scheduler_trace();
         self.execute_scheduler_actions(actions);
     }
 
     fn poll_scheduler(&mut self) {
         let actions = self.scheduler.poll(Instant::now(), false);
+        self.drain_scheduler_trace();
         self.execute_scheduler_actions(actions);
     }
 
@@ -1338,6 +1407,7 @@ impl Session {
             if let Some(follow_up) = self.execute_scheduler_action(action) {
                 actions.extend(follow_up);
             }
+            self.drain_scheduler_trace();
             index += 1;
         }
     }
@@ -1354,6 +1424,10 @@ impl Session {
                         self.emit_delivery_update(
                             message.delivery(),
                             message.maybe_id(),
+                            crate::packets::DeliveryOutcome::TransportDropped { reason },
+                        );
+                        self.finish_untracked_flow(
+                            &message,
                             crate::packets::DeliveryOutcome::TransportDropped { reason },
                         );
                         None
@@ -1377,8 +1451,11 @@ impl Session {
                 None
             },
             SchedulerAction::BeginBarrier => {
+                self.drain_scheduler_trace();
                 if self.inflight_message_count == 0 {
-                    Some(self.scheduler.on_inflight_drained(Instant::now()))
+                    let actions = self.scheduler.on_inflight_drained(Instant::now());
+                    self.drain_scheduler_trace();
+                    Some(actions)
                 } else {
                     None
                 }
@@ -1387,6 +1464,10 @@ impl Session {
                 self.emit_delivery_update(
                     message.delivery(),
                     message.maybe_id(),
+                    crate::packets::DeliveryOutcome::TransportDropped { reason },
+                );
+                self.finish_untracked_flow(
+                    &message,
                     crate::packets::DeliveryOutcome::TransportDropped { reason },
                 );
                 log::debug!(
@@ -1412,6 +1493,8 @@ impl Session {
     }
 
     fn send_datagram(&mut self, message: &DispatchMessage) -> EnvelopeDispatchResult {
+        self.tracer
+            .on_datagram_attempt(message.trace(), self.conn.dgram_max_writable_len());
         match self.conn.dgram_send(message.framed()) {
             Ok(()) => {
                 self.emit_delivery_update(
@@ -1425,6 +1508,12 @@ impl Session {
                     message.kind_name(),
                     message.maybe_id(),
                     message.order()
+                );
+                self.tracer.on_datagram_result(
+                    message.trace(),
+                    "sent",
+                    format!("bytes={}", message.payload_len()),
+                    Some(crate::packets::DeliveryOutcome::TransportDelivered),
                 );
                 EnvelopeDispatchResult::Sent
             },
@@ -1447,6 +1536,21 @@ impl Session {
                     message.maybe_id(),
                     message.order()
                 );
+                self.tracer.on_datagram_result(
+                    message.trace(),
+                    match result {
+                        EnvelopeDispatchResult::DeferredByCongestion => "deferred",
+                        EnvelopeDispatchResult::Dropped(_) => "dropped",
+                        EnvelopeDispatchResult::Sent => "sent",
+                    },
+                    "reason=datagram_not_writable".to_string(),
+                    match result {
+                        EnvelopeDispatchResult::Dropped(reason) => {
+                            Some(crate::packets::DeliveryOutcome::TransportDropped { reason })
+                        },
+                        _ => None,
+                    },
+                );
                 result
             },
             Err(err) => {
@@ -1454,6 +1558,14 @@ impl Session {
                     "dropping datagram {} for client {} after dgram_send error: {err:?}",
                     message.kind_name(),
                     self.client_id,
+                );
+                self.tracer.on_datagram_result(
+                    message.trace(),
+                    "dropped",
+                    format!("reason=error error={err:?}"),
+                    Some(crate::packets::DeliveryOutcome::TransportDropped {
+                        reason: DropReason::DatagramRejected,
+                    }),
                 );
                 EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected)
             },
@@ -1549,6 +1661,9 @@ impl Session {
         }
 
         let StreamTarget { stream_id, fin } = self.resolve_stream_target(message.order());
+        let transport_reason = self.stream_transport_reason(&message);
+        self.tracer
+            .on_stream_transport_selected(message.trace(), stream_id, fin, &transport_reason);
 
         log::debug!(
             "client {} opening server stream {} for {} {:?} ({:?}, fin={})",
@@ -1570,6 +1685,7 @@ impl Session {
             )
             .then_some(message.maybe_id())
             .flatten(),
+            message.trace().clone(),
         );
         EnvelopeDispatchResult::Sent
     }
@@ -1606,13 +1722,23 @@ impl Session {
         payload: &[u8],
         fin: bool,
         transport_receipt_id: Option<crate::packets::MessageId>,
+        trace: DispatchTraceMeta,
     ) {
         if payload.is_empty() {
             return;
         }
 
+        let queued_before = self.queued_stream_bytes;
+        let inflight_before = self.inflight_message_count;
         self.inflight_message_count = self.inflight_message_count.saturating_add(1);
         self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.len());
+        self.tracer.on_stream_queued(
+            &trace,
+            queued_before,
+            self.queued_stream_bytes,
+            inflight_before,
+            self.inflight_message_count,
+        );
         let state = self.stream_state_mut(stream_id, "tx");
         state.pending_writes.push_back(PendingStreamWrite {
             data: payload.to_vec(),
@@ -1620,6 +1746,7 @@ impl Session {
             fin,
             tracks_inflight: true,
             transport_receipt_id,
+            trace,
         });
     }
 
@@ -1631,6 +1758,8 @@ impl Session {
         for chunk in state.pending_writes.drain(..) {
             if chunk.tracks_inflight {
                 self.inflight_message_count = self.inflight_message_count.saturating_sub(1);
+                self.tracer
+                    .on_flow_aborted(chunk.trace.flow_id, "stream_reset_or_clear");
             }
 
             let remaining = chunk.data.len().saturating_sub(chunk.offset);
@@ -1678,19 +1807,44 @@ impl Session {
                 let send_fin = chunk.fin;
                 match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], send_fin) {
                     Ok(written) => {
+                        let queued_before = self.queued_stream_bytes;
                         chunk.offset += written;
                         self.queued_stream_bytes = self.queued_stream_bytes.saturating_sub(written);
+                        self.tracer.on_stream_write(
+                            &chunk.trace,
+                            stream_id,
+                            written,
+                            chunk.data.len(),
+                            send_fin,
+                            queued_before,
+                            self.queued_stream_bytes,
+                        );
                         if chunk.offset < chunk.data.len() {
+                            self.tracer.on_stream_backpressure(
+                                &chunk.trace,
+                                stream_id,
+                                "partial_write",
+                                chunk.data.len().saturating_sub(chunk.offset),
+                            );
                             self.requeue_pending_write(stream_id, chunk);
                             break;
                         }
                         if chunk.tracks_inflight {
                             if let Some(message_id) = chunk.transport_receipt_id {
+                                self.tracer.on_transport_outcome(
+                                    message_id,
+                                    crate::packets::DeliveryOutcome::TransportDelivered,
+                                );
                                 let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
                                     client_id: self.client_id,
                                     message_id,
                                     outcome: crate::packets::DeliveryOutcome::TransportDelivered,
                                 });
+                            } else {
+                                self.tracer.on_flow_outcome(
+                                    chunk.trace.flow_id,
+                                    crate::packets::DeliveryOutcome::TransportDelivered,
+                                );
                             }
                             self.inflight_message_count =
                                 self.inflight_message_count.saturating_sub(1);
@@ -1706,10 +1860,22 @@ impl Session {
                             self.client_id,
                             stream_id
                         );
+                        self.tracer.on_stream_backpressure(
+                            &chunk.trace,
+                            stream_id,
+                            "stream_limit",
+                            chunk.data.len().saturating_sub(chunk.offset),
+                        );
                         self.requeue_pending_write(stream_id, chunk);
                         break;
                     },
                     Err(quiche::Error::Done) => {
+                        self.tracer.on_stream_backpressure(
+                            &chunk.trace,
+                            stream_id,
+                            "not_writable",
+                            chunk.data.len().saturating_sub(chunk.offset),
+                        );
                         self.requeue_pending_write(stream_id, chunk);
                         break;
                     },
@@ -1739,7 +1905,7 @@ impl Session {
     }
 
     fn emit_delivery_update(
-        &self,
+        &mut self,
         delivery: crate::packets::DeliveryPolicy,
         id: Option<crate::packets::MessageId>,
         outcome: crate::packets::DeliveryOutcome,
@@ -1750,11 +1916,61 @@ impl Session {
         let Some(message_id) = id else {
             return;
         };
+        self.tracer.on_transport_outcome(message_id, outcome);
         let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
             client_id: self.client_id,
             message_id,
             outcome,
         });
+    }
+
+    fn maybe_log_network_snapshot(&mut self) {
+        let rtt_ms = self
+            .conn
+            .path_stats()
+            .next()
+            .map(|stats| stats.rtt.as_secs_f64() * 1000.0);
+        self.tracer.maybe_log_snapshot(SessionSnapshot {
+            established: self.conn.is_established(),
+            rtt_ms,
+            queued_stream_bytes: self.queued_stream_bytes,
+            inflight_messages: self.inflight_message_count,
+            active_streams: self.streams.len(),
+            active_sequences: self.sequence_streams.len(),
+            pending_pings: self.pending_ping_nonces.len(),
+            send_quantum: self.conn.send_quantum(),
+        });
+    }
+
+    fn stream_transport_reason(&self, message: &DispatchMessage) -> String {
+        if !message.is_datagram_eligible() {
+            if message.maybe_id().is_some() {
+                return "datagram_ineligible:id_present".to_string();
+            }
+            return format!("datagram_ineligible:order={:?}", message.order());
+        }
+
+        match self.conn.dgram_max_writable_len() {
+            Some(max_len) if message.payload_len() > max_len => {
+                format!("datagram_ineligible:payload_exceeds_writable_len({max_len})")
+            },
+            Some(_) => "stream_selected_after_datagram_fallback".to_string(),
+            None => "datagram_ineligible:not_writable".to_string(),
+        }
+    }
+
+    fn drain_scheduler_trace(&mut self) {
+        self.tracer.on_scheduler_events(self.scheduler.take_trace_events());
+    }
+
+    fn finish_untracked_flow(
+        &mut self,
+        message: &DispatchMessage,
+        outcome: crate::packets::DeliveryOutcome,
+    ) {
+        if message.maybe_id().is_none() {
+            self.tracer.on_flow_outcome(message.trace().flow_id, outcome);
+        }
     }
 }
 

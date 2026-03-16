@@ -1,4 +1,5 @@
 use std::collections::{hash_map::Entry, HashMap};
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -6,28 +7,39 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use mio::net::UdpSocket as MioUdpSocket;
+use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::RecvInfo;
 use rand::Rng;
 
+use super::packets as protocol;
+
 const MAX_DATAGRAM_SIZE: usize = 1350;
-const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(5);
 const ACTIVE_CONNECTION_ID_LIMIT: u64 = 4;
 const TARGET_ACTIVE_SCIDS: usize = ACTIVE_CONNECTION_ID_LIMIT as usize;
+const SOCKET_TOKEN: Token = Token(0);
+const COMMAND_TOKEN: Token = Token(1);
+const CLIENT_STREAM_ID: u64 = 0;
+
+type WakeNotifier = Arc<dyn Fn() + Send + Sync>;
 
 pub(super) struct IncomingPackets {
-    pub(super) datagrams: Vec<Vec<u8>>,
-    pub(super) streams: Vec<Vec<u8>>,
+    pub(super) messages: Vec<protocol::decode::DecodedServerMessage>,
 }
 
 enum WorkerCommand {
-    SendDatagram(Vec<u8>),
+    SendPacket(protocol::C2SPacket),
     RebindSocket(UdpSocket),
     Shutdown,
 }
 
+enum WorkerControl {
+    Continue,
+    ShutdownRequested,
+}
+
 struct WorkerIncoming {
-    datagrams: Vec<Vec<u8>>,
-    streams: Vec<Vec<u8>>,
+    messages: Vec<protocol::decode::DecodedServerMessage>,
 }
 
 pub(super) struct QuicClient {
@@ -38,12 +50,19 @@ pub(super) struct QuicClient {
     is_established: Arc<AtomicBool>,
     peer_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
     path_rtt_us: Arc<AtomicU64>,
+    wake_notifier: Arc<Mutex<Option<WakeNotifier>>>,
+    worker_waker: Arc<Waker>,
 }
 
 #[derive(Default)]
 struct QuicStreamState {
     recv_buffer: Vec<u8>,
     recv_finished: bool,
+}
+
+struct PendingStreamWrite {
+    data: Vec<u8>,
+    offset: usize,
 }
 
 impl QuicClient {
@@ -68,17 +87,24 @@ impl QuicClient {
 
         let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
         let (incoming_tx, incoming_rx) = mpsc::channel::<WorkerIncoming>();
+        let poll = Poll::new().context("failed to create mio poll")?;
+        let worker_waker =
+            Arc::new(Waker::new(poll.registry(), COMMAND_TOKEN).context("failed to create mio waker")?);
 
         let is_established = Arc::new(AtomicBool::new(false));
         let peer_cert_der = Arc::new(Mutex::new(None));
         let path_rtt_us = Arc::new(AtomicU64::new(0));
+        let wake_notifier = Arc::new(Mutex::new(None));
 
         let is_established_worker = Arc::clone(&is_established);
         let peer_cert_der_worker = Arc::clone(&peer_cert_der);
         let path_rtt_us_worker = Arc::clone(&path_rtt_us);
+        let wake_notifier_worker = Arc::clone(&wake_notifier);
+        let worker_waker_handle = Arc::clone(&worker_waker);
 
         let worker_handle = thread::spawn(move || {
             if let Err(err) = run_worker(
+                poll,
                 socket,
                 conn,
                 server_addr,
@@ -88,6 +114,8 @@ impl QuicClient {
                 is_established_worker,
                 peer_cert_der_worker,
                 path_rtt_us_worker,
+                wake_notifier_worker,
+                worker_waker_handle,
             ) {
                 log::error!("client network worker failed: {err:#}");
             }
@@ -101,6 +129,8 @@ impl QuicClient {
             is_established,
             peer_cert_der,
             path_rtt_us,
+            wake_notifier,
+            worker_waker,
         })
     }
 
@@ -126,19 +156,19 @@ impl QuicClient {
     }
 
     pub(super) fn poll(&mut self) -> Result<IncomingPackets> {
-        let mut datagrams = Vec::new();
-        let mut streams = Vec::new();
+        let mut messages = Vec::new();
         while let Ok(incoming) = self.incoming_rx.try_recv() {
-            datagrams.extend(incoming.datagrams);
-            streams.extend(incoming.streams);
+            messages.extend(incoming.messages);
         }
-        Ok(IncomingPackets { datagrams, streams })
+        Ok(IncomingPackets { messages })
     }
 
-    pub(super) fn send_datagram(&mut self, payload: &[u8]) -> Result<()> {
+    pub(super) fn send_packet(&mut self, packet: protocol::C2SPacket) -> Result<()> {
         self.command_tx
-            .send(WorkerCommand::SendDatagram(payload.to_vec()))
-            .context("client network worker is unavailable")
+            .send(WorkerCommand::SendPacket(packet))
+            .context("client network worker is unavailable")?;
+        let _ = self.worker_waker.wake();
+        Ok(())
     }
 
     pub(super) fn handle_network_change(&mut self) -> Result<()> {
@@ -146,13 +176,23 @@ impl QuicClient {
         socket.set_nonblocking(true).context("failed to set rebound UDP socket non-blocking")?;
         self.command_tx
             .send(WorkerCommand::RebindSocket(socket))
-            .context("client network worker is unavailable")
+            .context("client network worker is unavailable")?;
+        let _ = self.worker_waker.wake();
+        Ok(())
+    }
+
+    pub(super) fn set_wake_notifier(&mut self, notifier: WakeNotifier) {
+        if let Ok(mut slot) = self.wake_notifier.lock() {
+            *slot = Some(notifier);
+        }
     }
 }
 
 impl Drop for QuicClient {
     fn drop(&mut self) {
+        let _ = self.command_tx.send(WorkerCommand::SendPacket(protocol::C2SPacket::Disconnect {}));
         let _ = self.command_tx.send(WorkerCommand::Shutdown);
+        let _ = self.worker_waker.wake();
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
@@ -161,7 +201,8 @@ impl Drop for QuicClient {
 
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
-    mut socket: UdpSocket,
+    mut poll: Poll,
+    socket: UdpSocket,
     mut conn: quiche::Connection,
     server_addr: SocketAddr,
     mut local_addr: SocketAddr,
@@ -170,83 +211,119 @@ fn run_worker(
     is_established: Arc<AtomicBool>,
     peer_cert_der: Arc<Mutex<Option<Vec<u8>>>>,
     path_rtt_us: Arc<AtomicU64>,
+    wake_notifier: Arc<Mutex<Option<WakeNotifier>>>,
+    _worker_waker: Arc<Waker>,
 ) -> Result<()> {
+    let mut socket = MioUdpSocket::from_std(socket);
+    poll.registry()
+        .register(&mut socket, SOCKET_TOKEN, Interest::READABLE)
+        .context("failed to register UDP socket with mio")?;
     let mut send_buf = [0u8; MAX_DATAGRAM_SIZE];
     let mut recv_buf = [0u8; 65_535];
     let mut app_buf = [0u8; 4096];
     let mut stream_states: HashMap<u64, QuicStreamState> = HashMap::new();
+    let mut pending_writes: VecDeque<PendingStreamWrite> = VecDeque::new();
+    let mut last_established = false;
+    let mut shutdown_requested = false;
+    let mut events = Events::with_capacity(8);
 
     advertise_spare_scids(&mut conn);
     flush_outgoing(&socket, &mut conn, &mut send_buf)?;
 
     loop {
-        let mut had_activity = false;
+        let timeout = conn.timeout();
+        poll.poll(&mut events, timeout)
+            .context("client network poll failed")?;
 
-        if process_worker_commands(
+        let poll_timed_out = events.is_empty() && timeout.is_some_and(|value| !value.is_zero());
+
+        if matches!(
+            process_worker_commands(
             &command_rx,
+            poll.registry(),
             &mut socket,
             &mut conn,
             &mut local_addr,
-            &mut had_activity,
-        )? {
-            return Ok(());
+            &mut pending_writes,
+        )?,
+            WorkerControl::ShutdownRequested
+        ) {
+            shutdown_requested = true;
         }
-        recv_udp(&socket, &mut conn, &mut recv_buf, server_addr, local_addr, &mut had_activity)?;
-        let datagrams = drain_datagrams(&mut conn, &mut app_buf, &mut had_activity);
-        let streams = drain_streams(&mut conn, &mut app_buf, &mut stream_states, &mut had_activity);
+        if events.iter().any(|event| event.token() == SOCKET_TOKEN && event.is_readable()) {
+            recv_udp(
+                &socket,
+                &mut conn,
+                &mut recv_buf,
+                server_addr,
+                local_addr,
+            )?;
+        }
+        let datagrams = drain_datagrams(&mut conn, &mut app_buf);
+        let streams = drain_streams(&mut conn, &mut app_buf, &mut stream_states);
+        let messages = decode_server_messages(datagrams.into_iter().chain(streams.into_iter()));
+        queue_immediate_responses(&mut pending_writes, &messages);
 
-        if let Some(timeout) = conn.timeout() {
-            if timeout.is_zero() {
-                conn.on_timeout();
-                had_activity = true;
-            }
+        if poll_timed_out || conn.timeout().is_some_and(|value| value.is_zero()) {
+            conn.on_timeout();
         }
 
         drain_path_events(&mut conn);
         advertise_spare_scids(&mut conn);
 
-        if flush_outgoing(&socket, &mut conn, &mut send_buf)? {
-            had_activity = true;
-        }
-
-        if !datagrams.is_empty() || !streams.is_empty() {
-            let _ = incoming_tx.send(WorkerIncoming { datagrams, streams });
-        }
+        flush_stream_writes(&mut conn, &mut pending_writes)?;
+        let _ = flush_outgoing(&socket, &mut conn, &mut send_buf)?;
 
         refresh_shared_connection_state(&conn, &is_established, &peer_cert_der, &path_rtt_us);
+        let established = conn.is_established();
+        if established != last_established {
+            last_established = established;
+            notify_waker(&wake_notifier);
+        }
 
-        if conn.is_closed() {
+        if !messages.is_empty() {
+            let _ = incoming_tx.send(WorkerIncoming { messages });
+            notify_waker(&wake_notifier);
+        }
+
+        if conn.is_closed() || (shutdown_requested && pending_writes.is_empty()) {
             return Ok(());
         }
 
-        if !had_activity {
-            // Keep this tiny to reduce jitter while still avoiding a busy loop.
-            thread::sleep(WORKER_IDLE_SLEEP);
-        }
     }
 }
 
 fn process_worker_commands(
     command_rx: &mpsc::Receiver<WorkerCommand>,
-    socket: &mut UdpSocket,
+    registry: &mio::Registry,
+    socket: &mut MioUdpSocket,
     conn: &mut quiche::Connection,
     local_addr: &mut SocketAddr,
-    had_activity: &mut bool,
-) -> Result<bool> {
+    pending_writes: &mut VecDeque<PendingStreamWrite>,
+) -> Result<WorkerControl> {
     while let Ok(cmd) = command_rx.try_recv() {
         match cmd {
-            WorkerCommand::SendDatagram(payload) => {
-                let _ = conn.dgram_send(&payload);
-                *had_activity = true;
+            WorkerCommand::SendPacket(packet) => {
+                queue_c2s_packet(pending_writes, packet);
             },
             WorkerCommand::RebindSocket(new_socket) => {
                 let new_local_addr =
                     new_socket.local_addr().context("failed to get rebound local addr")?;
                 let previous_local_addr = *local_addr;
+                registry.deregister(socket).context("failed to deregister UDP socket")?;
+                let mut new_socket = MioUdpSocket::from_std(new_socket);
+                registry
+                    .register(&mut new_socket, SOCKET_TOKEN, Interest::READABLE)
+                    .context("failed to register rebound UDP socket")?;
                 let previous_socket = std::mem::replace(socket, new_socket);
                 *local_addr = new_local_addr;
                 if conn.is_established() {
                     if let Err(err) = conn.migrate_source(*local_addr) {
+                        registry.deregister(socket).ok();
+                        let mut previous_socket = previous_socket;
+                        registry
+                            .register(&mut previous_socket, SOCKET_TOKEN, Interest::READABLE)
+                            .ok();
                         *socket = previous_socket;
                         *local_addr = previous_local_addr;
                         log::warn!("failed to migrate QUIC connection to rebound socket: {err:?}");
@@ -256,12 +333,58 @@ fn process_worker_commands(
                 } else {
                     log::info!("client rebound UDP socket to {}", *local_addr);
                 }
-                *had_activity = true;
             },
-            WorkerCommand::Shutdown => return Ok(true),
+            WorkerCommand::Shutdown => return Ok(WorkerControl::ShutdownRequested),
         }
     }
-    Ok(false)
+    Ok(WorkerControl::Continue)
+}
+
+fn notify_waker(wake_notifier: &Arc<Mutex<Option<WakeNotifier>>>) {
+    let notifier = wake_notifier.lock().ok().and_then(|slot| slot.clone());
+    if let Some(notifier) = notifier {
+        notifier();
+    }
+}
+
+fn queue_immediate_responses<'a>(
+    pending_writes: &mut VecDeque<PendingStreamWrite>,
+    messages: impl IntoIterator<Item = &'a protocol::decode::DecodedServerMessage>,
+) {
+    for message in messages {
+        match message {
+            protocol::decode::DecodedServerMessage::Envelope(envelope) => {
+                if let Some(message_id) = envelope.receipt_id {
+                    queue_c2s_packet(pending_writes, protocol::C2SPacket::Receipt { message_id });
+                }
+                for packet in &envelope.packets {
+                    if let protocol::S2CPacket::Ping { nonce } = packet {
+                        queue_c2s_packet(pending_writes, protocol::C2SPacket::Pong { nonce: *nonce });
+                    }
+                }
+            },
+            protocol::decode::DecodedServerMessage::Resource(resource) => {
+                if let Some(message_id) = resource.receipt_id {
+                    queue_c2s_packet(pending_writes, protocol::C2SPacket::Receipt { message_id });
+                }
+            },
+        };
+    }
+}
+
+fn decode_server_messages(
+    packets: impl IntoIterator<Item = Vec<u8>>,
+) -> Vec<protocol::decode::DecodedServerMessage> {
+    packets
+        .into_iter()
+        .filter_map(|packet| {
+            let decoded = protocol::decode::server_message(&packet);
+            if decoded.is_none() {
+                log::debug!("client dropped undecodable server packet ({} bytes)", packet.len());
+            }
+            decoded
+        })
+        .collect()
 }
 
 fn advertise_spare_scids(conn: &mut quiche::Connection) {
@@ -309,12 +432,11 @@ fn drain_path_events(conn: &mut quiche::Connection) {
 }
 
 fn recv_udp(
-    socket: &UdpSocket,
+    socket: &MioUdpSocket,
     conn: &mut quiche::Connection,
     recv_buf: &mut [u8],
     server_addr: SocketAddr,
     local_addr: SocketAddr,
-    had_activity: &mut bool,
 ) -> Result<()> {
     loop {
         let recv = socket.recv_from(recv_buf);
@@ -334,23 +456,17 @@ fn recv_udp(
                 log::warn!("client conn.recv error: {err:?}");
             }
         }
-        *had_activity = true;
     }
     Ok(())
 }
 
-fn drain_datagrams(
-    conn: &mut quiche::Connection,
-    app_buf: &mut [u8],
-    had_activity: &mut bool,
-) -> Vec<Vec<u8>> {
+fn drain_datagrams(conn: &mut quiche::Connection, app_buf: &mut [u8]) -> Vec<Vec<u8>> {
     let mut datagrams = Vec::new();
     loop {
         match conn.dgram_recv(app_buf) {
             Ok(len) => {
                 let mut framed = app_buf[..len].to_vec();
                 datagrams.extend(drain_framed_packets(&mut framed));
-                *had_activity = true;
             },
             Err(quiche::Error::Done) => break,
             Err(_) => break,
@@ -363,7 +479,6 @@ fn drain_streams(
     conn: &mut quiche::Connection,
     app_buf: &mut [u8],
     stream_states: &mut HashMap<u64, QuicStreamState>,
-    had_activity: &mut bool,
 ) -> Vec<Vec<u8>> {
     let mut streams = Vec::new();
     for stream_id in conn.readable() {
@@ -372,7 +487,6 @@ fn drain_streams(
                 Ok((len, fin)) => {
                     let chunk = app_buf[..len].to_vec();
                     streams.extend(ingest_stream_data(stream_states, conn, stream_id, &chunk, fin));
-                    *had_activity = true;
                     if fin {
                         break;
                     }
@@ -456,8 +570,36 @@ fn cleanup_stream_if_closed(
     }
 }
 
+fn flush_stream_writes(
+    conn: &mut quiche::Connection,
+    pending_writes: &mut VecDeque<PendingStreamWrite>,
+) -> Result<()> {
+    loop {
+        let Some(mut write) = pending_writes.pop_front() else {
+            break;
+        };
+
+        match conn.stream_send(CLIENT_STREAM_ID, &write.data[write.offset..], false) {
+            Ok(written) => {
+                write.offset += written;
+                if write.offset < write.data.len() {
+                    pending_writes.push_front(write);
+                    break;
+                }
+            },
+            Err(quiche::Error::Done | quiche::Error::StreamLimit) => {
+                pending_writes.push_front(write);
+                break;
+            },
+            Err(err) => return Err(anyhow::anyhow!("client stream_send failed: {err:?}")),
+        }
+    }
+
+    Ok(())
+}
+
 fn flush_outgoing(
-    socket: &UdpSocket,
+    socket: &MioUdpSocket,
     conn: &mut quiche::Connection,
     send_buf: &mut [u8],
 ) -> Result<bool> {
@@ -465,7 +607,11 @@ fn flush_outgoing(
     loop {
         match conn.send(send_buf) {
             Ok((len, send_info)) => {
-                socket.send_to(&send_buf[..len], send_info.to).context("socket send_to failed")?;
+                match socket.send_to(&send_buf[..len], send_info.to) {
+                    Ok(_) => {},
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => return Err(err).context("socket send_to failed"),
+                }
                 sent_any = true;
             },
             Err(quiche::Error::Done) => break,
@@ -506,4 +652,24 @@ fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let payload = buffer[4..4 + len].to_vec();
     buffer.drain(..4 + len);
     Some(payload)
+}
+
+fn frame_outbound_packet(payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+fn queue_c2s_packet(
+    pending_writes: &mut VecDeque<PendingStreamWrite>,
+    packet: protocol::C2SPacket,
+) {
+    let Ok(bytes) = protocol::encode_c2s(&packet) else {
+        return;
+    };
+    pending_writes.push_back(PendingStreamWrite {
+        data: frame_outbound_packet(&bytes),
+        offset: 0,
+    });
 }

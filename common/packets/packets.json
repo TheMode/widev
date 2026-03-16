@@ -103,6 +103,11 @@
       "fields": [
         { "name": "message_id", "type": "MessageId" }
       ]
+    },
+    {
+      "name": "Disconnect",
+      "description": "Client is intentionally disconnecting and the session should be torn down immediately without recovery.",
+      "fields": []
     }
   ],
   "s2c": [
@@ -123,6 +128,11 @@
     {
       "name": "Join",
       "description": "Signal that the client has enough session state to initialize local surfaces and begin rendering.",
+      "fields": []
+    },
+    {
+      "name": "ResetScene",
+      "description": "Remove all currently spawned scene elements without resetting session bootstrap metadata.",
       "fields": []
     },
     {

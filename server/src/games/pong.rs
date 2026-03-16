@@ -255,8 +255,20 @@ impl PongGame {
         state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
     }
 
+    fn send_match_cleanup(
+        &mut self,
+        state: &mut GameState,
+        client_id: ClientId,
+    ) {
+        state.send(PacketEnvelope::single(PacketTarget::Client(client_id), S2CPacket::ResetScene {}));
+    }
+
     fn remove_from_queue(&mut self, client_id: ClientId) {
         self.matchmaking_queue.retain(|&id| id != client_id);
+    }
+
+    fn is_client_in_match(&self, client_id: ClientId) -> bool {
+        self.matches.values().any(|m| m.player1 == client_id || m.player2 == client_id)
     }
 
     fn find_match_and_remove_player(&mut self, client_id: ClientId) -> Option<(u64, Match)> {
@@ -302,9 +314,13 @@ impl Game for PongGame {
 
                 if let Some((match_id, m)) = self.find_match_and_remove_player(client_id) {
                     let remaining = if m.player1 == client_id { m.player2 } else { m.player1 };
+                    self.send_match_cleanup(state, remaining);
                     log::info!("match {} ended, player {} wins by disconnect", match_id, remaining);
                     self.matchmaking_queue.push_back(remaining);
                     self.try_start_match(state);
+                    if !self.is_client_in_match(remaining) {
+                        self.send_waiting_screen(state, remaining);
+                    }
                 }
             },
             NetworkEvent::ClientPacket { client_id, packet } => match packet {
@@ -423,9 +439,17 @@ impl Game for PongGame {
 
         for match_id in matches_to_end {
             if let Some(m) = self.matches.remove(&match_id) {
+                self.send_match_cleanup(state, m.player1);
+                self.send_match_cleanup(state, m.player2);
                 self.matchmaking_queue.push_back(m.player1);
                 self.matchmaking_queue.push_back(m.player2);
                 self.try_start_match(state);
+                if !self.is_client_in_match(m.player1) {
+                    self.send_waiting_screen(state, m.player1);
+                }
+                if !self.is_client_in_match(m.player2) {
+                    self.send_waiting_screen(state, m.player2);
+                }
             }
         }
 

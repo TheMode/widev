@@ -9,7 +9,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use super::persistence::BindingStore;
 use super::protocol;
 
-const INPUT_RESEND_EVERY_FRAMES: u16 = 8;
 const GAMEPAD_AXIS_CAPTURE_THRESHOLD: f32 = 0.35;
 const MOUSE_AXIS_CAPTURE_THRESHOLD: f32 = 0.1;
 
@@ -225,7 +224,6 @@ struct BindingAssignment {
     id: u16,
     input: InputPath,
     last_value: f32,
-    frames_since_send: u16,
 }
 
 pub(super) struct ConfirmedBinding {
@@ -367,16 +365,13 @@ impl BindingState {
     {
         let mut outgoing = Vec::new();
         for binding in &mut self.active_bindings {
-            binding.frames_since_send = binding.frames_since_send.saturating_add(1);
             let value = read_value(&binding.input).clamp(-1.0, 1.0);
             let changed = (value - binding.last_value).abs() >= f32::EPSILON;
-            let should_resend = binding.frames_since_send >= INPUT_RESEND_EVERY_FRAMES;
-            if !changed && !should_resend {
+            if !changed {
                 continue;
             }
 
             binding.last_value = value;
-            binding.frames_since_send = 0;
             outgoing.push((binding.id, value));
         }
         outgoing
@@ -397,7 +392,6 @@ impl BindingState {
             id,
             input,
             last_value: 0.0,
-            frames_since_send: 0,
         });
     }
 }
@@ -650,6 +644,16 @@ impl InputCapture {
         self.just_pressed_keys.clear();
         self.just_captured_inputs.clear();
         self.mouse_axes.clear();
+    }
+
+    pub(super) fn clear_active_inputs(&mut self) {
+        self.pressed_keys.clear();
+        self.pressed_mouse_buttons.clear();
+        self.pressed_gamepad_buttons.clear();
+        self.mouse_axes.clear();
+        self.gamepad_axes.clear();
+        self.just_pressed_keys.clear();
+        self.just_captured_inputs.clear();
     }
 }
 

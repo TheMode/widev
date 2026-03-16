@@ -7,7 +7,7 @@ use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, PredefinedMenuItem, Submenu};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{DeviceEvent, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::Window;
@@ -22,9 +22,16 @@ const HEIGHT: u32 = 600;
 const MAIN_SURFACE_ID: u32 = 1;
 const TICK_INTERVAL: Duration = Duration::from_millis(16);
 
+#[derive(Clone, Copy, Debug)]
+enum AppEvent {
+    NetworkReady,
+}
+
 pub(super) fn run(game: ClientGame) -> Result<()> {
-    let event_loop = EventLoop::new().context("failed to create event loop")?;
-    let mut app = App::new(game);
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .context("failed to create event loop")?;
+    let mut app = App::new(game, event_loop.create_proxy());
     event_loop.run_app(&mut app).context("event loop failed")
 }
 
@@ -34,6 +41,7 @@ struct App {
     renderer: Option<Renderer>,
     settings: AppSettings,
     input_capture: InputCapture,
+    window_focused: bool,
     window_occluded: bool,
     force_redraw: bool,
     next_tick_at: Instant,
@@ -112,13 +120,19 @@ enum MenuAction {
 }
 
 impl App {
-    fn new(game: ClientGame) -> Self {
+    fn new(mut game: ClientGame, proxy: EventLoopProxy<AppEvent>) -> Self {
+        let wake_notifier: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = proxy.send_event(AppEvent::NetworkReady);
+        });
+        game.set_network_waker(wake_notifier);
+
         Self {
             game,
             window: None,
             renderer: None,
             settings: AppSettings::default(),
             input_capture: InputCapture::new(),
+            window_focused: true,
             window_occluded: false,
             force_redraw: true,
             next_tick_at: Instant::now(),
@@ -306,7 +320,6 @@ impl App {
         }
 
         self.input_capture.poll_gamepads();
-        self.game.tick_network()?;
         self.sync_surface_state()?;
         let surface = self.game.surface_state(MAIN_SURFACE_ID);
 
@@ -323,8 +336,10 @@ impl App {
         } else {
             self.last_prompt_signature = None;
             window.set_title(self.game.game_name());
-            let input_capture = &self.input_capture;
-            self.game.send_bound_inputs(|path| input_capture.read_binding_value(path))?;
+            if self.window_focused {
+                let input_capture = &self.input_capture;
+                self.game.send_bound_inputs(|path| input_capture.read_binding_value(path))?;
+            }
         }
 
         let mut states = self.game.render_states();
@@ -389,7 +404,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.network_migration.on_resumed(Instant::now(), self.game.is_connected()) {
             if let Err(err) = self.game.handle_network_change() {
@@ -427,6 +442,27 @@ impl ApplicationHandler for App {
         self.update_control_flow(event_loop);
     }
 
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::NetworkReady => {
+                if let Err(err) = self.game.tick_network() {
+                    log::error!("client network event error: {err:#}");
+                    event_loop.exit();
+                    return;
+                }
+                if let Err(err) = self.ensure_window_ready(event_loop) {
+                    log::error!("client network wake error: {err:#}");
+                    event_loop.exit();
+                    return;
+                }
+                if self.window.is_some() {
+                    self.wake_for_render();
+                }
+                self.update_control_flow(event_loop);
+            },
+        }
+    }
+
     fn device_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
@@ -447,7 +483,13 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Focused(_) => self.apply_render_activity_change(),
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if !focused {
+                    self.input_capture.clear_active_inputs();
+                }
+                self.apply_render_activity_change();
+            },
             WindowEvent::Occluded(occluded) => {
                 self.window_occluded = occluded;
                 self.apply_render_activity_change();
