@@ -48,7 +48,7 @@ pub enum PacketOrder {
     #[default]
     Independent,
     /// Declare a client-visible dependency on another envelope id without affecting scheduler order.
-    Dependency(EnvelopeId),
+    Dependency(MessageId),
     /// Append this packet to the reused stream for this sequence.
     Sequence(uuid::Uuid),
     /// Append this packet to the reused stream for this sequence, then send FIN.
@@ -90,10 +90,70 @@ pub enum PacketTarget {
     BroadcastExcept(ClientId),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PacketMeta {
+    pub target: PacketTarget,
+    pub priority: PacketPriority,
+    pub order: PacketOrder,
+    pub delivery: DeliveryPolicy,
+}
+
+impl PacketMeta {
+    fn new(target: PacketTarget) -> Self {
+        Self {
+            target,
+            priority: PacketPriority::default(),
+            order: PacketOrder::default(),
+            delivery: DeliveryPolicy::default(),
+        }
+    }
+
+    fn set_droppable(&mut self) {
+        self.priority = PacketPriority::Droppable;
+    }
+
+    fn set_deadline(&mut self, max_delay: Duration) {
+        self.priority = PacketPriority::Deadline { max_delay };
+    }
+
+    fn set_coalescing(&mut self, target_payload_bytes: usize) {
+        self.priority = PacketPriority::Coalescing { target_payload_bytes };
+    }
+
+    fn set_delivery(&mut self, delivery: DeliveryPolicy) {
+        self.delivery = delivery;
+    }
+
+    fn set_independent(&mut self) {
+        self.order = PacketOrder::Independent;
+    }
+
+    fn set_dependency(&mut self, message_id: MessageId) {
+        self.order = PacketOrder::Dependency(message_id);
+    }
+
+    fn set_sequence(&mut self, sequence_id: uuid::Uuid) {
+        self.order = PacketOrder::Sequence(sequence_id);
+    }
+
+    fn set_sequence_end(&mut self, sequence_id: uuid::Uuid) {
+        self.order = PacketOrder::SequenceEnd(sequence_id);
+    }
+}
+
 #[derive(Clone)]
 pub enum PacketPayload {
     Single(S2CPacket),
     Bundle(PacketBundle),
+}
+
+#[derive(Clone)]
+pub struct PacketResource {
+    pub id: MessageId,
+    pub resource_type: String,
+    pub blob: Vec<u8>,
+    pub usage_count: i32,
+    pub meta: PacketMeta,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,42 +177,35 @@ pub enum PacketControl {
 
 #[derive(Clone)]
 pub struct PacketEnvelope {
-    pub id: Option<EnvelopeId>,
-    pub target: PacketTarget,
+    pub id: Option<MessageId>,
     pub payload: PacketPayload,
-    pub priority: PacketPriority,
-    pub order: PacketOrder,
-    pub delivery: DeliveryPolicy,
+    pub meta: PacketMeta,
 }
 
 #[derive(Clone)]
 pub enum PacketMessage {
     Envelope(PacketEnvelope),
+    Resource(PacketResource),
     Control(PacketControl),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum PacketEnvelopeValidationError {
-    #[error("droppable envelopes cannot have an id")]
+pub enum MessageValidationError {
+    #[error("resource usage count must be -1 or greater")]
+    InvalidUsageCount,
+    #[error("droppable messages cannot have an id")]
     DroppableWithId,
-    #[error("delivery-tracked envelopes require an id")]
+    #[error("delivery-tracked messages require an id")]
     DeliveryRequiresId,
-    #[error("droppable envelopes cannot require a client receipt")]
+    #[error("droppable messages cannot require a client receipt")]
     DroppableWithClientReceipt,
-    #[error("coalescing envelopes require a non-zero payload target")]
+    #[error("coalescing messages require a non-zero payload target")]
     CoalescingWithZeroTarget,
 }
 
 impl PacketEnvelope {
     pub fn new(target: PacketTarget, payload: PacketPayload) -> Self {
-        Self {
-            id: None,
-            target,
-            payload,
-            priority: PacketPriority::default(),
-            order: PacketOrder::default(),
-            delivery: DeliveryPolicy::default(),
-        }
+        Self { id: None, payload, meta: PacketMeta::new(target) }
     }
 
     pub fn single(target: PacketTarget, packet: S2CPacket) -> Self {
@@ -164,76 +217,149 @@ impl PacketEnvelope {
     }
 
     pub fn droppable(mut self) -> Self {
-        self.priority = PacketPriority::Droppable;
+        self.meta.set_droppable();
         self
     }
 
     pub fn deadline(mut self, max_delay: Duration) -> Self {
-        self.priority = PacketPriority::Deadline { max_delay };
+        self.meta.set_deadline(max_delay);
         self
     }
 
     pub fn coalescing(mut self, target_payload_bytes: usize) -> Self {
-        self.priority = PacketPriority::Coalescing { target_payload_bytes };
+        self.meta.set_coalescing(target_payload_bytes);
         self
     }
 
-    pub fn id(mut self, id: EnvelopeId) -> Self {
+    pub fn id(mut self, id: MessageId) -> Self {
         self.id = Some(id);
         self
     }
 
     pub fn delivery(mut self, delivery: DeliveryPolicy) -> Self {
-        self.delivery = delivery;
+        self.meta.set_delivery(delivery);
         self
     }
 
     pub fn independent(mut self) -> Self {
-        self.order = PacketOrder::Independent;
+        self.meta.set_independent();
         self
     }
 
-    pub fn dependency(mut self, envelope_id: EnvelopeId) -> Self {
-        self.order = PacketOrder::Dependency(envelope_id);
+    pub fn dependency(mut self, message_id: MessageId) -> Self {
+        self.meta.set_dependency(message_id);
         self
     }
 
     pub fn sequence(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.order = PacketOrder::Sequence(sequence_id);
+        self.meta.set_sequence(sequence_id);
         self
     }
 
     pub fn sequence_end(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.order = PacketOrder::SequenceEnd(sequence_id);
+        self.meta.set_sequence_end(sequence_id);
         self
     }
 
-    pub fn validate(&self) -> Result<(), PacketEnvelopeValidationError> {
-        let tracks_delivery = matches!(
-            self.delivery,
-            DeliveryPolicy::ObserveTransport | DeliveryPolicy::RequireClientReceipt
-        );
-
-        if matches!(self.priority, PacketPriority::Droppable) && self.id.is_some() {
-            return Err(PacketEnvelopeValidationError::DroppableWithId);
-        }
-
-        if tracks_delivery && self.id.is_none() {
-            return Err(PacketEnvelopeValidationError::DeliveryRequiresId);
-        }
-
-        if matches!(self.priority, PacketPriority::Droppable)
-            && self.delivery == DeliveryPolicy::RequireClientReceipt
-        {
-            return Err(PacketEnvelopeValidationError::DroppableWithClientReceipt);
-        }
-
-        if matches!(self.priority, PacketPriority::Coalescing { target_payload_bytes: 0 }) {
-            return Err(PacketEnvelopeValidationError::CoalescingWithZeroTarget);
-        }
-
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        validate_message_policy(self.id, self.meta.priority, self.meta.delivery)?;
         Ok(())
     }
+}
+
+impl PacketResource {
+    pub fn new(
+        target: PacketTarget,
+        id: MessageId,
+        resource_type: impl Into<String>,
+        blob: Vec<u8>,
+        usage_count: i32,
+    ) -> Self {
+        Self {
+            id,
+            resource_type: resource_type.into(),
+            blob,
+            usage_count,
+            meta: PacketMeta::new(target),
+        }
+    }
+
+    pub fn droppable(mut self) -> Self {
+        self.meta.set_droppable();
+        self
+    }
+
+    pub fn deadline(mut self, max_delay: Duration) -> Self {
+        self.meta.set_deadline(max_delay);
+        self
+    }
+
+    pub fn coalescing(mut self, target_payload_bytes: usize) -> Self {
+        self.meta.set_coalescing(target_payload_bytes);
+        self
+    }
+
+    pub fn delivery(mut self, delivery: DeliveryPolicy) -> Self {
+        self.meta.set_delivery(delivery);
+        self
+    }
+
+    pub fn independent(mut self) -> Self {
+        self.meta.set_independent();
+        self
+    }
+
+    pub fn dependency(mut self, message_id: MessageId) -> Self {
+        self.meta.set_dependency(message_id);
+        self
+    }
+
+    pub fn sequence(mut self, sequence_id: uuid::Uuid) -> Self {
+        self.meta.set_sequence(sequence_id);
+        self
+    }
+
+    pub fn sequence_end(mut self, sequence_id: uuid::Uuid) -> Self {
+        self.meta.set_sequence_end(sequence_id);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.usage_count < -1 {
+            return Err(MessageValidationError::InvalidUsageCount);
+        }
+        validate_message_policy(Some(self.id), self.meta.priority, self.meta.delivery)?;
+        Ok(())
+    }
+}
+
+fn validate_message_policy(
+    id: Option<MessageId>,
+    priority: PacketPriority,
+    delivery: DeliveryPolicy,
+) -> Result<(), MessageValidationError> {
+    let tracks_delivery =
+        matches!(delivery, DeliveryPolicy::ObserveTransport | DeliveryPolicy::RequireClientReceipt);
+
+    if matches!(priority, PacketPriority::Droppable)
+        && delivery == DeliveryPolicy::RequireClientReceipt
+    {
+        return Err(MessageValidationError::DroppableWithClientReceipt);
+    }
+
+    if matches!(priority, PacketPriority::Droppable) && id.is_some() {
+        return Err(MessageValidationError::DroppableWithId);
+    }
+
+    if tracks_delivery && id.is_none() {
+        return Err(MessageValidationError::DeliveryRequiresId);
+    }
+
+    if matches!(priority, PacketPriority::Coalescing { target_payload_bytes: 0 }) {
+        return Err(MessageValidationError::CoalescingWithZeroTarget);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -247,7 +373,7 @@ mod tests {
                 .droppable()
                 .id(1);
 
-        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DroppableWithId));
+        assert_eq!(envelope.validate(), Err(MessageValidationError::DroppableWithId));
     }
 
     #[test]
@@ -256,7 +382,7 @@ mod tests {
             PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
                 .delivery(DeliveryPolicy::RequireClientReceipt);
 
-        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DeliveryRequiresId));
+        assert_eq!(envelope.validate(), Err(MessageValidationError::DeliveryRequiresId));
     }
 
     #[test]
@@ -265,7 +391,7 @@ mod tests {
             PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
                 .delivery(DeliveryPolicy::ObserveTransport);
 
-        assert_eq!(envelope.validate(), Err(PacketEnvelopeValidationError::DeliveryRequiresId));
+        assert_eq!(envelope.validate(), Err(MessageValidationError::DeliveryRequiresId));
     }
 
     #[test]
@@ -278,7 +404,7 @@ mod tests {
 
         assert_eq!(
             envelope.validate(),
-            Err(PacketEnvelopeValidationError::DroppableWithClientReceipt)
+            Err(MessageValidationError::DroppableWithClientReceipt)
         );
     }
 
@@ -290,7 +416,36 @@ mod tests {
 
         assert_eq!(
             envelope.validate(),
-            Err(PacketEnvelopeValidationError::CoalescingWithZeroTarget)
+            Err(MessageValidationError::CoalescingWithZeroTarget)
         );
+    }
+
+    #[test]
+    fn resource_usage_count_must_be_minus_one_or_greater() {
+        let resource = PacketResource::new(
+            PacketTarget::Broadcast,
+            1,
+            "texture",
+            vec![1, 2, 3],
+            -2,
+        );
+
+        assert_eq!(
+            resource.validate(),
+            Err(MessageValidationError::InvalidUsageCount)
+        );
+    }
+
+    #[test]
+    fn resource_allows_permanent_usage_count() {
+        let resource = PacketResource::new(
+            PacketTarget::Broadcast,
+            1,
+            "texture",
+            vec![1, 2, 3],
+            -1,
+        );
+
+        assert_eq!(resource.validate(), Ok(()));
     }
 }

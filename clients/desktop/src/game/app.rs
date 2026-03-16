@@ -58,6 +58,7 @@ struct RenderCache {
     last_rendered_states: Vec<super::RenderState>,
     last_rendered_text: Vec<super::renderer::TextCommand>,
     last_surface_state: Option<super::SurfaceState>,
+    last_render_revision: u64,
     surface_list_sent: bool,
     last_reported_surface_size: Option<(u32, u32)>,
 }
@@ -334,15 +335,17 @@ impl App {
         states.extend(overlay_states);
         let render_needed = self.force_redraw
             || self.render_cache.last_surface_state != Some(surface)
+            || self.render_cache.last_render_revision != self.game.render_revision()
             || self.render_cache.last_rendered_states != states
             || self.render_cache.last_rendered_text != overlay_text;
         if render_needed {
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.render(&states, &overlay_text)?;
+                renderer.render(&states, self.game.resources(), &overlay_text)?;
             }
             self.render_cache.last_rendered_states = states;
             self.render_cache.last_rendered_text = overlay_text;
             self.render_cache.last_surface_state = Some(surface);
+            self.render_cache.last_render_revision = self.game.render_revision();
             self.force_redraw = false;
         }
 

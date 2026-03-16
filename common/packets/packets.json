@@ -11,8 +11,8 @@
       "type": "u32"
     },
     {
-      "name": "EnvelopeId",
-      "description": "Unique identifier for one server envelope, used for client receipts.",
+      "name": "MessageId",
+      "description": "Unique identifier for one server message payload, used for dependencies and client receipts.",
       "type": "u128"
     },
     {
@@ -101,7 +101,7 @@
       "name": "Receipt",
       "description": "Acknowledgement sent after the client has applied every packet in a receipt-requesting envelope.",
       "fields": [
-        { "name": "envelope_id", "type": "EnvelopeId" }
+        { "name": "message_id", "type": "MessageId" }
       ]
     }
   ],
@@ -199,6 +199,21 @@
       "fields": [
         { "name": "element_id", "type": "ElementId" },
         { "name": "color", "type": "Color" }
+      ]
+    },
+    {
+      "name": "ElementSetTexture",
+      "description": "Set the texture resource to render for one element on this client.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "resource_id", "type": "MessageId" }
+      ]
+    },
+    {
+      "name": "ResourceFree",
+      "description": "Release a previously sent resource on this client immediately.",
+      "fields": [
+        { "name": "resource_id", "type": "MessageId" }
       ]
     }
   ]

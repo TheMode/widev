@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -14,6 +16,7 @@ use winit::window::Window;
 use super::bindings::BindingPromptState;
 use super::LatencySnapshot;
 use super::RenderState;
+use super::ClientResource;
 
 const SHADER_SOURCE: &str = r#"
 struct Screen {
@@ -56,6 +59,55 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const TEXTURED_SHADER_SOURCE: &str = r#"
+struct Screen {
+    virtual_size: vec2<f32>,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> screen: Screen;
+
+@group(1) @binding(0)
+var texture_sampler: sampler;
+
+@group(1) @binding(1)
+var texture_data: texture_2d<f32>;
+
+struct VsIn {
+    @location(0) unit_pos: vec2<f32>,
+    @location(1) center: vec2<f32>,
+    @location(2) size: vec2<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VsIn) -> VsOut {
+    let world = input.center + input.unit_pos * input.size;
+    let ndc = vec2<f32>(
+        (world.x / screen.virtual_size.x) * 2.0 - 1.0,
+        1.0 - (world.y / screen.virtual_size.y) * 2.0
+    );
+
+    var out: VsOut;
+    out.position = vec4<f32>(ndc, 0.0, 1.0);
+    out.uv = input.unit_pos + vec2<f32>(0.5, 0.5);
+    out.color = input.color;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(texture_data, texture_sampler, input.uv) * input.color;
+}
+"#;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
@@ -75,6 +127,11 @@ struct InstanceRaw {
 struct ScreenUniform {
     virtual_size: [f32; 2],
     _pad: [f32; 2],
+}
+
+struct GpuTexture {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 const QUAD_VERTICES: [Vertex; 4] = [
@@ -116,14 +173,21 @@ pub(super) struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    textured_pipeline: wgpu::RenderPipeline,
     size: PhysicalSize<u32>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     instance_staging: Vec<InstanceRaw>,
+    textured_instance_buffer: wgpu::Buffer,
+    textured_instance_capacity: usize,
+    textured_instance_staging: Vec<InstanceRaw>,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    texture_sampler: wgpu::Sampler,
+    textures: HashMap<u128, GpuTexture>,
     virtual_dimension_lock: Option<(u32, u32)>,
     aspect_ratio_lock: Option<(u32, u32)>,
     clear_color: wgpu::Color,
@@ -189,6 +253,10 @@ impl Renderer {
             label: Some("widev-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
         });
+        let textured_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("widev-textured-shader"),
+            source: wgpu::ShaderSource::Wgsl(TEXTURED_SHADER_SOURCE.into()),
+        });
 
         let uniform = ScreenUniform {
             virtual_size: [config.width as f32, config.height as f32],
@@ -219,6 +287,38 @@ impl Renderer {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
+        });
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("texture-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("texture-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -282,6 +382,68 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let textured_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("widev-textured-pipeline-layout"),
+                bind_group_layouts: &[&uniform_layout, &texture_bind_group_layout],
+                immediate_size: 0,
+            });
+        let textured_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("widev-textured-pipeline"),
+            layout: Some(&textured_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &textured_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[wgpu::VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: wgpu::VertexFormat::Float32x2,
+                        }],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 8,
+                                shader_location: 2,
+                                format: wgpu::VertexFormat::Float32x2,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 16,
+                                shader_location: 3,
+                                format: wgpu::VertexFormat::Float32x4,
+                            },
+                        ],
+                    },
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &textured_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-vertex-buffer"),
@@ -299,6 +461,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let textured_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("textured-instance-buffer"),
+            size: std::mem::size_of::<InstanceRaw>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let text_cache = Cache::new(&device);
         let mut text_atlas = TextAtlas::new(&device, &queue, &text_cache, format);
@@ -312,14 +480,21 @@ impl Renderer {
             queue,
             config,
             pipeline,
+            textured_pipeline,
             size,
             vertex_buffer,
             index_buffer,
             instance_buffer,
             instance_capacity: 1,
             instance_staging: Vec::new(),
+            textured_instance_buffer,
+            textured_instance_capacity: 1,
+            textured_instance_staging: Vec::new(),
             uniform_buffer,
             uniform_bind_group,
+            texture_bind_group_layout,
+            texture_sampler,
+            textures: HashMap::new(),
             virtual_dimension_lock: None,
             aspect_ratio_lock: None,
             clear_color: wgpu::Color::BLACK,
@@ -366,10 +541,16 @@ impl Renderer {
     pub(super) fn render(
         &mut self,
         render_states: &[RenderState],
+        resources: &HashMap<u128, ClientResource>,
         text_commands: &[TextCommand],
     ) -> Result<()> {
-        self.ensure_instance_capacity(render_states.len().max(1));
-        self.write_instances(render_states);
+        self.sync_textures(resources)?;
+        let (colored_states, textured_states): (Vec<_>, Vec<_>) =
+            render_states.iter().partition(|state| state.texture_id.is_none());
+        self.ensure_instance_capacity(colored_states.len().max(1));
+        self.ensure_textured_instance_capacity(textured_states.len().max(1));
+        self.write_instances(&colored_states);
+        self.write_textured_instances(&textured_states);
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -421,7 +602,26 @@ impl Renderer {
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             pass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
             pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
-            pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..render_states.len() as u32);
+            pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..colored_states.len() as u32);
+            if !textured_states.is_empty() {
+                pass.set_pipeline(&self.textured_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, self.textured_instance_buffer.slice(..));
+                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.set_viewport(vp_x as f32, vp_y as f32, vp_w as f32, vp_h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(vp_x, vp_y, vp_w, vp_h);
+                for (index, state) in textured_states.iter().enumerate() {
+                    let Some(texture_id) = state.texture_id else {
+                        continue;
+                    };
+                    let Some(texture) = self.textures.get(&texture_id) else {
+                        continue;
+                    };
+                    pass.set_bind_group(1, &texture.bind_group, &[]);
+                    pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, index as u32..index as u32 + 1);
+                }
+            }
             self.text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
                 .context("failed to render text")?;
@@ -749,7 +949,20 @@ impl Renderer {
         });
     }
 
-    fn write_instances(&mut self, render_states: &[RenderState]) {
+    fn ensure_textured_instance_capacity(&mut self, required: usize) {
+        if required <= self.textured_instance_capacity {
+            return;
+        }
+        self.textured_instance_capacity = required.next_power_of_two();
+        self.textured_instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("textured-instance-buffer"),
+            size: (self.textured_instance_capacity * std::mem::size_of::<InstanceRaw>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+
+    fn write_instances(&mut self, render_states: &[&RenderState]) {
         if render_states.is_empty() {
             return;
         }
@@ -764,6 +977,93 @@ impl Renderer {
             0,
             bytemuck::cast_slice(&self.instance_staging),
         );
+    }
+
+    fn write_textured_instances(&mut self, render_states: &[&RenderState]) {
+        if render_states.is_empty() {
+            return;
+        }
+        self.textured_instance_staging.clear();
+        self.textured_instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
+            center: [state.x, state.y],
+            size: [state.width, state.height],
+            color: unpack_color(state.color),
+        }));
+        self.queue.write_buffer(
+            &self.textured_instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.textured_instance_staging),
+        );
+    }
+
+    fn sync_textures(&mut self, resources: &HashMap<u128, ClientResource>) -> Result<()> {
+        self.textures.retain(|texture_id, _| {
+            resources.get(texture_id).and_then(ClientResource::texture).is_some()
+        });
+
+        for (&texture_id, resource) in resources {
+            let Some(texture) = resource.texture() else {
+                continue;
+            };
+            if self.textures.contains_key(&texture_id) {
+                continue;
+            }
+            let size = wgpu::Extent3d {
+                width: texture.width.max(1),
+                height: texture.height.max(1),
+                depth_or_array_layers: 1,
+            };
+            let gpu_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("element-texture"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &texture.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(
+                        NonZeroU32::new(texture.width.max(1) * 4)
+                            .expect("texture row bytes must be non-zero")
+                            .into(),
+                    ),
+                    rows_per_image: Some(
+                        NonZeroU32::new(texture.height.max(1))
+                            .expect("texture height must be non-zero")
+                            .into(),
+                    ),
+                },
+                size,
+            );
+            let view = gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("element-texture-bind-group"),
+                layout: &self.texture_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                ],
+            });
+            self.textures.insert(texture_id, GpuTexture { _texture: gpu_texture, bind_group });
+        }
+        Ok(())
     }
 
     fn write_screen_uniform(&mut self) {
@@ -934,7 +1234,7 @@ fn push_rect(states: &mut Vec<RenderState>, x: f32, y: f32, width: f32, height: 
     let sy = y.round();
     let sw = width.max(1.0).round();
     let sh = height.max(1.0).round();
-    states.push(RenderState { x: sx, y: sy, width: sw, height: sh, color });
+    states.push(RenderState { x: sx, y: sy, width: sw, height: sh, color, texture_id: None });
 }
 
 fn draw_border(

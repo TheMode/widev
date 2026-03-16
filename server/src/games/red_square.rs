@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -6,15 +7,14 @@ use uuid::Uuid;
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    DeliveryOutcome, DeliveryPolicy, InputType, PacketBundle, PacketEnvelope, PacketTarget,
-    PredictionKind, S2CPacket, TransformPredictionMask,
+    DeliveryOutcome, DeliveryPolicy, InputType, MessageId, PacketBundle, PacketEnvelope,
+    PacketResource, PacketTarget, PredictionKind, S2CPacket, TransformPredictionMask,
 };
 
 const GAME_WIDTH: f32 = 800.0;
 const GAME_HEIGHT: f32 = 600.0;
 const PLAYER_SPEED: f32 = 220.0;
-const OWN_PLAYER_COLOR: [f32; 4] = [0.74, 0.17, 245.0, 1.0];
-const OTHER_PLAYER_COLOR: [f32; 4] = [0.65, 0.24, 29.0, 1.0];
+const PLAYER_TEXTURE_SIZE: u32 = 32;
 
 #[derive(Default, Clone, Copy)]
 struct PlayerInput {
@@ -38,11 +38,17 @@ struct PlayerState {
 
 pub struct RedSquareGame {
     players: HashMap<ClientId, PlayerState>,
+    player_texture_id: MessageId,
+    player_texture_png: Vec<u8>,
 }
 
 impl RedSquareGame {
-    pub fn new(_started_at: Instant, _state: &mut GameState) -> Self {
-        Self { players: HashMap::new() }
+    pub fn new(_started_at: Instant, state: &mut GameState) -> Self {
+        Self {
+            players: HashMap::new(),
+            player_texture_id: state.alloc_message_id(),
+            player_texture_png: encode_red_square_png(PLAYER_TEXTURE_SIZE),
+        }
     }
 
     fn spawn_element(client_id: ClientId) -> ElementState {
@@ -64,7 +70,7 @@ impl RedSquareGame {
             return;
         };
         let bootstrap_sequence_id = player.bootstrap_sequence_id;
-        let envelope_id = state.alloc_envelope_id();
+        let message_id = state.alloc_message_id();
 
         let mut bundle = vec![
             S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
@@ -89,9 +95,9 @@ impl RedSquareGame {
                 continue;
             };
             bundle.push(S2CPacket::ElementAdd { element_id });
-            bundle.push(S2CPacket::ElementSetColor {
+            bundle.push(S2CPacket::ElementSetTexture {
                 element_id,
-                color: if element_id == client_id { OWN_PLAYER_COLOR } else { OTHER_PLAYER_COLOR },
+                resource_id: self.player_texture_id,
             });
             bundle.push(S2CPacket::ElementSetTransformPrediction {
                 element_id,
@@ -107,9 +113,19 @@ impl RedSquareGame {
         }
         bundle.push(S2CPacket::Join {});
 
+        state.send_resource(
+            PacketResource::new(
+                PacketTarget::Client(client_id),
+                self.player_texture_id,
+                "image/png",
+                self.player_texture_png.clone(),
+                -1,
+            )
+            .sequence(bootstrap_sequence_id),
+        );
         state.send(
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
-                .id(envelope_id)
+                .id(message_id)
                 .delivery(DeliveryPolicy::RequireClientReceipt)
                 .sequence(bootstrap_sequence_id),
         );
@@ -127,7 +143,10 @@ impl Game for RedSquareGame {
                 let mut bundle: PacketBundle = Vec::new();
                 bundle.extend([
                     S2CPacket::ElementAdd { element_id: client_id },
-                    S2CPacket::ElementSetColor { element_id: client_id, color: OTHER_PLAYER_COLOR },
+                    S2CPacket::ElementSetTexture {
+                        element_id: client_id,
+                        resource_id: self.player_texture_id,
+                    },
                     S2CPacket::ElementSetTransformPrediction {
                         element_id: client_id,
                         enabled: true,
@@ -145,19 +164,19 @@ impl Game for RedSquareGame {
 
                 log::info!("client {client_id} connected");
             },
-            NetworkEvent::DeliveryUpdate { client_id, envelope_id, outcome } => match outcome {
+            NetworkEvent::DeliveryUpdate { client_id, message_id, outcome } => match outcome {
                 DeliveryOutcome::TransportDelivered => {
                     log::info!(
-                        "transport delivered envelope {envelope_id:032x} to client {client_id}"
+                        "transport delivered message {message_id:032x} to client {client_id}"
                     );
                 },
                 DeliveryOutcome::TransportDropped { reason } => {
                     log::info!(
-                            "transport dropped envelope {envelope_id:032x} for client {client_id}: {reason:?}"
+                            "transport dropped message {message_id:032x} for client {client_id}: {reason:?}"
                         );
                 },
                 DeliveryOutcome::ClientProcessed => {
-                    log::info!("client {client_id} processed envelope {envelope_id:032x}");
+                    log::info!("client {client_id} processed message {message_id:032x}");
                 },
             },
             NetworkEvent::ClientDisconnected(client_id) => {
@@ -231,4 +250,20 @@ impl Game for RedSquareGame {
             state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
         }
     }
+}
+
+fn encode_red_square_png(size: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(Cursor::new(&mut bytes), size, size);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("encoding generated texture header");
+        let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+        for _ in 0..(size * size) {
+            rgba.extend_from_slice(&[0xFF, 0x24, 0x24, 0xFF]);
+        }
+        writer.write_image_data(&rgba).expect("encoding generated texture payload");
+    }
+    bytes
 }

@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::packets::{EnvelopeId, PacketControl, PacketEnvelope, PacketMessage};
+use crate::packets::{MessageId, PacketControl, PacketEnvelope, PacketMessage, PacketResource};
 
 pub struct GameState {
     outbox: VecDeque<PacketMessage>,
-    next_envelope_id: EnvelopeId,
+    next_message_id: MessageId,
     ticks_per_second: u16,
 }
 
@@ -13,7 +13,7 @@ impl GameState {
     pub fn new(ticks_per_second: u16) -> Self {
         Self {
             outbox: VecDeque::new(),
-            next_envelope_id: 1,
+            next_message_id: 1,
             ticks_per_second: ticks_per_second.max(1),
         }
     }
@@ -30,9 +30,13 @@ impl GameState {
         self.outbox.push_back(PacketMessage::Envelope(envelope));
     }
 
-    pub fn alloc_envelope_id(&mut self) -> EnvelopeId {
-        let id = self.next_envelope_id;
-        self.next_envelope_id = self.next_envelope_id.wrapping_add(1).max(1);
+    pub fn send_resource(&mut self, resource: PacketResource) {
+        self.outbox.push_back(PacketMessage::Resource(resource));
+    }
+
+    pub fn alloc_message_id(&mut self) -> MessageId {
+        let id = self.next_message_id;
+        self.next_message_id = self.next_message_id.wrapping_add(1).max(1);
         id
     }
 

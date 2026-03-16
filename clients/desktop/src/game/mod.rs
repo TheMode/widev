@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ const FIXED_FRAME_DT_SECONDS: f32 = 1.0 / 60.0;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
 const LATENCY_SMOOTHING_ALPHA: f64 = 0.06;
 const PLAYER_SIZE: f32 = 32.0;
-const DEFAULT_PLAYER_COLOR: protocol::Color = [0.65, 0.24, 29.0, 1.0];
+const DEFAULT_ELEMENT_TINT: protocol::Color = [1.0, 0.0, 0.0, 1.0];
 const CLIENT_CAPABILITIES: &[&str] = &[
     "render.draw_square",
     "prediction.lerp",
@@ -35,6 +36,69 @@ pub struct GameConfig {
     pub server_addr: SocketAddr,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TextureResource {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) rgba: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum ClientResourcePayload {
+    Texture(TextureResource),
+    Unsupported,
+}
+
+#[derive(Clone)]
+pub(super) struct ClientResource {
+    resource_type: String,
+    remaining_uses: Option<u32>,
+    active_elements: HashSet<u32>,
+    payload: ClientResourcePayload,
+}
+
+impl ClientResource {
+    fn new(resource_type: String, usage_count: i32, blob: &[u8]) -> Result<Self> {
+        let remaining_uses = match usage_count {
+            -1 => None,
+            0.. => Some(usage_count as u32),
+            _ => return Err(anyhow::anyhow!("invalid resource usage_count={usage_count}")),
+        };
+        let payload = decode_resource_payload(&resource_type, blob);
+        Ok(Self { resource_type, remaining_uses, active_elements: HashSet::new(), payload })
+    }
+
+    pub(super) fn texture(&self) -> Option<&TextureResource> {
+        match &self.payload {
+            ClientResourcePayload::Texture(texture) => Some(texture),
+            ClientResourcePayload::Unsupported => None,
+        }
+    }
+
+    fn usage_count_display(&self) -> i32 {
+        self.remaining_uses.map(|remaining| remaining as i32).unwrap_or(-1)
+    }
+
+    fn consume_for_element(&mut self, element_id: u32) -> bool {
+        if matches!(self.remaining_uses, Some(0)) {
+            return false;
+        }
+        if let Some(remaining_uses) = &mut self.remaining_uses {
+            *remaining_uses -= 1;
+        }
+        self.active_elements.insert(element_id);
+        true
+    }
+
+    fn release_element(&mut self, element_id: u32) {
+        self.active_elements.remove(&element_id);
+    }
+
+    fn should_free(&self) -> bool {
+        matches!(self.remaining_uses, Some(0)) && self.active_elements.is_empty()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct RenderState {
     pub(super) x: f32,
@@ -42,6 +106,7 @@ pub(super) struct RenderState {
     pub(super) width: f32,
     pub(super) height: f32,
     pub(super) color: u32,
+    pub(super) texture_id: Option<protocol::MessageId>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -143,6 +208,7 @@ impl SessionBootstrap {
 struct ElementState {
     visible: bool,
     color: protocol::Color,
+    texture_id: Option<protocol::MessageId>,
     last_authoritative: Vec2f,
     last_authoritative_at: Instant,
     target: Vec2f,
@@ -179,6 +245,7 @@ impl ElementState {
         Self {
             visible: false,
             color,
+            texture_id: None,
             last_authoritative: Vec2f::default(),
             last_authoritative_at: now,
             target: Vec2f::default(),
@@ -237,8 +304,9 @@ pub(super) struct ClientGame {
     phase: ClientPhase,
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
-    pending_envelopes: VecDeque<protocol::decode::DecodedEnvelope>,
-    processed_envelope_ids: HashSet<protocol::EnvelopeId>,
+    resources: HashMap<protocol::MessageId, ClientResource>,
+    pending_messages: VecDeque<protocol::decode::DecodedServerMessage>,
+    processed_message_ids: HashSet<u128>,
     bootstrap: SessionBootstrap,
     bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
@@ -247,6 +315,7 @@ pub(super) struct ClientGame {
     next_ping_nonce: u64,
     last_ping_sent_at: Instant,
     smoothed_path_rtt: Option<Duration>,
+    render_revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -262,8 +331,9 @@ impl ClientGame {
             phase: ClientPhase::Connecting,
             server_cert_fingerprint: None,
             elements: HashMap::new(),
-            pending_envelopes: VecDeque::new(),
-            processed_envelope_ids: HashSet::new(),
+            resources: HashMap::new(),
+            pending_messages: VecDeque::new(),
+            processed_message_ids: HashSet::new(),
             bootstrap: SessionBootstrap::new(),
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
@@ -272,6 +342,7 @@ impl ClientGame {
             next_ping_nonce: 1,
             last_ping_sent_at: Instant::now(),
             smoothed_path_rtt: None,
+            render_revision: 0,
         })
     }
 
@@ -281,12 +352,12 @@ impl ClientGame {
         self.ensure_server_identity_logged();
 
         for bytes in incoming.datagrams.into_iter().chain(incoming.streams) {
-            let Some(envelope) = protocol::decode::s2c_envelope(&bytes) else {
+            let Some(message) = protocol::decode::server_message(&bytes) else {
                 continue;
             };
-            self.pending_envelopes.push_back(envelope);
+            self.pending_messages.push_back(message);
         }
-        self.process_ready_envelopes()?;
+        self.process_ready_messages()?;
 
         if self.net.is_established() && self.phase == ClientPhase::Connecting {
             let hello = protocol::C2SPacket::ClientHello {
@@ -350,15 +421,24 @@ impl ClientGame {
     pub(super) fn render_states(&self) -> Vec<RenderState> {
         self.elements
             .values()
-            .filter(|e| e.visible)
+            .filter(|e| e.visible && e.texture_id.and_then(|id| self.texture_resource(id)).is_some())
             .map(|e| RenderState {
                 x: e.draw.x,
                 y: e.draw.y,
                 width: PLAYER_SIZE,
                 height: PLAYER_SIZE,
                 color: oklch_to_u32(e.color),
+                texture_id: e.texture_id,
             })
             .collect()
+    }
+
+    pub(super) fn resources(&self) -> &HashMap<protocol::MessageId, ClientResource> {
+        &self.resources
+    }
+
+    pub(super) fn render_revision(&self) -> u64 {
+        self.render_revision
     }
 
     pub(super) fn game_name(&self) -> &str {
@@ -510,7 +590,7 @@ impl ClientGame {
             self.pending_prediction.remove(&element_id).unwrap_or(self.default_prediction);
         self.elements
             .entry(element_id)
-            .or_insert_with(|| ElementState::hidden(now, prediction, DEFAULT_PLAYER_COLOR));
+            .or_insert_with(|| ElementState::hidden(now, prediction, DEFAULT_ELEMENT_TINT));
     }
 
     fn handle_element_move(&mut self, element_id: u32, x: f32, y: f32) {
@@ -532,6 +612,39 @@ impl ClientGame {
             element.color = color;
         } else {
             log::debug!("ignored ElementSetColor for unknown element_id={element_id}");
+        }
+    }
+
+    fn apply_element_texture(&mut self, element_id: u32, resource_id: protocol::MessageId) {
+        let Some(previous_resource_id) = self.element_texture_id(element_id) else {
+            log::debug!("ignored ElementSetTexture for unknown element_id={element_id}");
+            return;
+        };
+
+        if let Some(previous_resource_id) = previous_resource_id.filter(|id| *id != resource_id) {
+            self.release_resource_binding(previous_resource_id, element_id);
+        }
+
+        let mut accepted = true;
+        if self.resources.contains_key(&resource_id) {
+            accepted = self.bind_resource_to_element(resource_id, element_id);
+        }
+
+        let next_texture_id = if accepted {
+            Some(resource_id)
+        } else if previous_resource_id == Some(resource_id) {
+            previous_resource_id
+        } else {
+            None
+        };
+        let changed = self.set_element_texture_id(element_id, next_texture_id);
+
+        if !accepted {
+            log::warn!("resource {resource_id} has no remaining uses for element {element_id}");
+        }
+
+        if changed && next_texture_id != previous_resource_id {
+            self.bump_render_revision();
         }
     }
 
@@ -588,6 +701,12 @@ impl ClientGame {
             protocol::S2CPacket::ElementSetColor { element_id, color } => {
                 self.apply_element_color(element_id, color);
             },
+            protocol::S2CPacket::ElementSetTexture { element_id, resource_id } => {
+                self.apply_element_texture(element_id, resource_id);
+            },
+            protocol::S2CPacket::ResourceFree { resource_id } => {
+                self.free_resource(resource_id);
+            },
             protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
                 self.handle_binding_declare(binding_id, identifier, input_type)?;
             },
@@ -598,7 +717,11 @@ impl ClientGame {
                 self.handle_element_move(element_id, x, y);
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
-                self.elements.remove(&element_id);
+                if let Some(element) = self.elements.remove(&element_id) {
+                    if let Some(resource_id) = element.texture_id {
+                        self.release_resource_binding(resource_id, element_id);
+                    }
+                }
                 self.pending_prediction.remove(&element_id);
             },
         }
@@ -606,22 +729,26 @@ impl ClientGame {
         Ok(())
     }
 
-    fn process_ready_envelopes(&mut self) -> Result<()> {
+    fn process_ready_messages(&mut self) -> Result<()> {
         loop {
             let mut progressed = false;
             let mut remaining = VecDeque::new();
 
-            while let Some(envelope) = self.pending_envelopes.pop_front() {
-                if !self.dependency_satisfied(envelope.dependency_id) {
-                    remaining.push_back(envelope);
+            while let Some(message) = self.pending_messages.pop_front() {
+                let dependency_id = match &message {
+                    protocol::decode::DecodedServerMessage::Envelope(envelope) => envelope.dependency_id,
+                    protocol::decode::DecodedServerMessage::Resource(resource) => resource.dependency_id,
+                };
+                if !self.dependency_satisfied(dependency_id) {
+                    remaining.push_back(message);
                     continue;
                 }
 
-                self.apply_decoded_envelope(envelope)?;
+                self.apply_decoded_message(message)?;
                 progressed = true;
             }
 
-            self.pending_envelopes = remaining;
+            self.pending_messages = remaining;
             if !progressed {
                 break;
             }
@@ -630,23 +757,37 @@ impl ClientGame {
         Ok(())
     }
 
-    fn dependency_satisfied(&self, dependency_id: Option<protocol::EnvelopeId>) -> bool {
-        dependency_id.is_none_or(|id| self.processed_envelope_ids.contains(&id))
+    fn dependency_satisfied(&self, dependency_id: Option<protocol::MessageId>) -> bool {
+        dependency_id.is_none_or(|id| self.processed_message_ids.contains(&id))
     }
 
-    fn apply_decoded_envelope(
+    fn apply_decoded_message(
         &mut self,
-        envelope: protocol::decode::DecodedEnvelope,
+        message: protocol::decode::DecodedServerMessage,
     ) -> Result<()> {
-        for packet in envelope.packets {
-            self.handle_server_packet(packet)?;
+        let receipt_id = match &message {
+            protocol::decode::DecodedServerMessage::Envelope(envelope) => envelope.receipt_id,
+            protocol::decode::DecodedServerMessage::Resource(resource) => resource.receipt_id,
+        };
+
+        match message {
+            protocol::decode::DecodedServerMessage::Envelope(envelope) => {
+                for packet in envelope.packets {
+                    self.handle_server_packet(packet)?;
+                }
+
+                if let Some(id) = envelope.id {
+                    self.processed_message_ids.insert(id);
+                }
+            },
+            protocol::decode::DecodedServerMessage::Resource(resource) => {
+                self.store_resource(resource.id, resource.resource_type, resource.usage_count, resource.blob)?;
+                self.processed_message_ids.insert(resource.id);
+            },
         }
 
-        if let Some(id) = envelope.id {
-            self.processed_envelope_ids.insert(id);
-        }
-        if let Some(envelope_id) = envelope.receipt_id {
-            self.send_when_connected(protocol::C2SPacket::Receipt { envelope_id })?;
+        if let Some(message_id) = receipt_id {
+            self.send_when_connected(protocol::C2SPacket::Receipt { message_id })?;
         }
 
         Ok(())
@@ -684,6 +825,122 @@ impl ClientGame {
         self.last_ping_sent_at = Instant::now();
         self.send_c2s(protocol::C2SPacket::Ping { nonce })
     }
+
+    fn store_resource(
+        &mut self,
+        resource_id: protocol::MessageId,
+        resource_type: String,
+        usage_count: i32,
+        blob: Vec<u8>,
+    ) -> Result<()> {
+        let resource = match ClientResource::new(resource_type, usage_count, &blob) {
+            Ok(resource) => resource,
+            Err(_) => {
+                log::warn!("ignored invalid resource {resource_id} usage_count={usage_count}");
+                return Ok(());
+            },
+        };
+        let had_texture = self.texture_resource(resource_id).is_some();
+        self.resources.insert(resource_id, resource);
+        self.reconcile_resource_bindings(resource_id);
+        let has_texture = self.texture_resource(resource_id).is_some();
+        if had_texture != has_texture {
+            self.bump_render_revision();
+        }
+        if let Some(resource) = self.resources.get(&resource_id) {
+            log::debug!(
+                "received resource {} type={} bytes={} remaining_uses={}",
+                resource_id,
+                resource.resource_type,
+                blob.len(),
+                resource.usage_count_display()
+            );
+        }
+        Ok(())
+    }
+
+    fn texture_resource(&self, resource_id: protocol::MessageId) -> Option<&TextureResource> {
+        self.resources.get(&resource_id).and_then(ClientResource::texture)
+    }
+
+    fn bind_resource_to_element(
+        &mut self,
+        resource_id: protocol::MessageId,
+        element_id: u32,
+    ) -> bool {
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return false;
+        };
+        resource.consume_for_element(element_id)
+    }
+
+    fn release_resource_binding(&mut self, resource_id: protocol::MessageId, element_id: u32) {
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            return;
+        };
+        resource.release_element(element_id);
+        if resource.should_free() {
+            self.resources.remove(&resource_id);
+            self.bump_render_revision();
+        }
+    }
+
+    fn free_resource(&mut self, resource_id: protocol::MessageId) {
+        let Some(resource) = self.resources.remove(&resource_id) else {
+            return;
+        };
+
+        for element_id in resource.active_elements {
+            let changed = self.set_element_texture_id(element_id, None);
+            if changed {
+                log::debug!("cleared freed resource {resource_id} from element {element_id}");
+            }
+        }
+
+        self.bump_render_revision();
+        log::debug!("freed resource {resource_id} on server request");
+    }
+
+    fn reconcile_resource_bindings(&mut self, resource_id: protocol::MessageId) {
+        let element_ids: Vec<u32> = self
+            .elements
+            .iter()
+            .filter_map(|(&element_id, element)| (element.texture_id == Some(resource_id)).then_some(element_id))
+            .collect();
+
+        for element_id in element_ids {
+            if self.bind_resource_to_element(resource_id, element_id) {
+                continue;
+            }
+            if self.set_element_texture_id(element_id, None) {
+                self.bump_render_revision();
+            }
+            log::warn!("resource {resource_id} exhausted before binding to element {element_id}");
+        }
+    }
+
+    fn element_texture_id(&self, element_id: u32) -> Option<Option<protocol::MessageId>> {
+        self.elements.get(&element_id).map(|element| element.texture_id)
+    }
+
+    fn set_element_texture_id(
+        &mut self,
+        element_id: u32,
+        texture_id: Option<protocol::MessageId>,
+    ) -> bool {
+        let Some(element) = self.elements.get_mut(&element_id) else {
+            return false;
+        };
+        if element.texture_id == texture_id {
+            return false;
+        }
+        element.texture_id = texture_id;
+        true
+    }
+
+    fn bump_render_revision(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+    }
 }
 
 pub fn run(config: GameConfig) -> Result<()> {
@@ -713,6 +970,32 @@ fn oklch_to_u32([l, c, h_deg, _alpha]: protocol::Color) -> u32 {
     (((r * 255.0).round() as u32) << 16)
         | (((g * 255.0).round() as u32) << 8)
         | ((b * 255.0).round() as u32)
+}
+
+fn decode_png_texture(bytes: &[u8]) -> Result<TextureResource> {
+    let mut decoder = png::Decoder::new(Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info()?;
+    let mut rgba = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut rgba)?;
+    if info.color_type != png::ColorType::Rgba {
+        return Err(anyhow::anyhow!("expected RGBA png output, got {:?}", info.color_type));
+    }
+    rgba.truncate(info.buffer_size());
+    Ok(TextureResource { width: info.width, height: info.height, rgba })
+}
+
+fn decode_resource_payload(resource_type: &str, blob: &[u8]) -> ClientResourcePayload {
+    match resource_type {
+        "image/png" => match decode_png_texture(blob) {
+            Ok(texture) => ClientResourcePayload::Texture(texture),
+            Err(err) => {
+                log::warn!("failed decoding png resource: {err:#}");
+                ClientResourcePayload::Unsupported
+            },
+        },
+        _ => ClientResourcePayload::Unsupported,
+    }
 }
 
 fn fingerprint_hex(der: &[u8]) -> String {

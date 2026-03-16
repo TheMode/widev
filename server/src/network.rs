@@ -14,13 +14,13 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
-use crate::packet_codec::{decode_c2s_packet, serialize_envelope_frames, serialize_s2c_packet};
+use crate::packet_codec::{decode_c2s_packet, serialize_packet_message, serialize_s2c_packet};
 use crate::packet_scheduler::{
-    DispatchEnvelope, PacketScheduler, SchedulerAction, SchedulerCommand,
+    DispatchKind, DispatchMessage, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
 use crate::packets::{
     DropReason, PacketControl, PacketEnvelope, PacketMessage, PacketOrder, PacketPriority,
-    PacketTarget,
+    PacketResource, PacketTarget,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -220,6 +220,13 @@ fn validate_message_for_dispatch(message: &PacketMessage) -> bool {
         PacketMessage::Envelope(envelope) => {
             if let Err(err) = envelope.validate() {
                 log::warn!("dropping invalid envelope: {err}");
+                return false;
+            }
+            true
+        },
+        PacketMessage::Resource(resource) => {
+            if let Err(err) = resource.validate() {
+                log::warn!("dropping invalid resource: {err}");
                 return false;
             }
             true
@@ -643,6 +650,9 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
                     PacketMessage::Envelope(envelope) => {
                         dispatch_envelope_for_thread(shard, envelope)
                     },
+                    PacketMessage::Resource(resource) => {
+                        dispatch_resource_for_thread(shard, resource)
+                    },
                     PacketMessage::Control(control) => dispatch_control_for_thread(shard, *control),
                 }
             }
@@ -733,16 +743,30 @@ fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<
 }
 
 fn dispatch_envelope_for_thread(shard: &mut ShardState, envelope: &PacketEnvelope) {
-    if !envelope_has_local_targets(shard, envelope.target) {
+    if !envelope_has_local_targets(shard, envelope.meta.target) {
         return;
     }
 
-    let Some(framed) = serialize_envelope_frames(envelope) else {
+    let Some(framed) = serialize_packet_message(&PacketMessage::Envelope(envelope.clone())) else {
         return;
     };
 
-    for_each_target_session_mut(shard, envelope.target, |session| {
+    for_each_target_session_mut(shard, envelope.meta.target, |session| {
         session.send_envelope(envelope, &framed);
+    });
+}
+
+fn dispatch_resource_for_thread(shard: &mut ShardState, resource: &PacketResource) {
+    if !envelope_has_local_targets(shard, resource.meta.target) {
+        return;
+    }
+
+    let Some(framed) = serialize_packet_message(&PacketMessage::Resource(resource.clone())) else {
+        return;
+    };
+
+    for_each_target_session_mut(shard, resource.meta.target, |session| {
+        session.send_resource(resource, &framed);
     });
 }
 
@@ -898,10 +922,10 @@ fn decode_and_forward_c2s(
                 );
             }
         },
-        Some(crate::packets::C2SPacket::Receipt { envelope_id }) => {
+        Some(crate::packets::C2SPacket::Receipt { message_id }) => {
             let _ = event_tx.send(NetworkEvent::DeliveryUpdate {
                 client_id: session.client_id,
-                envelope_id,
+                message_id,
                 outcome: crate::packets::DeliveryOutcome::ClientProcessed,
             });
         },
@@ -1103,7 +1127,7 @@ struct PendingStreamWrite {
     offset: usize,
     fin: bool,
     tracks_inflight: bool,
-    transport_receipt_id: Option<crate::packets::EnvelopeId>,
+    transport_receipt_id: Option<crate::packets::MessageId>,
 }
 
 #[derive(Default)]
@@ -1212,13 +1236,21 @@ impl Session {
     }
 
     fn send_envelope(&mut self, envelope: &PacketEnvelope, framed: &[u8]) {
-        self.dispatch_scheduler_command(SchedulerCommand::Envelope(DispatchEnvelope {
-            id: envelope.id,
-            priority: envelope.priority,
-            order: envelope.order,
-            delivery: envelope.delivery,
-            framed: framed.to_vec(),
-        }));
+        self.dispatch_scheduler_command(SchedulerCommand::Message(DispatchMessage::new(
+            DispatchKind::Envelope,
+            envelope.id,
+            envelope.meta,
+            framed.to_vec(),
+        )));
+    }
+
+    fn send_resource(&mut self, resource: &PacketResource, framed: &[u8]) {
+        self.dispatch_scheduler_command(SchedulerCommand::Message(DispatchMessage::new(
+            DispatchKind::Resource,
+            Some(resource.id),
+            resource.meta,
+            framed.to_vec(),
+        )));
     }
 
     fn dispatch_scheduler_command(&mut self, command: SchedulerCommand) {
@@ -1247,19 +1279,19 @@ impl Session {
         action: SchedulerAction,
     ) -> Option<Vec<SchedulerAction>> {
         match action {
-            SchedulerAction::DispatchEnvelope { envelope, force_flush } => {
-                match self.dispatch_ordered_envelope(envelope.clone(), force_flush) {
+            SchedulerAction::DispatchMessage { message, force_flush } => {
+                match self.dispatch_message(message.clone(), force_flush) {
                     EnvelopeDispatchResult::Sent => None,
                     EnvelopeDispatchResult::Dropped(reason) => {
                         self.emit_delivery_update(
-                            envelope.delivery,
-                            envelope.id,
+                            message.delivery(),
+                            message.maybe_id(),
                             crate::packets::DeliveryOutcome::TransportDropped { reason },
                         );
                         None
                     },
                     EnvelopeDispatchResult::DeferredByCongestion => {
-                        self.scheduler.requeue_deferred(envelope, Instant::now());
+                        self.scheduler.requeue_deferred_message(message, Instant::now());
                         None
                     },
                 }
@@ -1283,17 +1315,18 @@ impl Session {
                     None
                 }
             },
-            SchedulerAction::DropEnvelope { envelope, reason } => {
+            SchedulerAction::DropMessage { message, reason } => {
                 self.emit_delivery_update(
-                    envelope.delivery,
-                    envelope.id,
+                    message.delivery(),
+                    message.maybe_id(),
                     crate::packets::DeliveryOutcome::TransportDropped { reason },
                 );
                 log::debug!(
-                    "dropping scheduled envelope for client {}: id={:?} order={:?} reason={:?}",
+                    "dropping scheduled {} for client {}: id={:?} order={:?} reason={:?}",
+                    message.kind_name(),
                     self.client_id,
-                    envelope.id,
-                    envelope.order,
+                    message.maybe_id(),
+                    message.order(),
                     reason
                 );
                 None
@@ -1301,55 +1334,58 @@ impl Session {
         }
     }
 
-    fn can_send_as_datagram(&self, envelope: &DispatchEnvelope) -> bool {
+    fn can_send_as_datagram(&self, message: &DispatchMessage) -> bool {
         let datagram_fits = self
             .conn
             .dgram_max_writable_len()
-            .is_some_and(|max_len| envelope.payload_len() <= max_len);
+            .is_some_and(|max_len| message.payload_len() <= max_len);
 
-        envelope.is_datagram_eligible() && datagram_fits
+        message.is_datagram_eligible() && datagram_fits
     }
 
-    fn send_datagram(&mut self, envelope: &DispatchEnvelope) -> EnvelopeDispatchResult {
-        match self.conn.dgram_send(&envelope.framed) {
+    fn send_datagram(&mut self, message: &DispatchMessage) -> EnvelopeDispatchResult {
+        match self.conn.dgram_send(message.framed()) {
             Ok(()) => {
                 self.emit_delivery_update(
-                    envelope.delivery,
-                    envelope.id,
+                    message.delivery(),
+                    message.maybe_id(),
                     crate::packets::DeliveryOutcome::TransportDelivered,
                 );
                 log::debug!(
-                    "client {} sent envelope {:?} ({:?}) as datagram",
+                    "client {} sent {} {:?} ({:?}) as datagram",
                     self.client_id,
-                    envelope.id,
-                    envelope.order
+                    message.kind_name(),
+                    message.maybe_id(),
+                    message.order()
                 );
                 EnvelopeDispatchResult::Sent
             },
             Err(
                 quiche::Error::Done | quiche::Error::InvalidState | quiche::Error::BufferTooShort,
             ) => {
-                let result = match envelope.priority {
+                let result = match message.priority() {
                     PacketPriority::Deadline { .. } => EnvelopeDispatchResult::DeferredByCongestion,
                     _ => EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected),
                 };
                 log::debug!(
-                    "{} datagram envelope for client {}: id={:?} order={:?}",
+                    "{} datagram {} for client {}: id={:?} order={:?}",
                     match result {
                         EnvelopeDispatchResult::DeferredByCongestion => "deferring",
                         EnvelopeDispatchResult::Dropped(_) => "dropping",
                         EnvelopeDispatchResult::Sent => "sent",
                     },
+                    message.kind_name(),
                     self.client_id,
-                    envelope.id,
-                    envelope.order
+                    message.maybe_id(),
+                    message.order()
                 );
                 result
             },
             Err(err) => {
                 log::debug!(
-                    "dropping datagram envelope for client {} after dgram_send error: {err:?}",
-                    self.client_id
+                    "dropping datagram {} for client {} after dgram_send error: {err:?}",
+                    message.kind_name(),
+                    self.client_id,
                 );
                 EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected)
             },
@@ -1403,16 +1439,13 @@ impl Session {
         }
     }
 
-    fn dispatch_ordered_envelope(
+    fn dispatch_message(
         &mut self,
-        envelope: DispatchEnvelope,
+        message: DispatchMessage,
         force_flush: bool,
     ) -> EnvelopeDispatchResult {
-        let DispatchEnvelope { id, priority, order, delivery, framed } = envelope;
-        let transport_meta = DispatchEnvelope { id, priority, order, delivery, framed };
-
-        if self.can_send_as_datagram(&transport_meta) {
-            match self.send_datagram(&transport_meta) {
+        if self.can_send_as_datagram(&message) {
+            match self.send_datagram(&message) {
                 EnvelopeDispatchResult::Sent => {
                     return EnvelopeDispatchResult::Sent;
                 },
@@ -1427,48 +1460,47 @@ impl Session {
             }
         }
 
-        if transport_meta.is_droppable()
-            && !self.has_stream_budget(transport_meta.framed.len())
-            && !force_flush
+        if message.is_droppable() && !self.has_stream_budget(message.framed().len()) && !force_flush
         {
             log::debug!(
-                "dropping envelope for client {} due to stream congestion budget",
+                "dropping {} for client {} due to stream congestion budget",
+                message.kind_name(),
                 self.client_id
             );
             return EnvelopeDispatchResult::Dropped(DropReason::CongestionBudgetExceeded);
         }
 
-        if transport_meta.is_deadline()
-            && !self.has_stream_budget(transport_meta.framed.len())
-            && !force_flush
+        if message.is_deadline() && !self.has_stream_budget(message.framed().len()) && !force_flush
         {
             log::debug!(
-                "deferring deadline envelope for client {} due to stream congestion budget",
-                self.client_id
+                "deferring deadline {} for client {} due to stream congestion budget",
+                message.kind_name(),
+                self.client_id,
             );
             return EnvelopeDispatchResult::DeferredByCongestion;
         }
 
-        let StreamTarget { stream_id, fin } = self.resolve_stream_target(order);
+        let StreamTarget { stream_id, fin } = self.resolve_stream_target(message.order());
 
         log::debug!(
-            "client {} opening server stream {} for envelope {:?} ({:?}, fin={})",
+            "client {} opening server stream {} for {} {:?} ({:?}, fin={})",
             self.client_id,
             stream_id,
-            id,
-            order,
+            message.kind_name(),
+            message.maybe_id(),
+            message.order(),
             fin
         );
         self.queue_stream_payloads(
             stream_id,
-            &transport_meta.framed,
+            message.framed(),
             fin,
             matches!(
-                transport_meta.delivery,
+                message.delivery(),
                 crate::packets::DeliveryPolicy::ObserveTransport
                     | crate::packets::DeliveryPolicy::RequireClientReceipt
             )
-            .then_some(transport_meta.id)
+            .then_some(message.maybe_id())
             .flatten(),
         );
         EnvelopeDispatchResult::Sent
@@ -1505,7 +1537,7 @@ impl Session {
         stream_id: u64,
         payload: &[u8],
         fin: bool,
-        transport_receipt_id: Option<crate::packets::EnvelopeId>,
+        transport_receipt_id: Option<crate::packets::MessageId>,
     ) {
         if payload.is_empty() {
             return;
@@ -1585,10 +1617,10 @@ impl Session {
                             break;
                         }
                         if chunk.tracks_inflight {
-                            if let Some(envelope_id) = chunk.transport_receipt_id {
+                            if let Some(message_id) = chunk.transport_receipt_id {
                                 let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
                                     client_id: self.client_id,
-                                    envelope_id,
+                                    message_id,
                                     outcome: crate::packets::DeliveryOutcome::TransportDelivered,
                                 });
                             }
@@ -1641,18 +1673,18 @@ impl Session {
     fn emit_delivery_update(
         &self,
         delivery: crate::packets::DeliveryPolicy,
-        id: Option<crate::packets::EnvelopeId>,
+        id: Option<crate::packets::MessageId>,
         outcome: crate::packets::DeliveryOutcome,
     ) {
         if delivery == crate::packets::DeliveryPolicy::None {
             return;
         }
-        let Some(envelope_id) = id else {
+        let Some(message_id) = id else {
             return;
         };
         let _ = self.event_tx.send(NetworkEvent::DeliveryUpdate {
             client_id: self.client_id,
-            envelope_id,
+            message_id,
             outcome,
         });
     }

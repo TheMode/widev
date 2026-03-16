@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::game_state::GameState;
-use crate::packets::{C2SPacket, DeliveryOutcome, EnvelopeId};
+use crate::packets::{C2SPacket, DeliveryOutcome, MessageId};
 
 pub type ClientId = u32;
 
@@ -11,7 +11,7 @@ pub enum NetworkEvent {
     ClientDisconnected(ClientId),
     DeliveryUpdate {
         client_id: ClientId,
-        envelope_id: EnvelopeId,
+        message_id: MessageId,
         outcome: DeliveryOutcome,
     },
     ClientPacket {

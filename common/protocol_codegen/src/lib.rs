@@ -119,7 +119,7 @@ impl CodegenBackend for RustBackend {
         write_codec_fn(&mut out, "encode_c2s", "decode_c2s", "C2SPacket");
         write_codec_fn(&mut out, "encode_s2c", "decode_s2c", "S2CPacket");
 
-        if schema.typedefs.iter().any(|typedef_def| typedef_def.name == "EnvelopeId") {
+        if schema.typedefs.iter().any(|typedef_def| typedef_def.name == "MessageId") {
             write_decode_module(&mut out);
         }
 
@@ -227,14 +227,30 @@ fn write_decode_module(out: &mut String) {
         "{}",
         r#"
 pub mod decode {
-    use super::{decode_s2c, EnvelopeId, S2CPacket};
+    use super::{decode_s2c, MessageId, S2CPacket};
 
     #[derive(Debug, Clone)]
     pub struct DecodedEnvelope {
-        pub id: Option<EnvelopeId>,
-        pub receipt_id: Option<EnvelopeId>,
-        pub dependency_id: Option<EnvelopeId>,
+        pub id: Option<MessageId>,
+        pub receipt_id: Option<MessageId>,
+        pub dependency_id: Option<MessageId>,
         pub packets: Vec<S2CPacket>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct DecodedResource {
+        pub id: MessageId,
+        pub receipt_id: Option<MessageId>,
+        pub dependency_id: Option<MessageId>,
+        pub resource_type: String,
+        pub usage_count: i32,
+        pub blob: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum DecodedServerMessage {
+        Envelope(DecodedEnvelope),
+        Resource(DecodedResource),
     }
 
     pub fn s2c_envelope(bytes: &[u8]) -> Option<DecodedEnvelope> {
@@ -250,7 +266,7 @@ pub mod decode {
         let flags = bytes[1];
         let mut cursor = 2usize;
         let id = if flags & FLAG_HAS_ID != 0 {
-            read_envelope_id(bytes, &mut cursor)
+            read_message_id(bytes, &mut cursor)
         } else {
             None
         };
@@ -260,7 +276,7 @@ pub mod decode {
             None
         };
         let dependency_id = if flags & FLAG_HAS_DEPENDENCY != 0 {
-            read_envelope_id(bytes, &mut cursor)
+            read_message_id(bytes, &mut cursor)
         } else {
             None
         };
@@ -275,7 +291,65 @@ pub mod decode {
         Some(DecodedEnvelope { id, receipt_id, dependency_id, packets })
     }
 
-    fn read_envelope_id(bytes: &[u8], cursor: &mut usize) -> Option<EnvelopeId> {
+    pub fn server_message(bytes: &[u8]) -> Option<DecodedServerMessage> {
+        const FRAME_VERSION: u8 = 1;
+        const FRAME_KIND_ENVELOPE: u8 = 1;
+        const FRAME_KIND_RESOURCE: u8 = 2;
+        const FLAG_CLIENT_PROCESSED_RECEIPT: u8 = 1 << 0;
+        const FLAG_HAS_DEPENDENCY: u8 = 1 << 1;
+
+        if bytes.len() < 2 || bytes[0] != FRAME_VERSION {
+            return None;
+        }
+
+        match bytes[1] {
+            FRAME_KIND_ENVELOPE => {
+                s2c_envelope(&bytes[2..]).map(DecodedServerMessage::Envelope)
+            },
+            FRAME_KIND_RESOURCE => {
+                let payload = &bytes[2..];
+                if payload.len() < 1 + 16 + 2 + 4 + 4 {
+                    return None;
+                }
+
+                let flags = payload[0];
+                let mut cursor = 1usize;
+                let id = read_message_id(payload, &mut cursor)?;
+                let receipt_id = if flags & FLAG_CLIENT_PROCESSED_RECEIPT != 0 {
+                    Some(id)
+                } else {
+                    None
+                };
+                let dependency_id = if flags & FLAG_HAS_DEPENDENCY != 0 {
+                    read_message_id(payload, &mut cursor)
+                } else {
+                    None
+                };
+
+                let resource_type_len = read_u16(payload, &mut cursor)? as usize;
+                let resource_type =
+                    String::from_utf8(payload.get(cursor..cursor + resource_type_len)?.to_vec())
+                        .ok()?;
+                cursor += resource_type_len;
+
+                let usage_count = read_i32(payload, &mut cursor)?;
+                let blob_len = read_u32(payload, &mut cursor)? as usize;
+                let blob = payload.get(cursor..cursor + blob_len)?.to_vec();
+
+                Some(DecodedServerMessage::Resource(DecodedResource {
+                    id,
+                    receipt_id,
+                    dependency_id,
+                    resource_type,
+                    usage_count,
+                    blob,
+                }))
+            },
+            _ => None,
+        }
+    }
+
+    fn read_message_id(bytes: &[u8], cursor: &mut usize) -> Option<MessageId> {
         if bytes.len() < *cursor + 16 {
             return None;
         }
@@ -283,6 +357,43 @@ pub mod decode {
         raw.copy_from_slice(&bytes[*cursor..*cursor + 16]);
         *cursor += 16;
         Some(u128::from_be_bytes(raw))
+    }
+
+    fn read_u16(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
+        if bytes.len() < *cursor + 2 {
+            return None;
+        }
+        let raw = [bytes[*cursor], bytes[*cursor + 1]];
+        *cursor += 2;
+        Some(u16::from_be_bytes(raw))
+    }
+
+    fn read_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+        if bytes.len() < *cursor + 4 {
+            return None;
+        }
+        let raw = [
+            bytes[*cursor],
+            bytes[*cursor + 1],
+            bytes[*cursor + 2],
+            bytes[*cursor + 3],
+        ];
+        *cursor += 4;
+        Some(u32::from_be_bytes(raw))
+    }
+
+    fn read_i32(bytes: &[u8], cursor: &mut usize) -> Option<i32> {
+        if bytes.len() < *cursor + 4 {
+            return None;
+        }
+        let raw = [
+            bytes[*cursor],
+            bytes[*cursor + 1],
+            bytes[*cursor + 2],
+            bytes[*cursor + 3],
+        ];
+        *cursor += 4;
+        Some(i32::from_be_bytes(raw))
     }
 
     fn read_frame<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {

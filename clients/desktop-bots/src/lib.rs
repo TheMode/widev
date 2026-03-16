@@ -84,7 +84,7 @@ struct BotSession {
     conn: quiche::Connection,
     stream_states: HashMap<u64, QuicStreamState>,
     pending_envelopes: VecDeque<protocol::decode::DecodedEnvelope>,
-    processed_envelope_ids: HashSet<protocol::EnvelopeId>,
+    processed_message_ids: HashSet<protocol::MessageId>,
     flow: Box<dyn BotFlow>,
     outgoing: Vec<protocol::C2SPacket>,
     established_notified: bool,
@@ -532,7 +532,7 @@ fn create_bot_session(
         conn,
         stream_states: HashMap::new(),
         pending_envelopes: VecDeque::new(),
-        processed_envelope_ids: HashSet::new(),
+        processed_message_ids: HashSet::new(),
         flow,
         outgoing: Vec::with_capacity(16),
         established_notified: false,
@@ -816,8 +816,8 @@ fn process_ready_envelopes(session: &mut BotSession) -> Result<()> {
     Ok(())
 }
 
-fn dependency_satisfied(session: &BotSession, dependency_id: Option<protocol::EnvelopeId>) -> bool {
-    dependency_id.is_none_or(|id| session.processed_envelope_ids.contains(&id))
+fn dependency_satisfied(session: &BotSession, dependency_id: Option<protocol::MessageId>) -> bool {
+    dependency_id.is_none_or(|id| session.processed_message_ids.contains(&id))
 }
 
 fn apply_decoded_envelope(
@@ -828,10 +828,10 @@ fn apply_decoded_envelope(
         handle_s2c_packet(session, packet)?;
     }
     if let Some(id) = envelope.id {
-        session.processed_envelope_ids.insert(id);
+        session.processed_message_ids.insert(id);
     }
-    if let Some(envelope_id) = envelope.receipt_id {
-        session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
+    if let Some(message_id) = envelope.receipt_id {
+        session.outgoing.push(protocol::C2SPacket::Receipt { message_id });
     }
     Ok(())
 }

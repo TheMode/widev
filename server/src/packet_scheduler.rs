@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
-use crate::packets::{DeliveryPolicy, DropReason, EnvelopeId, PacketOrder, PacketPriority};
+use crate::packets::{
+    DeliveryPolicy, DropReason, MessageId, PacketMeta, PacketOrder, PacketPriority,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OrderDomain {
@@ -18,49 +20,94 @@ enum QueueHeadAction {
     Drop(DropReason),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchKind {
+    Envelope,
+    Resource,
+}
+
 #[derive(Clone)]
-pub struct DispatchEnvelope {
-    pub id: Option<EnvelopeId>,
-    pub priority: PacketPriority,
-    pub order: PacketOrder,
-    pub delivery: DeliveryPolicy,
+pub struct DispatchMessage {
+    pub kind: DispatchKind,
+    pub id: Option<MessageId>,
+    pub meta: PacketMeta,
     pub framed: Vec<u8>,
 }
 
-impl DispatchEnvelope {
+impl DispatchMessage {
+    pub fn new(
+        kind: DispatchKind,
+        id: Option<MessageId>,
+        meta: PacketMeta,
+        framed: Vec<u8>,
+    ) -> Self {
+        Self { kind, id, meta, framed }
+    }
+
+    pub fn priority(&self) -> PacketPriority {
+        self.meta.priority
+    }
+
     pub fn domain(&self) -> OrderDomain {
-        domain_for_order(self.order)
-    }
-
-    pub fn is_datagram_eligible(&self) -> bool {
-        matches!(self.priority, PacketPriority::Droppable | PacketPriority::Deadline { .. })
-            && matches!(self.order, PacketOrder::Independent | PacketOrder::Dependency(_))
-            && self.id.is_none()
-    }
-
-    pub fn is_droppable(&self) -> bool {
-        matches!(self.priority, PacketPriority::Droppable)
-    }
-
-    pub fn is_deadline(&self) -> bool {
-        matches!(self.priority, PacketPriority::Deadline { .. })
+        domain_for_order(self.meta.order)
     }
 
     pub fn payload_len(&self) -> usize {
         self.framed.len()
     }
+
+    pub fn maybe_id(&self) -> Option<MessageId> {
+        self.id
+    }
+
+    pub fn order(&self) -> PacketOrder {
+        self.meta.order
+    }
+
+    pub fn delivery(&self) -> DeliveryPolicy {
+        self.meta.delivery
+    }
+
+    pub fn framed(&self) -> &[u8] {
+        &self.framed
+    }
+
+    pub fn is_datagram_eligible(&self) -> bool {
+        self.kind == DispatchKind::Envelope
+            && matches!(
+                self.meta.priority,
+                PacketPriority::Droppable | PacketPriority::Deadline { .. }
+            )
+            && matches!(self.meta.order, PacketOrder::Independent | PacketOrder::Dependency(_))
+            && self.id.is_none()
+    }
+
+    pub fn is_droppable(&self) -> bool {
+        matches!(self.priority(), PacketPriority::Droppable)
+    }
+
+    pub fn is_deadline(&self) -> bool {
+        matches!(self.priority(), PacketPriority::Deadline { .. })
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            DispatchKind::Envelope => "envelope",
+            DispatchKind::Resource => "resource",
+        }
+    }
 }
 
 #[derive(Clone)]
-struct ScheduledEnvelope {
+struct ScheduledMessage {
     deadline_at: Option<Instant>,
     coalescing_target: Option<usize>,
-    envelope: DispatchEnvelope,
+    message: DispatchMessage,
 }
 
 #[derive(Clone)]
 pub enum SchedulerCommand {
-    Envelope(DispatchEnvelope),
+    Message(DispatchMessage),
     SequenceClose(Uuid),
     SequenceCloseAll,
     Clear,
@@ -69,23 +116,23 @@ pub enum SchedulerCommand {
 
 #[derive(Clone)]
 pub enum SchedulerAction {
-    DispatchEnvelope {
-        envelope: DispatchEnvelope,
+    DispatchMessage {
+        message: DispatchMessage,
         force_flush: bool,
     },
     CloseSequence(Uuid),
     CloseAllSequences,
     ClearTransportState,
     BeginBarrier,
-    DropEnvelope {
-        envelope: DispatchEnvelope,
+    DropMessage {
+        message: DispatchMessage,
         reason: DropReason,
     },
 }
 
 pub struct PacketScheduler {
-    deferred_independent: VecDeque<ScheduledEnvelope>,
-    deferred_sequences: HashMap<Uuid, VecDeque<ScheduledEnvelope>>,
+    deferred_independent: VecDeque<ScheduledMessage>,
+    deferred_sequences: HashMap<Uuid, VecDeque<ScheduledMessage>>,
     blocked_commands: VecDeque<SchedulerCommand>,
     barrier_pending: bool,
 }
@@ -137,12 +184,12 @@ impl PacketScheduler {
         self.poll(now, false)
     }
 
-    pub fn requeue_deferred(&mut self, envelope: DispatchEnvelope, now: Instant) {
-        let scheduled = ScheduledEnvelope::new(envelope, now);
-        match scheduled.envelope.domain() {
-            OrderDomain::Independent => self.deferred_independent.push_front(scheduled),
+    pub fn requeue_deferred_message(&mut self, message: DispatchMessage, now: Instant) {
+        let scheduled = ScheduledMessage::new(message, now);
+        match scheduled.message.domain() {
+            OrderDomain::Independent => insert_requeued(&mut self.deferred_independent, scheduled),
             OrderDomain::Sequence(sequence_id) => {
-                self.deferred_sequences.entry(sequence_id).or_default().push_front(scheduled);
+                insert_requeued(self.deferred_sequences.entry(sequence_id).or_default(), scheduled);
             },
         }
     }
@@ -161,12 +208,12 @@ impl PacketScheduler {
         now: Instant,
     ) -> Vec<SchedulerAction> {
         match command {
-            SchedulerCommand::Envelope(envelope) => {
-                if should_initially_defer(&envelope) {
-                    self.enqueue_deferred(envelope, now);
+            SchedulerCommand::Message(message) => {
+                if should_initially_defer(message.priority()) {
+                    self.enqueue_deferred_message(message, now);
                     self.poll(now, false)
                 } else {
-                    vec![SchedulerAction::DispatchEnvelope { envelope, force_flush: false }]
+                    vec![SchedulerAction::DispatchMessage { message, force_flush: false }]
                 }
             },
             SchedulerCommand::SequenceClose(sequence_id) => {
@@ -183,19 +230,19 @@ impl PacketScheduler {
         }
     }
 
-    fn enqueue_deferred(&mut self, envelope: DispatchEnvelope, now: Instant) {
-        let scheduled = ScheduledEnvelope::new(envelope, now);
-        match scheduled.envelope.domain() {
-            OrderDomain::Independent => self.deferred_independent.push_back(scheduled),
+    fn enqueue_deferred_message(&mut self, message: DispatchMessage, now: Instant) {
+        let scheduled = ScheduledMessage::new(message, now);
+        match scheduled.message.domain() {
+            OrderDomain::Independent => insert_scheduled(&mut self.deferred_independent, scheduled),
             OrderDomain::Sequence(sequence_id) => {
-                self.deferred_sequences.entry(sequence_id).or_default().push_back(scheduled);
+                insert_scheduled(self.deferred_sequences.entry(sequence_id).or_default(), scheduled);
             },
         }
     }
 
     fn conflicts_with_deferred(&self, command: &SchedulerCommand) -> bool {
         match command {
-            SchedulerCommand::Envelope(envelope) => match envelope.domain() {
+            SchedulerCommand::Message(message) => match message.domain() {
                 OrderDomain::Independent => false,
                 OrderDomain::Sequence(sequence_id) => {
                     self.deferred_sequences.contains_key(&sequence_id)
@@ -239,8 +286,8 @@ impl PacketScheduler {
                     let Some(scheduled) = queue.pop_front() else {
                         break;
                     };
-                    actions.push(SchedulerAction::DropEnvelope {
-                        envelope: scheduled.envelope,
+                    actions.push(SchedulerAction::DropMessage {
+                        message: scheduled.message,
                         reason,
                     });
                 },
@@ -248,8 +295,8 @@ impl PacketScheduler {
                     let Some(scheduled) = queue.pop_front() else {
                         break;
                     };
-                    actions.push(SchedulerAction::DispatchEnvelope {
-                        envelope: scheduled.envelope,
+                    actions.push(SchedulerAction::DispatchMessage {
+                        message: scheduled.message,
                         force_flush,
                     });
                 },
@@ -290,9 +337,9 @@ impl PacketScheduler {
     }
 }
 
-impl ScheduledEnvelope {
-    fn new(envelope: DispatchEnvelope, now: Instant) -> Self {
-        let (deadline_at, coalescing_target) = match envelope.priority {
+impl ScheduledMessage {
+    fn new(message: DispatchMessage, now: Instant) -> Self {
+        let (deadline_at, coalescing_target) = match message.priority() {
             PacketPriority::Deadline { max_delay } => {
                 (now.checked_add(max_delay).or(Some(now)), None)
             },
@@ -301,12 +348,20 @@ impl ScheduledEnvelope {
             },
             _ => (None, None),
         };
-        Self { deadline_at, coalescing_target, envelope }
+        Self { deadline_at, coalescing_target, message }
     }
 }
 
-fn should_initially_defer(envelope: &DispatchEnvelope) -> bool {
-    matches!(envelope.priority, PacketPriority::Deadline { .. } | PacketPriority::Coalescing { .. })
+fn insert_scheduled(queue: &mut VecDeque<ScheduledMessage>, scheduled: ScheduledMessage) {
+    queue.push_back(scheduled);
+}
+
+fn insert_requeued(queue: &mut VecDeque<ScheduledMessage>, scheduled: ScheduledMessage) {
+    queue.push_front(scheduled);
+}
+
+fn should_initially_defer(priority: PacketPriority) -> bool {
+    matches!(priority, PacketPriority::Deadline { .. } | PacketPriority::Coalescing { .. })
 }
 
 pub fn domain_for_order(order: PacketOrder) -> OrderDomain {
@@ -319,7 +374,7 @@ pub fn domain_for_order(order: PacketOrder) -> OrderDomain {
 }
 
 fn queue_head_action(
-    scheduled_messages: &VecDeque<ScheduledEnvelope>,
+    scheduled_messages: &VecDeque<ScheduledMessage>,
     now: Instant,
     force_flush: bool,
 ) -> QueueHeadAction {
@@ -344,13 +399,13 @@ fn queue_head_action(
     QueueHeadAction::Dispatch
 }
 
-fn coalescing_run_bytes(scheduled_messages: &VecDeque<ScheduledEnvelope>) -> usize {
+fn coalescing_run_bytes(scheduled_messages: &VecDeque<ScheduledMessage>) -> usize {
     let mut total = 0usize;
     for envelope in scheduled_messages {
         if envelope.coalescing_target.is_none() {
             break;
         }
-        total = total.saturating_add(envelope.envelope.framed.len());
+        total = total.saturating_add(envelope.message.payload_len());
     }
     total
 }
@@ -364,12 +419,34 @@ mod tests {
         priority: PacketPriority,
         order: PacketOrder,
         framed_len: usize,
-    ) -> DispatchEnvelope {
-        DispatchEnvelope {
-            id: None,
-            priority,
-            order,
-            delivery: DeliveryPolicy::None,
+    ) -> DispatchMessage {
+        message(DispatchKind::Envelope, None, priority, order, framed_len)
+    }
+
+    fn resource(
+        priority: PacketPriority,
+        order: PacketOrder,
+        framed_len: usize,
+    ) -> DispatchMessage {
+        message(DispatchKind::Resource, Some(1), priority, order, framed_len)
+    }
+
+    fn message(
+        kind: DispatchKind,
+        id: Option<MessageId>,
+        priority: PacketPriority,
+        order: PacketOrder,
+        framed_len: usize,
+    ) -> DispatchMessage {
+        DispatchMessage {
+            kind,
+            id,
+            meta: PacketMeta {
+                target: crate::packets::PacketTarget::Broadcast,
+                priority,
+                order,
+                delivery: DeliveryPolicy::None,
+            },
             framed: vec![0; framed_len],
         }
     }
@@ -384,18 +461,18 @@ mod tests {
             128,
         );
 
-        let actions = scheduler.push(SchedulerCommand::Envelope(env.clone()), now);
-        assert!(matches!(actions.as_slice(), [SchedulerAction::DispatchEnvelope { .. }]));
+        let actions = scheduler.push(SchedulerCommand::Message(env.clone()), now);
+        assert!(matches!(actions.as_slice(), [SchedulerAction::DispatchMessage { .. }]));
 
-        scheduler.requeue_deferred(env.clone(), now);
+        scheduler.requeue_deferred_message(env.clone(), now);
         assert!(matches!(
             scheduler.poll(now + Duration::from_millis(10), false).as_slice(),
-            [SchedulerAction::DispatchEnvelope { force_flush: false, .. }]
+            [SchedulerAction::DispatchMessage { force_flush: false, .. }]
         ));
-        scheduler.requeue_deferred(env, now);
+        scheduler.requeue_deferred_message(env, now);
         assert!(matches!(
             scheduler.poll(now + Duration::from_millis(60), false).as_slice(),
-            [SchedulerAction::DropEnvelope { reason: DropReason::ExpiredDeadline, .. }]
+            [SchedulerAction::DropMessage { reason: DropReason::ExpiredDeadline, .. }]
         ));
     }
 
@@ -409,7 +486,7 @@ mod tests {
             250,
         );
 
-        assert!(scheduler.push(SchedulerCommand::Envelope(first), now).is_empty());
+        assert!(scheduler.push(SchedulerCommand::Message(first), now).is_empty());
     }
 
     #[test]
@@ -427,11 +504,11 @@ mod tests {
             400,
         );
 
-        assert!(scheduler.push(SchedulerCommand::Envelope(first), now).is_empty());
-        let actions = scheduler.push(SchedulerCommand::Envelope(second), now);
+        assert!(scheduler.push(SchedulerCommand::Message(first), now).is_empty());
+        let actions = scheduler.push(SchedulerCommand::Message(second), now);
         assert_eq!(actions.len(), 2);
         assert!(actions.iter().all(|action| {
-            matches!(action, SchedulerAction::DispatchEnvelope { force_flush: false, .. })
+            matches!(action, SchedulerAction::DispatchMessage { force_flush: false, .. })
         }));
     }
 
@@ -446,12 +523,12 @@ mod tests {
             PacketOrder::Sequence(blocked_sequence),
             128,
         );
-        scheduler.push(SchedulerCommand::Envelope(first.clone()), now);
-        scheduler.requeue_deferred(first, now);
+        scheduler.push(SchedulerCommand::Message(first.clone()), now);
+        scheduler.requeue_deferred_message(first, now);
 
         assert!(scheduler
             .push(
-                SchedulerCommand::Envelope(envelope(
+                SchedulerCommand::Message(envelope(
                     PacketPriority::Normal,
                     PacketOrder::Sequence(blocked_sequence),
                     64,
@@ -461,14 +538,14 @@ mod tests {
             .is_empty());
 
         let other_actions = scheduler.push(
-            SchedulerCommand::Envelope(envelope(
+            SchedulerCommand::Message(envelope(
                 PacketPriority::Normal,
                 PacketOrder::Sequence(other_sequence),
                 64,
             )),
             now,
         );
-        assert!(matches!(other_actions.as_slice(), [SchedulerAction::DispatchEnvelope { .. }]));
+        assert!(matches!(other_actions.as_slice(), [SchedulerAction::DispatchMessage { .. }]));
     }
 
     #[test]
@@ -481,8 +558,8 @@ mod tests {
             PacketOrder::Sequence(sequence_id),
             128,
         );
-        scheduler.push(SchedulerCommand::Envelope(first.clone()), now);
-        scheduler.requeue_deferred(first, now);
+        scheduler.push(SchedulerCommand::Message(first.clone()), now);
+        scheduler.requeue_deferred_message(first, now);
 
         assert!(scheduler.push(SchedulerCommand::SequenceClose(sequence_id), now).is_empty());
     }
@@ -492,7 +569,7 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = PacketScheduler::new();
         scheduler.push(
-            SchedulerCommand::Envelope(envelope(
+            SchedulerCommand::Message(envelope(
                 PacketPriority::Coalescing { target_payload_bytes: 600 },
                 PacketOrder::Independent,
                 250,
@@ -513,8 +590,8 @@ mod tests {
             PacketOrder::Sequence(sequence_id),
             128,
         );
-        scheduler.push(SchedulerCommand::Envelope(first.clone()), now);
-        scheduler.requeue_deferred(first, now);
+        scheduler.push(SchedulerCommand::Message(first.clone()), now);
+        scheduler.requeue_deferred_message(first, now);
         scheduler.push(SchedulerCommand::SequenceClose(sequence_id), now);
 
         let actions = scheduler.push(SchedulerCommand::Clear, now);
@@ -531,20 +608,20 @@ mod tests {
             PacketOrder::Independent,
             300,
         );
-        scheduler.push(SchedulerCommand::Envelope(first), now);
+        scheduler.push(SchedulerCommand::Message(first), now);
 
         let actions = scheduler.push(SchedulerCommand::Barrier, now);
         assert!(matches!(
             actions.as_slice(),
             [
-                SchedulerAction::DispatchEnvelope { force_flush: true, .. },
+                SchedulerAction::DispatchMessage { force_flush: true, .. },
                 SchedulerAction::BeginBarrier
             ]
         ));
 
         assert!(scheduler
             .push(
-                SchedulerCommand::Envelope(envelope(
+                SchedulerCommand::Message(envelope(
                     PacketPriority::Normal,
                     PacketOrder::Independent,
                     100,
@@ -556,7 +633,45 @@ mod tests {
         let released = scheduler.on_inflight_drained(now);
         assert!(matches!(
             released.as_slice(),
-            [SchedulerAction::DispatchEnvelope { force_flush: false, .. }]
+            [SchedulerAction::DispatchMessage { force_flush: false, .. }]
         ));
+    }
+
+    #[test]
+    fn coalescing_resource_waits_below_threshold() {
+        let now = Instant::now();
+        let mut scheduler = PacketScheduler::new();
+        assert!(scheduler
+            .push(
+                SchedulerCommand::Message(resource(
+                    PacketPriority::Coalescing { target_payload_bytes: 256 },
+                    PacketOrder::Independent,
+                    128,
+                )),
+                now,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn resource_sequence_conflict_blocks_same_sequence() {
+        let now = Instant::now();
+        let mut scheduler = PacketScheduler::new();
+        let sequence_id = Uuid::from_u128(9);
+        scheduler.requeue_deferred_message(
+            resource(PacketPriority::Normal, PacketOrder::Sequence(sequence_id), 32),
+            now,
+        );
+
+        assert!(scheduler
+            .push(
+                SchedulerCommand::Message(resource(
+                    PacketPriority::Normal,
+                    PacketOrder::Sequence(sequence_id),
+                    64,
+                )),
+                now,
+            )
+            .is_empty());
     }
 }
