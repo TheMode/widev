@@ -45,7 +45,7 @@ pub enum PacketOrder {
     /// No ordering relationship with any other packet.
     #[default]
     Independent,
-    /// Declare a client-visible dependency on another envelope id without affecting scheduler order.
+    /// Declare a client-visible dependency on another envelope's id.
     Dependency(MessageId),
     /// Append this packet to the reused stream for this sequence.
     Sequence(uuid::Uuid),
