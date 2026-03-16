@@ -1915,7 +1915,7 @@ impl Session {
         id: Option<crate::packets::MessageId>,
         outcome: crate::packets::DeliveryOutcome,
     ) {
-        if delivery == crate::packets::DeliveryPolicy::None {
+        if delivery == crate::packets::DeliveryPolicy::FireAndForget {
             return;
         }
         let Some(message_id) = id else {

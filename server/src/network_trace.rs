@@ -1538,7 +1538,7 @@ impl DescribeLong for PacketOrder {
 impl DescribeShort for DeliveryPolicy {
     fn describe_short(&self) -> &'static str {
         match self {
-            Self::None => "None",
+            Self::FireAndForget => "FireAndForget",
             Self::ObserveTransport => "ObserveTransport",
             Self::RequireClientReceipt => "RequireClientReceipt",
         }

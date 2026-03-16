@@ -58,7 +58,7 @@ pub enum PacketOrder {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DeliveryPolicy {
     #[default]
-    None,
+    FireAndForget,
     /// Emit a server-side transport outcome when the envelope is delivered or dropped.
     ObserveTransport,
     /// Emit transport outcomes and also require a client receipt after the full envelope is applied.

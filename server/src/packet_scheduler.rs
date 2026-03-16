@@ -547,7 +547,7 @@ mod tests {
                 target: crate::packets::PacketTarget::Broadcast,
                 priority,
                 order,
-                delivery: DeliveryPolicy::None,
+                delivery: DeliveryPolicy::FireAndForget,
             },
             framed: vec![0; framed_len],
             trace: DispatchTraceMeta {
