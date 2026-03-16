@@ -79,7 +79,7 @@ impl DispatchMessage {
         self.kind == DispatchKind::Envelope
             && matches!(
                 self.meta.priority,
-                PacketPriority::Droppable | PacketPriority::Deadline { .. }
+                PacketPriority::Droppable | PacketPriority::MaxDelay { .. }
             )
             && matches!(self.meta.order, PacketOrder::Independent | PacketOrder::Dependency(_))
             && self.id.is_none()
@@ -89,8 +89,8 @@ impl DispatchMessage {
         matches!(self.priority(), PacketPriority::Droppable)
     }
 
-    pub fn is_deadline(&self) -> bool {
-        matches!(self.priority(), PacketPriority::Deadline { .. })
+    pub fn is_max_delay(&self) -> bool {
+        matches!(self.priority(), PacketPriority::MaxDelay { .. })
     }
 
     pub fn kind_name(&self) -> &'static str {
@@ -301,11 +301,9 @@ impl PacketScheduler {
     fn queue_len_for_domain(&self, domain: OrderDomain) -> usize {
         match domain {
             OrderDomain::Independent => self.deferred_independent.len(),
-            OrderDomain::Sequence(sequence_id) => self
-                .deferred_sequences
-                .get(&sequence_id)
-                .map(|queue| queue.len())
-                .unwrap_or(0),
+            OrderDomain::Sequence(sequence_id) => {
+                self.deferred_sequences.get(&sequence_id).map(|queue| queue.len()).unwrap_or(0)
+            },
         }
     }
 
@@ -434,7 +432,7 @@ fn priority_name(priority: PacketPriority) -> &'static str {
     match priority {
         PacketPriority::Normal => "normal",
         PacketPriority::Droppable => "droppable",
-        PacketPriority::Deadline { .. } => "deadline",
+        PacketPriority::MaxDelay { .. } => "max_delay",
         PacketPriority::Coalescing { .. } => "coalescing",
     }
 }
@@ -442,7 +440,7 @@ fn priority_name(priority: PacketPriority) -> &'static str {
 impl ScheduledMessage {
     fn new(message: DispatchMessage, now: Instant) -> Self {
         let (deadline_at, coalescing_target) = match message.priority() {
-            PacketPriority::Deadline { max_delay } => {
+            PacketPriority::MaxDelay { max_delay } => {
                 (now.checked_add(max_delay).or(Some(now)), None)
             },
             PacketPriority::Coalescing { target_payload_bytes } => {
@@ -463,7 +461,7 @@ fn insert_requeued(queue: &mut VecDeque<ScheduledMessage>, scheduled: ScheduledM
 }
 
 fn should_initially_defer(priority: PacketPriority) -> bool {
-    matches!(priority, PacketPriority::Deadline { .. } | PacketPriority::Coalescing { .. })
+    matches!(priority, PacketPriority::MaxDelay { .. } | PacketPriority::Coalescing { .. })
 }
 
 pub fn domain_for_order(order: PacketOrder) -> OrderDomain {
@@ -565,7 +563,7 @@ mod tests {
         let now = Instant::now();
         let mut scheduler = PacketScheduler::new();
         let env = envelope(
-            PacketPriority::Deadline { max_delay: Duration::from_millis(50) },
+            PacketPriority::MaxDelay { max_delay: Duration::from_millis(50) },
             PacketOrder::Independent,
             128,
         );
@@ -628,7 +626,7 @@ mod tests {
         let blocked_sequence = Uuid::from_u128(1);
         let other_sequence = Uuid::from_u128(2);
         let first = envelope(
-            PacketPriority::Deadline { max_delay: Duration::from_secs(1) },
+            PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
             PacketOrder::Sequence(blocked_sequence),
             128,
         );
@@ -663,7 +661,7 @@ mod tests {
         let mut scheduler = PacketScheduler::new();
         let sequence_id = Uuid::from_u128(1);
         let first = envelope(
-            PacketPriority::Deadline { max_delay: Duration::from_secs(1) },
+            PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
             PacketOrder::Sequence(sequence_id),
             128,
         );
@@ -695,7 +693,7 @@ mod tests {
         let mut scheduler = PacketScheduler::new();
         let sequence_id = Uuid::from_u128(1);
         let first = envelope(
-            PacketPriority::Deadline { max_delay: Duration::from_secs(1) },
+            PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
             PacketOrder::Sequence(sequence_id),
             128,
         );

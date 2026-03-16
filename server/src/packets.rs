@@ -6,8 +6,6 @@ use thiserror::Error;
 
 use crate::game::ClientId;
 
-pub type ActionId = u64;
-
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PacketPriority {
     /// Send as soon as practical using the normal transport path.
@@ -30,7 +28,7 @@ pub enum PacketPriority {
     /// instead of dropping immediately when the session is over budget or a
     /// QUIC datagram is temporarily not writable, the transport may keep the
     /// packet queued until `max_delay` elapses.
-    Deadline {
+    MaxDelay {
         max_delay: Duration,
     },
     /// Keep the packet queued until enough serialized payload has accumulated.
@@ -112,8 +110,8 @@ impl PacketMeta {
         self.priority = PacketPriority::Droppable;
     }
 
-    fn set_deadline(&mut self, max_delay: Duration) {
-        self.priority = PacketPriority::Deadline { max_delay };
+    fn set_max_delay(&mut self, max_delay: Duration) {
+        self.priority = PacketPriority::MaxDelay { max_delay };
     }
 
     fn set_coalescing(&mut self, target_payload_bytes: usize) {
@@ -221,8 +219,8 @@ impl PacketEnvelope {
         self
     }
 
-    pub fn deadline(mut self, max_delay: Duration) -> Self {
-        self.meta.set_deadline(max_delay);
+    pub fn max_delay(mut self, max_delay: Duration) -> Self {
+        self.meta.set_max_delay(max_delay);
         self
     }
 
@@ -289,8 +287,8 @@ impl PacketResource {
         self
     }
 
-    pub fn deadline(mut self, max_delay: Duration) -> Self {
-        self.meta.set_deadline(max_delay);
+    pub fn max_delay(mut self, max_delay: Duration) -> Self {
+        self.meta.set_max_delay(max_delay);
         self
     }
 

@@ -1354,12 +1354,12 @@ impl SessionTracer {
 
         let total_ms = flow.started_at.elapsed().as_secs_f64() * 1000.0;
 
-        // Calculate deadline remaining if applicable
+        // Calculate max_delay remaining if applicable
         let deadline_remaining_ms = match (flow.priority_type, outcome_label.as_str()) {
-            (PacketPriority::Deadline { max_delay: _ }, "TransportDropped(ExpiredDeadline)") => {
+            (PacketPriority::MaxDelay { max_delay: _ }, "TransportDropped(ExpiredDeadline)") => {
                 Some(-1.0) // Negative signals expired
             },
-            (PacketPriority::Deadline { max_delay }, _) => {
+            (PacketPriority::MaxDelay { max_delay }, _) => {
                 let remaining = max_delay.as_secs_f64() * 1000.0 - total_ms;
                 Some(remaining)
             },
@@ -1502,7 +1502,7 @@ impl DescribeShort for PacketPriority {
         match self {
             Self::Normal => "Normal",
             Self::Droppable => "Droppable",
-            Self::Deadline { .. } => "Deadline",
+            Self::MaxDelay { .. } => "MaxDelay",
             Self::Coalescing { .. } => "Coalescing",
         }
     }
@@ -1513,8 +1513,8 @@ impl DescribeLong for PacketPriority {
         match self {
             Self::Normal => "Normal".to_string(),
             Self::Droppable => "Droppable".to_string(),
-            Self::Deadline { max_delay } => {
-                format!("Deadline({:.0}ms)", max_delay.as_secs_f64() * 1000.0)
+            Self::MaxDelay { max_delay } => {
+                format!("MaxDelay({:.0}ms)", max_delay.as_secs_f64() * 1000.0)
             },
             Self::Coalescing { target_payload_bytes } => {
                 format!("Coalescing({target_payload_bytes}B)")

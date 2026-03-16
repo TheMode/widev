@@ -1522,7 +1522,7 @@ impl Session {
                 quiche::Error::Done | quiche::Error::InvalidState | quiche::Error::BufferTooShort,
             ) => {
                 let result = match message.priority() {
-                    PacketPriority::Deadline { .. } => EnvelopeDispatchResult::DeferredByCongestion,
+                    PacketPriority::MaxDelay { .. } => EnvelopeDispatchResult::DeferredByCongestion,
                     _ => EnvelopeDispatchResult::Dropped(DropReason::DatagramRejected),
                 };
                 log::debug!(
@@ -1651,10 +1651,10 @@ impl Session {
             return EnvelopeDispatchResult::Dropped(DropReason::CongestionBudgetExceeded);
         }
 
-        if message.is_deadline() && !self.has_stream_budget(message.framed().len()) && !force_flush
+        if message.is_max_delay() && !self.has_stream_budget(message.framed().len()) && !force_flush
         {
             log::debug!(
-                "deferring deadline {} for client {} due to stream congestion budget",
+                "deferring max_delay {} for client {} due to stream congestion budget",
                 message.kind_name(),
                 self.client_id,
             );
