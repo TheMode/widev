@@ -3,16 +3,6 @@ use crate::packets::{
     S2CPacket,
 };
 
-pub enum DecodedC2SPacket {
-    Packet(C2SPacket),
-    Ping {
-        nonce: u64,
-    },
-    Pong {
-        nonce: u64,
-    },
-}
-
 pub fn serialize_s2c_packet(packet: &S2CPacket) -> Option<Vec<u8>> {
     encode_s2c(packet).ok()
 }
@@ -46,14 +36,8 @@ pub fn serialize_envelope_frames(envelope: &PacketEnvelope) -> Option<Vec<u8>> {
     Some(framed)
 }
 
-pub fn decode_c2s_packet(bytes: &[u8]) -> Option<DecodedC2SPacket> {
-    let packet = decode_c2s(bytes).ok()?;
-
-    Some(match packet {
-        C2SPacket::Ping { nonce } => DecodedC2SPacket::Ping { nonce },
-        C2SPacket::Pong { nonce } => DecodedC2SPacket::Pong { nonce },
-        packet => DecodedC2SPacket::Packet(packet),
-    })
+pub fn decode_c2s_packet(bytes: &[u8]) -> Option<C2SPacket> {
+    decode_c2s(bytes).ok()
 }
 
 fn append_packet_frame(framed: &mut Vec<u8>, packet: &S2CPacket) -> Option<()> {

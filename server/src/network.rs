@@ -14,9 +14,7 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
-use crate::packet_codec::{
-    decode_c2s_packet, serialize_envelope_frames, serialize_s2c_packet, DecodedC2SPacket,
-};
+use crate::packet_codec::{decode_c2s_packet, serialize_envelope_frames, serialize_s2c_packet};
 use crate::packet_scheduler::{
     DispatchEnvelope, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
@@ -880,12 +878,12 @@ fn decode_and_forward_c2s(
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match decode_c2s_packet(bytes) {
-        Some(DecodedC2SPacket::Ping { nonce }) => {
+        Some(crate::packets::C2SPacket::Ping { nonce }) => {
             if let Some(bytes) = serialize_s2c_packet(&crate::packets::S2CPacket::Pong { nonce }) {
                 let _ = session.conn.dgram_send(&bytes);
             }
         },
-        Some(DecodedC2SPacket::Pong { nonce }) => {
+        Some(crate::packets::C2SPacket::Pong { nonce }) => {
             if let Some(sent_at) = session.pending_ping_nonces.remove(&nonce) {
                 let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
                 let quiche_rtt_ms = session
@@ -902,14 +900,14 @@ fn decode_and_forward_c2s(
                 );
             }
         },
-        Some(DecodedC2SPacket::Packet(crate::packets::C2SPacket::Receipt { envelope_id })) => {
+        Some(crate::packets::C2SPacket::Receipt { envelope_id }) => {
             let _ = event_tx.send(NetworkEvent::DeliveryUpdate {
                 client_id: session.client_id,
                 envelope_id,
                 outcome: crate::packets::DeliveryOutcome::ClientProcessed,
             });
         },
-        Some(DecodedC2SPacket::Packet(packet)) => {
+        Some(packet) => {
             let _ =
                 event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
         },
