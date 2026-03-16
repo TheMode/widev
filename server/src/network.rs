@@ -751,8 +751,13 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
         },
     };
 
-    let mut session =
-        Session::new(client_id, client_addr, shard.event_tx.clone(), Arc::clone(&shard.tracer), conn);
+    let mut session = Session::new(
+        client_id,
+        client_addr,
+        shard.event_tx.clone(),
+        Arc::clone(&shard.tracer),
+        conn,
+    );
     recv_on_session(
         &mut session,
         &mut pkt_buf,
@@ -884,8 +889,8 @@ fn dispatch_control_to_target(
 
     for_each_target_session_mut(shard, target, |session| {
         session.tracer.on_control(match &command {
-            SchedulerCommand::SequenceClose(sequence_id) => PacketControl::SequenceClose {
-                sequence_id: *sequence_id,
+            SchedulerCommand::SequenceClose(sequence_id) => {
+                PacketControl::SequenceClose { sequence_id: *sequence_id }
             },
             SchedulerCommand::SequenceCloseAll => PacketControl::SequenceCloseAll { target },
             SchedulerCommand::Clear => PacketControl::Clear { target },
@@ -995,9 +1000,12 @@ fn decode_and_forward_c2s(
 ) {
     match decode_c2s_packet(bytes) {
         Some(crate::packets::C2SPacket::Ping { nonce }) => {
-            session
-                .tracer
-                .on_rx_packet(transport, bytes.len(), &crate::packets::C2SPacket::Ping { nonce });
+            session.tracer.on_rx_packet(
+                transport,
+                bytes.len(),
+                &crate::packets::C2SPacket::Ping { nonce },
+                None,
+            );
             if let Some(bytes) =
                 serialize_s2c_packet_message(&crate::packets::S2CPacket::Pong { nonce })
             {
@@ -1005,30 +1013,23 @@ fn decode_and_forward_c2s(
             }
         },
         Some(crate::packets::C2SPacket::Pong { nonce }) => {
-            session
-                .tracer
-                .on_rx_packet(transport, bytes.len(), &crate::packets::C2SPacket::Pong { nonce });
-            if let Some(sent_at) = session.pending_ping_nonces.remove(&nonce) {
-                let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
-                let quiche_rtt_ms = session
-                    .conn
-                    .path_stats()
-                    .next()
-                    .map(|stats| stats.rtt.as_secs_f64() * 1000.0)
-                    .unwrap_or_default();
-                log::debug!(
-                    "server latency client {}: {:.2}ms (quiche_rtt={:.2}ms)",
-                    session.client_id,
-                    rtt_ms,
-                    quiche_rtt_ms
-                );
-            }
+            let rtt_ms = session
+                .pending_ping_nonces
+                .remove(&nonce)
+                .map(|sent_at| sent_at.elapsed().as_secs_f64() * 1000.0);
+            session.tracer.on_rx_packet(
+                transport,
+                bytes.len(),
+                &crate::packets::C2SPacket::Pong { nonce },
+                rtt_ms,
+            );
         },
         Some(crate::packets::C2SPacket::Receipt { message_id }) => {
             session.tracer.on_rx_packet(
                 transport,
                 bytes.len(),
                 &crate::packets::C2SPacket::Receipt { message_id },
+                None,
             );
             session
                 .tracer
@@ -1044,12 +1045,13 @@ fn decode_and_forward_c2s(
                 transport,
                 bytes.len(),
                 &crate::packets::C2SPacket::Disconnect {},
+                None,
             );
             session.disconnect_requested = true;
             let _ = session.conn.close(true, 0, b"client_disconnect");
         },
         Some(packet) => {
-            session.tracer.on_rx_packet(transport, bytes.len(), &packet);
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet, None);
             let _ =
                 event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
         },
@@ -1493,8 +1495,7 @@ impl Session {
     }
 
     fn send_datagram(&mut self, message: &DispatchMessage) -> EnvelopeDispatchResult {
-        self.tracer
-            .on_datagram_attempt(message.trace(), self.conn.dgram_max_writable_len());
+        self.tracer.on_datagram_attempt(message.trace(), self.conn.dgram_max_writable_len());
         match self.conn.dgram_send(message.framed()) {
             Ok(()) => {
                 self.emit_delivery_update(
@@ -1662,8 +1663,12 @@ impl Session {
 
         let StreamTarget { stream_id, fin } = self.resolve_stream_target(message.order());
         let transport_reason = self.stream_transport_reason(&message);
-        self.tracer
-            .on_stream_transport_selected(message.trace(), stream_id, fin, &transport_reason);
+        self.tracer.on_stream_transport_selected(
+            message.trace(),
+            stream_id,
+            fin,
+            &transport_reason,
+        );
 
         log::debug!(
             "client {} opening server stream {} for {} {:?} ({:?}, fin={})",
@@ -1734,6 +1739,7 @@ impl Session {
         self.queued_stream_bytes = self.queued_stream_bytes.saturating_add(payload.len());
         self.tracer.on_stream_queued(
             &trace,
+            transport_receipt_id,
             queued_before,
             self.queued_stream_bytes,
             inflight_before,
@@ -1758,8 +1764,7 @@ impl Session {
         for chunk in state.pending_writes.drain(..) {
             if chunk.tracks_inflight {
                 self.inflight_message_count = self.inflight_message_count.saturating_sub(1);
-                self.tracer
-                    .on_flow_aborted(chunk.trace.flow_id, "stream_reset_or_clear");
+                self.tracer.on_flow_aborted(chunk.trace.flow_id, "stream_reset_or_clear");
             }
 
             let remaining = chunk.data.len().saturating_sub(chunk.offset);
@@ -1925,11 +1930,7 @@ impl Session {
     }
 
     fn maybe_log_network_snapshot(&mut self) {
-        let rtt_ms = self
-            .conn
-            .path_stats()
-            .next()
-            .map(|stats| stats.rtt.as_secs_f64() * 1000.0);
+        let rtt_ms = self.conn.path_stats().next().map(|stats| stats.rtt.as_secs_f64() * 1000.0);
         self.tracer.maybe_log_snapshot(SessionSnapshot {
             established: self.conn.is_established(),
             rtt_ms,
