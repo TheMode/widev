@@ -1480,7 +1480,7 @@ impl Session {
 
     fn resolve_stream_target(&mut self, order: PacketOrder) -> StreamTarget {
         match order {
-            PacketOrder::Independent => {
+            PacketOrder::Independent | PacketOrder::Dependency(_) => {
                 StreamTarget { stream_id: self.alloc_server_uni_stream_id(), fin: true }
             },
             PacketOrder::Sequence(sequence_id) => {

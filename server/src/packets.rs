@@ -47,6 +47,8 @@ pub enum PacketOrder {
     /// No ordering relationship with any other packet.
     #[default]
     Independent,
+    /// Declare a client-visible dependency on another envelope id without affecting scheduler order.
+    Dependency(EnvelopeId),
     /// Append this packet to the reused stream for this sequence.
     Sequence(uuid::Uuid),
     /// Append this packet to the reused stream for this sequence, then send FIN.
@@ -188,6 +190,11 @@ impl PacketEnvelope {
 
     pub fn independent(mut self) -> Self {
         self.order = PacketOrder::Independent;
+        self
+    }
+
+    pub fn dependency(mut self, envelope_id: EnvelopeId) -> Self {
+        self.order = PacketOrder::Dependency(envelope_id);
         self
     }
 

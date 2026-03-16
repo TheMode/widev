@@ -34,7 +34,7 @@ impl DispatchEnvelope {
 
     pub fn is_datagram_eligible(&self) -> bool {
         matches!(self.priority, PacketPriority::Droppable | PacketPriority::Deadline { .. })
-            && matches!(self.order, PacketOrder::Independent)
+            && matches!(self.order, PacketOrder::Independent | PacketOrder::Dependency(_))
             && self.id.is_none()
     }
 
@@ -311,7 +311,7 @@ fn should_initially_defer(envelope: &DispatchEnvelope) -> bool {
 
 pub fn domain_for_order(order: PacketOrder) -> OrderDomain {
     match order {
-        PacketOrder::Independent => OrderDomain::Independent,
+        PacketOrder::Independent | PacketOrder::Dependency(_) => OrderDomain::Independent,
         PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
             OrderDomain::Sequence(sequence_id)
         },

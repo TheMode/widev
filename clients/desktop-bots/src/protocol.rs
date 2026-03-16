@@ -2,10 +2,12 @@ mod packets {
     include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 }
 
-pub use packets::{C2SPacket, S2CPacket};
+pub use packets::{C2SPacket, EnvelopeId, S2CPacket};
 
 pub struct DecodedEnvelope {
-    pub receipt_id: Option<packets::EnvelopeId>,
+    pub id: Option<EnvelopeId>,
+    pub receipt_id: Option<EnvelopeId>,
+    pub dependency_id: Option<EnvelopeId>,
     pub packets: Vec<S2CPacket>,
 }
 
@@ -21,6 +23,7 @@ pub fn decode_envelope(bytes: &[u8]) -> Option<DecodedEnvelope> {
     const ENVELOPE_VERSION: u8 = 1;
     const FLAG_HAS_ID: u8 = 1 << 0;
     const FLAG_CLIENT_PROCESSED_RECEIPT: u8 = 1 << 1;
+    const FLAG_HAS_DEPENDENCY: u8 = 1 << 2;
 
     if bytes.len() < 2 || bytes[0] != ENVELOPE_VERSION {
         return None;
@@ -41,13 +44,24 @@ pub fn decode_envelope(bytes: &[u8]) -> Option<DecodedEnvelope> {
     };
 
     let receipt_id = if flags & FLAG_CLIENT_PROCESSED_RECEIPT != 0 { Some(id?) } else { None };
+    let dependency_id = if flags & FLAG_HAS_DEPENDENCY != 0 {
+        if bytes.len() < cursor + 16 {
+            return None;
+        }
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&bytes[cursor..cursor + 16]);
+        cursor += 16;
+        Some(u128::from_be_bytes(raw))
+    } else {
+        None
+    };
 
     let mut packets_buf = bytes[cursor..].to_vec();
     let mut packets = Vec::new();
     while let Some(frame) = pop_frame(&mut packets_buf) {
         packets.push(decode_s2c(&frame).ok()?);
     }
-    Some(DecodedEnvelope { receipt_id, packets })
+    Some(DecodedEnvelope { id, receipt_id, dependency_id, packets })
 }
 
 fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {

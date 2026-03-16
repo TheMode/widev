@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -233,6 +233,8 @@ pub(super) struct ClientGame {
     phase: ClientPhase,
     server_cert_fingerprint: Option<String>,
     elements: HashMap<u32, ElementState>,
+    pending_envelopes: VecDeque<protocol::DecodedEnvelope>,
+    processed_envelope_ids: HashSet<protocol::EnvelopeId>,
     bootstrap: SessionBootstrap,
     bindings: bindings::BindingState,
     default_prediction: PredictionConfig,
@@ -256,6 +258,8 @@ impl ClientGame {
             phase: ClientPhase::Connecting,
             server_cert_fingerprint: None,
             elements: HashMap::new(),
+            pending_envelopes: VecDeque::new(),
+            processed_envelope_ids: HashSet::new(),
             bootstrap: SessionBootstrap::new(),
             bindings: bindings::BindingState::new(persistence::BindingStore::load_default()?),
             default_prediction: PredictionConfig::default(),
@@ -276,13 +280,9 @@ impl ClientGame {
             let Some(envelope) = protocol::decode_envelope(&bytes) else {
                 continue;
             };
-            for packet in envelope.packets {
-                self.handle_server_packet(packet)?;
-            }
-            if let Some(envelope_id) = envelope.receipt_id {
-                self.send_when_connected(protocol::C2SPacket::Receipt { envelope_id })?;
-            }
+            self.pending_envelopes.push_back(envelope);
         }
+        self.process_ready_envelopes()?;
 
         if self.net.is_established() && self.phase == ClientPhase::Connecting {
             let hello = protocol::C2SPacket::ClientHello {
@@ -597,6 +597,49 @@ impl ClientGame {
                 self.elements.remove(&element_id);
                 self.pending_prediction.remove(&element_id);
             },
+        }
+
+        Ok(())
+    }
+
+    fn process_ready_envelopes(&mut self) -> Result<()> {
+        loop {
+            let mut progressed = false;
+            let mut remaining = VecDeque::new();
+
+            while let Some(envelope) = self.pending_envelopes.pop_front() {
+                if !self.dependency_satisfied(envelope.dependency_id) {
+                    remaining.push_back(envelope);
+                    continue;
+                }
+
+                self.apply_decoded_envelope(envelope)?;
+                progressed = true;
+            }
+
+            self.pending_envelopes = remaining;
+            if !progressed {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn dependency_satisfied(&self, dependency_id: Option<protocol::EnvelopeId>) -> bool {
+        dependency_id.is_none_or(|id| self.processed_envelope_ids.contains(&id))
+    }
+
+    fn apply_decoded_envelope(&mut self, envelope: protocol::DecodedEnvelope) -> Result<()> {
+        for packet in envelope.packets {
+            self.handle_server_packet(packet)?;
+        }
+
+        if let Some(id) = envelope.id {
+            self.processed_envelope_ids.insert(id);
+        }
+        if let Some(envelope_id) = envelope.receipt_id {
+            self.send_when_connected(protocol::C2SPacket::Receipt { envelope_id })?;
         }
 
         Ok(())

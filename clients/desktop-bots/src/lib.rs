@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +78,8 @@ struct BotSession {
     pending_send: Option<PendingDatagram>,
     conn: quiche::Connection,
     stream_states: HashMap<u64, QuicStreamState>,
+    pending_envelopes: VecDeque<protocol::DecodedEnvelope>,
+    processed_envelope_ids: HashSet<protocol::EnvelopeId>,
     flow: Box<dyn BotFlow>,
     outgoing: Vec<protocol::C2SPacket>,
     established_notified: bool,
@@ -524,6 +526,8 @@ fn create_bot_session(
         pending_send: None,
         conn,
         stream_states: HashMap::new(),
+        pending_envelopes: VecDeque::new(),
+        processed_envelope_ids: HashSet::new(),
         flow,
         outgoing: Vec::with_capacity(16),
         established_notified: false,
@@ -643,12 +647,7 @@ fn process_datagrams(
                     let Some(envelope) = protocol::decode_envelope(&frame) else {
                         continue;
                     };
-                    for packet in envelope.packets {
-                        handle_s2c_packet(session, packet)?;
-                    }
-                    if let Some(envelope_id) = envelope.receipt_id {
-                        session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
-                    }
+                    queue_envelope(session, envelope)?;
                 }
                 *had_activity = true;
             },
@@ -680,12 +679,7 @@ fn process_streams(
                         let Some(envelope) = protocol::decode_envelope(&frame) else {
                             continue;
                         };
-                        for packet in envelope.packets {
-                            handle_s2c_packet(session, packet)?;
-                        }
-                        if let Some(envelope_id) = envelope.receipt_id {
-                            session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
-                        }
+                        queue_envelope(session, envelope)?;
                     }
 
                     cleanup_stream_if_closed(&mut session.stream_states, &session.conn, stream_id);
@@ -783,6 +777,55 @@ fn handle_s2c_packet(session: &mut BotSession, packet: protocol::S2CPacket) -> R
 
     let mut ctx = BotContext { bot_id: session.bot_id, outgoing: &mut session.outgoing };
     session.flow.on_server_packet(&mut ctx, &packet)
+}
+
+fn queue_envelope(session: &mut BotSession, envelope: protocol::DecodedEnvelope) -> Result<()> {
+    session.pending_envelopes.push_back(envelope);
+    process_ready_envelopes(session)
+}
+
+fn process_ready_envelopes(session: &mut BotSession) -> Result<()> {
+    loop {
+        let mut progressed = false;
+        let mut remaining = VecDeque::new();
+
+        while let Some(envelope) = session.pending_envelopes.pop_front() {
+            if !dependency_satisfied(session, envelope.dependency_id) {
+                remaining.push_back(envelope);
+                continue;
+            }
+
+            apply_decoded_envelope(session, envelope)?;
+            progressed = true;
+        }
+
+        session.pending_envelopes = remaining;
+        if !progressed {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn dependency_satisfied(session: &BotSession, dependency_id: Option<protocol::EnvelopeId>) -> bool {
+    dependency_id.is_none_or(|id| session.processed_envelope_ids.contains(&id))
+}
+
+fn apply_decoded_envelope(
+    session: &mut BotSession,
+    envelope: protocol::DecodedEnvelope,
+) -> Result<()> {
+    for packet in envelope.packets {
+        handle_s2c_packet(session, packet)?;
+    }
+    if let Some(id) = envelope.id {
+        session.processed_envelope_ids.insert(id);
+    }
+    if let Some(envelope_id) = envelope.receipt_id {
+        session.outgoing.push(protocol::C2SPacket::Receipt { envelope_id });
+    }
+    Ok(())
 }
 
 fn flush_outgoing(session: &mut BotSession, send_buf: &mut [u8]) -> Result<bool> {

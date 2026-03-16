@@ -67,23 +67,27 @@ fn append_envelope_header(out: &mut Vec<u8>, envelope: &PacketEnvelope) {
     const ENVELOPE_VERSION: u8 = 1;
     const FLAG_HAS_ID: u8 = 1 << 0;
     const FLAG_CLIENT_PROCESSED_RECEIPT: u8 = 1 << 1;
+    const FLAG_HAS_DEPENDENCY: u8 = 1 << 2;
 
     out.push(ENVELOPE_VERSION);
 
     let mut flags = 0u8;
-    if envelope.delivery == DeliveryPolicy::RequireClientReceipt && envelope.id.is_some() {
+    if envelope.id.is_some() {
         flags |= FLAG_HAS_ID;
     }
     if envelope.delivery == DeliveryPolicy::RequireClientReceipt {
         flags |= FLAG_CLIENT_PROCESSED_RECEIPT;
     }
+    if matches!(envelope.order, crate::packets::PacketOrder::Dependency(_)) {
+        flags |= FLAG_HAS_DEPENDENCY;
+    }
     out.push(flags);
 
-    if envelope.delivery == DeliveryPolicy::RequireClientReceipt {
-        let Some(id) = envelope.id else {
-            return;
-        };
+    if let Some(id) = envelope.id {
         out.extend_from_slice(&envelope_id_to_bytes(id));
+    }
+    if let crate::packets::PacketOrder::Dependency(dependency_id) = envelope.order {
+        out.extend_from_slice(&envelope_id_to_bytes(dependency_id));
     }
 }
 
