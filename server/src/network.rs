@@ -639,7 +639,12 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
     match cmd {
         IoCommand::DispatchMessages(messages) => {
             for message in messages.iter() {
-                dispatch_message_for_thread(shard, message);
+                match message {
+                    PacketMessage::Envelope(envelope) => {
+                        dispatch_envelope_for_thread(shard, envelope)
+                    },
+                    PacketMessage::Control(control) => dispatch_control_for_thread(shard, *control),
+                }
             }
         },
         IoCommand::ReceivedDatagram { from, dcid, data } => {
@@ -724,13 +729,6 @@ fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<
         if worker_index_for_cid(&cid, worker_count) == worker_id {
             return cid;
         }
-    }
-}
-
-fn dispatch_message_for_thread(shard: &mut ShardState, message: &PacketMessage) {
-    match message {
-        PacketMessage::Envelope(envelope) => dispatch_envelope_for_thread(shard, envelope),
-        PacketMessage::Control(control) => dispatch_control_for_thread(shard, *control),
     }
 }
 
