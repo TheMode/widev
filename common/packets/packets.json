@@ -202,6 +202,15 @@
       ]
     },
     {
+      "name": "ElementSetSize",
+      "description": "Set the width and height for one element on this client.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "width", "type": "f32" },
+        { "name": "height", "type": "f32" }
+      ]
+    },
+    {
       "name": "ElementSetTexture",
       "description": "Set the texture resource to render for one element on this client.",
       "fields": [

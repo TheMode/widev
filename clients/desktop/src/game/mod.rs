@@ -212,6 +212,8 @@ struct ElementState {
     visible: bool,
     color: protocol::Color,
     texture_id: Option<protocol::MessageId>,
+    width: f32,
+    height: f32,
     last_authoritative: Vec2f,
     last_authoritative_at: Instant,
     target: Vec2f,
@@ -249,6 +251,8 @@ impl ElementState {
             visible: false,
             color,
             texture_id: None,
+            width: PLAYER_SIZE,
+            height: PLAYER_SIZE,
             last_authoritative: Vec2f::default(),
             last_authoritative_at: now,
             target: Vec2f::default(),
@@ -436,8 +440,8 @@ impl ClientGame {
             .map(|e| RenderState {
                 x: e.draw.x,
                 y: e.draw.y,
-                width: PLAYER_SIZE,
-                height: PLAYER_SIZE,
+                width: e.width,
+                height: e.height,
                 color: oklch_to_u32(e.color),
                 texture_id: e.texture_id,
             })
@@ -659,6 +663,16 @@ impl ClientGame {
         }
     }
 
+    fn apply_element_size(&mut self, element_id: u32, width: f32, height: f32) {
+        if let Some(element) = self.elements.get_mut(&element_id) {
+            element.width = width;
+            element.height = height;
+            self.bump_render_revision();
+        } else {
+            log::debug!("ignored ElementSetSize for unknown element_id={element_id}");
+        }
+    }
+
     fn handle_server_packet(&mut self, packet: protocol::S2CPacket) -> Result<()> {
         match packet {
             protocol::S2CPacket::ServerHello { tick_rate_hz } => {
@@ -711,6 +725,9 @@ impl ClientGame {
             },
             protocol::S2CPacket::ElementSetColor { element_id, color } => {
                 self.apply_element_color(element_id, color);
+            },
+            protocol::S2CPacket::ElementSetSize { element_id, width, height } => {
+                self.apply_element_size(element_id, width, height);
             },
             protocol::S2CPacket::ElementSetTexture { element_id, resource_id } => {
                 self.apply_element_texture(element_id, resource_id);

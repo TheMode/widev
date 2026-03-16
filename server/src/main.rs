@@ -25,16 +25,35 @@ struct Args {
     /// Server bind address (IP:PORT)
     #[arg(default_value = "127.0.0.1:4433")]
     bind: SocketAddr,
+    /// Game to run (e.g. pong, red_square)
+    #[arg(default_value = "")]
+    game: String,
 }
 
 fn main() -> Result<()> {
     init_logging();
 
     let args = Args::parse();
+
+    let game_names = games::game_names();
+    let game_name = if args.game.is_empty() {
+        game_names.first().copied().unwrap_or("pong")
+    } else {
+        &args.game
+    };
+
+    log::info!("starting game: {}", game_name);
+
     let network = NetworkRuntime::start(args.bind)?;
 
     let mut game_state = GameState::new(60);
-    let mut game = games::default_game(Instant::now(), &mut game_state);
+    let mut game = match games::create_game(game_name, Instant::now(), &mut game_state) {
+        Some(g) => g,
+        None => {
+            log::error!("unknown game: {}", game_name);
+            anyhow::bail!("unknown game: {}", game_name);
+        },
+    };
     let mut last_tick = Instant::now();
 
     loop {
