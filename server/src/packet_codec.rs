@@ -79,7 +79,8 @@ fn serialize_resource_payload(resource: &PacketResource) -> Option<Vec<u8>> {
     let resource_type_len = u16::try_from(resource_type.len()).ok()?;
     payload.extend_from_slice(&resource_type_len.to_be_bytes());
     payload.extend_from_slice(resource_type);
-    payload.extend_from_slice(&resource.usage_count.to_be_bytes());
+    let encoded_usage = resource.usage_count.unwrap_or(-1);
+    payload.extend_from_slice(&encoded_usage.to_be_bytes());
     payload.extend_from_slice(&(resource.blob.len() as u32).to_be_bytes());
     payload.extend_from_slice(&resource.blob);
     Some(payload)

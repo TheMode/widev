@@ -28,9 +28,8 @@ enum AppEvent {
 }
 
 pub(super) fn run(game: ClientGame) -> Result<()> {
-    let event_loop = EventLoop::<AppEvent>::with_user_event()
-        .build()
-        .context("failed to create event loop")?;
+    let event_loop =
+        EventLoop::<AppEvent>::with_user_event().build().context("failed to create event loop")?;
     let mut app = App::new(game, event_loop.create_proxy());
     event_loop.run_app(&mut app).context("event loop failed")
 }

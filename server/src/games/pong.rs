@@ -172,7 +172,7 @@ impl PongGame {
                 self.texture_id,
                 "image/png",
                 self.texture_png.clone(),
-                -1,
+                None,
             )
             .sequence(bootstrap_sequence_id),
         );
@@ -255,12 +255,11 @@ impl PongGame {
         state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
     }
 
-    fn send_match_cleanup(
-        &mut self,
-        state: &mut GameState,
-        client_id: ClientId,
-    ) {
-        state.send(PacketEnvelope::single(PacketTarget::Client(client_id), S2CPacket::ResetScene {}));
+    fn send_match_cleanup(&mut self, state: &mut GameState, client_id: ClientId) {
+        state.send(PacketEnvelope::single(
+            PacketTarget::Client(client_id),
+            S2CPacket::ResetScene {},
+        ));
     }
 
     fn remove_from_queue(&mut self, client_id: ClientId) {

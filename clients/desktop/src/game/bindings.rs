@@ -388,11 +388,7 @@ impl BindingState {
     }
 
     fn activate_binding(&mut self, id: u16, input: InputPath) {
-        self.active_bindings.push(BindingAssignment {
-            id,
-            input,
-            last_value: 0.0,
-        });
+        self.active_bindings.push(BindingAssignment { id, input, last_value: 0.0 });
     }
 }
 

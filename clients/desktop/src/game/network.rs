@@ -1,5 +1,5 @@
-use std::collections::{hash_map::Entry, HashMap};
 use std::collections::VecDeque;
+use std::collections::{hash_map::Entry, HashMap};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -88,8 +88,9 @@ impl QuicClient {
         let (command_tx, command_rx) = mpsc::channel::<WorkerCommand>();
         let (incoming_tx, incoming_rx) = mpsc::channel::<WorkerIncoming>();
         let poll = Poll::new().context("failed to create mio poll")?;
-        let worker_waker =
-            Arc::new(Waker::new(poll.registry(), COMMAND_TOKEN).context("failed to create mio waker")?);
+        let worker_waker = Arc::new(
+            Waker::new(poll.registry(), COMMAND_TOKEN).context("failed to create mio waker")?,
+        );
 
         let is_established = Arc::new(AtomicBool::new(false));
         let peer_cert_der = Arc::new(Mutex::new(None));
@@ -232,32 +233,25 @@ fn run_worker(
 
     loop {
         let timeout = conn.timeout();
-        poll.poll(&mut events, timeout)
-            .context("client network poll failed")?;
+        poll.poll(&mut events, timeout).context("client network poll failed")?;
 
         let poll_timed_out = events.is_empty() && timeout.is_some_and(|value| !value.is_zero());
 
         if matches!(
             process_worker_commands(
-            &command_rx,
-            poll.registry(),
-            &mut socket,
-            &mut conn,
-            &mut local_addr,
-            &mut pending_writes,
-        )?,
+                &command_rx,
+                poll.registry(),
+                &mut socket,
+                &mut conn,
+                &mut local_addr,
+                &mut pending_writes,
+            )?,
             WorkerControl::ShutdownRequested
         ) {
             shutdown_requested = true;
         }
         if events.iter().any(|event| event.token() == SOCKET_TOKEN && event.is_readable()) {
-            recv_udp(
-                &socket,
-                &mut conn,
-                &mut recv_buf,
-                server_addr,
-                local_addr,
-            )?;
+            recv_udp(&socket, &mut conn, &mut recv_buf, server_addr, local_addr)?;
         }
         let datagrams = drain_datagrams(&mut conn, &mut app_buf);
         let streams = drain_streams(&mut conn, &mut app_buf, &mut stream_states);
@@ -289,7 +283,6 @@ fn run_worker(
         if conn.is_closed() || (shutdown_requested && pending_writes.is_empty()) {
             return Ok(());
         }
-
     }
 }
 
@@ -359,7 +352,10 @@ fn queue_immediate_responses<'a>(
                 }
                 for packet in &envelope.packets {
                     if let protocol::S2CPacket::Ping { nonce } = packet {
-                        queue_c2s_packet(pending_writes, protocol::C2SPacket::Pong { nonce: *nonce });
+                        queue_c2s_packet(
+                            pending_writes,
+                            protocol::C2SPacket::Pong { nonce: *nonce },
+                        );
                     }
                 }
             },
@@ -668,8 +664,5 @@ fn queue_c2s_packet(
     let Ok(bytes) = protocol::encode_c2s(&packet) else {
         return;
     };
-    pending_writes.push_back(PendingStreamWrite {
-        data: frame_outbound_packet(&bytes),
-        offset: 0,
-    });
+    pending_writes.push_back(PendingStreamWrite { data: frame_outbound_packet(&bytes), offset: 0 });
 }

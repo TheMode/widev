@@ -152,7 +152,7 @@ pub struct PacketResource {
     pub id: MessageId,
     pub resource_type: String,
     pub blob: Vec<u8>,
-    pub usage_count: i32,
+    pub usage_count: Option<i32>,
     pub meta: PacketMeta,
 }
 
@@ -191,7 +191,7 @@ pub enum PacketMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum MessageValidationError {
-    #[error("resource usage count must be -1 or greater")]
+    #[error("resource usage count must be non-negative or null for permanency")]
     InvalidUsageCount,
     #[error("droppable messages cannot have an id")]
     DroppableWithId,
@@ -273,7 +273,7 @@ impl PacketResource {
         id: MessageId,
         resource_type: impl Into<String>,
         blob: Vec<u8>,
-        usage_count: i32,
+        usage_count: Option<i32>,
     ) -> Self {
         Self {
             id,
@@ -325,8 +325,10 @@ impl PacketResource {
     }
 
     pub fn validate(&self) -> Result<(), MessageValidationError> {
-        if self.usage_count < -1 {
-            return Err(MessageValidationError::InvalidUsageCount);
+        if let Some(count) = self.usage_count {
+            if count < 0 {
+                return Err(MessageValidationError::InvalidUsageCount);
+            }
         }
         validate_message_policy(Some(self.id), self.meta.priority, self.meta.delivery)?;
         Ok(())
@@ -415,9 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_usage_count_must_be_minus_one_or_greater() {
+    fn resource_usage_count_must_be_non_negative() {
         let resource =
-            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], -2);
+            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], Some(-1));
 
         assert_eq!(resource.validate(), Err(MessageValidationError::InvalidUsageCount));
     }
@@ -425,7 +427,7 @@ mod tests {
     #[test]
     fn resource_allows_permanent_usage_count() {
         let resource =
-            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], -1);
+            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], None);
 
         assert_eq!(resource.validate(), Ok(()));
     }

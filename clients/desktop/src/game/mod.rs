@@ -61,11 +61,14 @@ pub(super) struct ClientResource {
 }
 
 impl ClientResource {
-    fn new(resource_type: String, usage_count: i32, blob: &[u8]) -> Result<Self> {
+    fn new(resource_type: String, usage_count: Option<i32>, blob: &[u8]) -> Result<Self> {
         let remaining_uses = match usage_count {
-            -1 => None,
-            0.. => Some(usage_count as u32),
-            _ => return Err(anyhow::anyhow!("invalid resource usage_count={usage_count}")),
+            None => None,
+            Some(-1) => return Err(anyhow::anyhow!("invalid resource usage_count=-1")),
+            Some(count) if count >= 0 => Some(count as u32),
+            Some(negative) => {
+                return Err(anyhow::anyhow!("invalid resource usage_count={negative}"))
+            },
         };
         let payload = decode_resource_payload(&resource_type, blob);
         Ok(Self { resource_type, remaining_uses, active_elements: HashSet::new(), payload })
@@ -486,10 +489,7 @@ impl ClientGame {
         LatencySnapshot { connected: self.net.is_established(), quiche_rtt: self.smoothed_path_rtt }
     }
 
-    pub(super) fn set_network_waker(
-        &mut self,
-        wake_notifier: Arc<dyn Fn() + Send + Sync>,
-    ) {
+    pub(super) fn set_network_waker(&mut self, wake_notifier: Arc<dyn Fn() + Send + Sync>) {
         self.net.set_wake_notifier(wake_notifier);
     }
 
@@ -814,13 +814,13 @@ impl ClientGame {
         &mut self,
         resource_id: protocol::MessageId,
         resource_type: String,
-        usage_count: i32,
+        usage_count: Option<i32>,
         blob: Vec<u8>,
     ) -> Result<()> {
         let resource = match ClientResource::new(resource_type, usage_count, &blob) {
             Ok(resource) => resource,
             Err(_) => {
-                log::warn!("ignored invalid resource {resource_id} usage_count={usage_count}");
+                log::warn!("ignored invalid resource {resource_id} usage_count={usage_count:?}");
                 return Ok(());
             },
         };

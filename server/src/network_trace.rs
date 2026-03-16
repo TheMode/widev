@@ -1045,7 +1045,7 @@ impl SessionTracer {
                 resource.meta.delivery.describe_short(),
                 resource.meta.delivery == DeliveryPolicy::RequireClientReceipt,
                 FlowKind::Resource,
-                Some(resource.usage_count),
+                resource.usage_count,
                 packets,
             ),
         );
@@ -1059,7 +1059,10 @@ impl SessionTracer {
                 resource.meta.order.describe_long(),
                 resource.meta.delivery.describe_short(),
                 framed_len,
-                resource.usage_count
+                resource
+                    .usage_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "permanent".to_string())
             ),
         );
         trace

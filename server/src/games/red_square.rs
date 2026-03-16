@@ -119,7 +119,7 @@ impl RedSquareGame {
                 self.player_texture_id,
                 "image/png",
                 self.player_texture_png.clone(),
-                -1,
+                None,
             )
             .sequence(bootstrap_sequence_id),
         );

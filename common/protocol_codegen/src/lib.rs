@@ -243,7 +243,7 @@ pub mod decode {
         pub receipt_id: Option<MessageId>,
         pub dependency_id: Option<MessageId>,
         pub resource_type: String,
-        pub usage_count: i32,
+        pub usage_count: Option<i32>,
         pub blob: Vec<u8>,
     }
 
@@ -332,7 +332,8 @@ pub mod decode {
                         .ok()?;
                 cursor += resource_type_len;
 
-                let usage_count = read_i32(payload, &mut cursor)?;
+                let usage_count_raw = read_i32(payload, &mut cursor)?;
+                let usage_count = if usage_count_raw == -1 { None } else { Some(usage_count_raw) };
                 let blob_len = read_u32(payload, &mut cursor)? as usize;
                 let blob = payload.get(cursor..cursor + blob_len)?.to_vec();
 
