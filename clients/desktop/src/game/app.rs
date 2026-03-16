@@ -13,6 +13,7 @@ use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::Window;
 
 use super::bindings::InputCapture;
+use super::network_migration::NetworkMigrationCoordinator;
 use super::renderer::Renderer;
 use super::{ClientGame, ClientPhase};
 
@@ -38,6 +39,7 @@ struct App {
     next_tick_at: Instant,
     render_cache: RenderCache,
     last_prompt_signature: Option<String>,
+    network_migration: NetworkMigrationCoordinator,
     #[cfg(target_os = "macos")]
     menu: Option<AppMenu>,
 }
@@ -122,6 +124,7 @@ impl App {
             next_tick_at: Instant::now(),
             render_cache: RenderCache::default(),
             last_prompt_signature: None,
+            network_migration: NetworkMigrationCoordinator::new(),
             #[cfg(target_os = "macos")]
             menu: None,
         }
@@ -388,6 +391,12 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.network_migration.on_resumed(Instant::now(), self.game.is_connected()) {
+            if let Err(err) = self.game.handle_network_change() {
+                log::warn!("failed to migrate QUIC connection after app resume: {err:#}");
+            }
+        }
+
         if let Err(err) = self.ensure_window_ready(event_loop) {
             log::error!("{err:#}");
             event_loop.exit();
@@ -405,6 +414,11 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_menu_events(event_loop);
+        if self.network_migration.poll_network_change(Instant::now(), self.game.is_connected()) {
+            if let Err(err) = self.game.handle_network_change() {
+                log::warn!("failed to migrate QUIC connection after network change: {err:#}");
+            }
+        }
         if let Err(err) = self.ensure_window_ready(event_loop) {
             log::error!("client network error before join: {err:#}");
             event_loop.exit();

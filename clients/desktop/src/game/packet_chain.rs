@@ -65,8 +65,9 @@ impl PacketChain {
         F: FnMut(protocol::MessageId) -> bool,
     {
         dependency_id(message).is_none_or(|id| self.processed_message_ids.contains(&id))
-            && required_resource_ids(message)
-                .all(|resource_id| scheduled_resources.contains(&resource_id) || has_resource(resource_id))
+            && required_resource_ids(message).all(|resource_id| {
+                scheduled_resources.contains(&resource_id) || has_resource(resource_id)
+            })
     }
 }
 
@@ -77,9 +78,7 @@ fn message_id(message: &protocol::decode::DecodedServerMessage) -> Option<protoc
     }
 }
 
-fn dependency_id(
-    message: &protocol::decode::DecodedServerMessage,
-) -> Option<protocol::MessageId> {
+fn dependency_id(message: &protocol::decode::DecodedServerMessage) -> Option<protocol::MessageId> {
     match message {
         protocol::decode::DecodedServerMessage::Envelope(envelope) => envelope.dependency_id,
         protocol::decode::DecodedServerMessage::Resource(resource) => resource.dependency_id,
@@ -91,7 +90,9 @@ fn required_resource_ids(
 ) -> impl Iterator<Item = protocol::MessageId> + '_ {
     match message {
         protocol::decode::DecodedServerMessage::Envelope(envelope) => {
-            EitherRequiredResources::Packets(envelope.packets.iter().filter_map(required_resource_id))
+            EitherRequiredResources::Packets(
+                envelope.packets.iter().filter_map(required_resource_id),
+            )
         },
         protocol::decode::DecodedServerMessage::Resource(_) => {
             EitherRequiredResources::Empty(std::iter::empty())
@@ -169,14 +170,8 @@ mod tests {
 
         let ready = chain.drain_ready(|_| false);
         assert_eq!(ready.len(), 2);
-        assert!(matches!(
-            ready[0],
-            protocol::decode::DecodedServerMessage::Resource(_)
-        ));
-        assert!(matches!(
-            ready[1],
-            protocol::decode::DecodedServerMessage::Envelope(_)
-        ));
+        assert!(matches!(ready[0], protocol::decode::DecodedServerMessage::Resource(_)));
+        assert!(matches!(ready[1], protocol::decode::DecodedServerMessage::Envelope(_)));
     }
 
     #[test]

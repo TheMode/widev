@@ -235,7 +235,10 @@ impl PacketScheduler {
         match scheduled.message.domain() {
             OrderDomain::Independent => insert_scheduled(&mut self.deferred_independent, scheduled),
             OrderDomain::Sequence(sequence_id) => {
-                insert_scheduled(self.deferred_sequences.entry(sequence_id).or_default(), scheduled);
+                insert_scheduled(
+                    self.deferred_sequences.entry(sequence_id).or_default(),
+                    scheduled,
+                );
             },
         }
     }
@@ -286,10 +289,8 @@ impl PacketScheduler {
                     let Some(scheduled) = queue.pop_front() else {
                         break;
                     };
-                    actions.push(SchedulerAction::DropMessage {
-                        message: scheduled.message,
-                        reason,
-                    });
+                    actions
+                        .push(SchedulerAction::DropMessage { message: scheduled.message, reason });
                 },
                 QueueHeadAction::Dispatch => {
                     let Some(scheduled) = queue.pop_front() else {

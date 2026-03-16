@@ -402,10 +402,7 @@ mod tests {
                 .id(1)
                 .delivery(DeliveryPolicy::RequireClientReceipt);
 
-        assert_eq!(
-            envelope.validate(),
-            Err(MessageValidationError::DroppableWithClientReceipt)
-        );
+        assert_eq!(envelope.validate(), Err(MessageValidationError::DroppableWithClientReceipt));
     }
 
     #[test]
@@ -414,37 +411,21 @@ mod tests {
             PacketEnvelope::single(PacketTarget::Broadcast, S2CPacket::Ping { nonce: 1 })
                 .coalescing(0);
 
-        assert_eq!(
-            envelope.validate(),
-            Err(MessageValidationError::CoalescingWithZeroTarget)
-        );
+        assert_eq!(envelope.validate(), Err(MessageValidationError::CoalescingWithZeroTarget));
     }
 
     #[test]
     fn resource_usage_count_must_be_minus_one_or_greater() {
-        let resource = PacketResource::new(
-            PacketTarget::Broadcast,
-            1,
-            "texture",
-            vec![1, 2, 3],
-            -2,
-        );
+        let resource =
+            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], -2);
 
-        assert_eq!(
-            resource.validate(),
-            Err(MessageValidationError::InvalidUsageCount)
-        );
+        assert_eq!(resource.validate(), Err(MessageValidationError::InvalidUsageCount));
     }
 
     #[test]
     fn resource_allows_permanent_usage_count() {
-        let resource = PacketResource::new(
-            PacketTarget::Broadcast,
-            1,
-            "texture",
-            vec![1, 2, 3],
-            -1,
-        );
+        let resource =
+            PacketResource::new(PacketTarget::Broadcast, 1, "texture", vec![1, 2, 3], -1);
 
         assert_eq!(resource.validate(), Ok(()));
     }

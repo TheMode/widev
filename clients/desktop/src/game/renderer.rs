@@ -14,9 +14,9 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use super::bindings::BindingPromptState;
+use super::ClientResource;
 use super::LatencySnapshot;
 use super::RenderState;
-use super::ClientResource;
 
 const SHADER_SOURCE: &str = r#"
 struct Screen {
@@ -619,7 +619,11 @@ impl Renderer {
                         continue;
                     };
                     pass.set_bind_group(1, &texture.bind_group, &[]);
-                    pass.draw_indexed(0..QUAD_INDICES.len() as u32, 0, index as u32..index as u32 + 1);
+                    pass.draw_indexed(
+                        0..QUAD_INDICES.len() as u32,
+                        0,
+                        index as u32..index as u32 + 1,
+                    );
                 }
             }
             self.text_renderer

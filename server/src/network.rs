@@ -32,6 +32,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(2);
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
 const STREAM_RESET_ERROR_CODE: u64 = 0;
+const ACTIVE_CONNECTION_ID_LIMIT: u64 = 4;
+const TARGET_ACTIVE_SCIDS: usize = ACTIVE_CONNECTION_ID_LIMIT as usize;
 
 struct UdpCapabilities {
     batch_size: usize,
@@ -484,6 +486,7 @@ fn process_sessions_tick(
     }
 
     for client_id in touched_sessions {
+        shard.reconcile_session(client_id);
         shard.refresh_quic_timeout(client_id);
     }
 
@@ -493,8 +496,9 @@ fn process_sessions_tick(
 fn cleanup_disconnected_sessions(shard: &mut ShardState, disconnected: Vec<ClientId>) {
     for client_id in disconnected {
         if let Some(session) = shard.sessions.remove(&client_id) {
-            shard.client_id_by_addr.remove(&session.client_addr);
-            shard.client_id_by_cid.remove(&session.local_cid);
+            for cid in session.tracked_scids {
+                shard.client_id_by_cid.remove(&cid);
+            }
             let _ = shard.event_tx.send(NetworkEvent::ClientDisconnected(client_id));
         }
     }
@@ -506,7 +510,6 @@ struct ShardState {
     local_addr: SocketAddr,
     config: quiche::Config,
     sessions: HashMap<ClientId, Session>,
-    client_id_by_addr: HashMap<SocketAddr, ClientId>,
     client_id_by_cid: HashMap<Vec<u8>, ClientId>,
     quic_timeouts: BinaryHeap<QuicTimeout>,
     event_tx: mpsc::Sender<NetworkEvent>,
@@ -528,7 +531,6 @@ impl ShardState {
             local_addr,
             config,
             sessions: HashMap::new(),
-            client_id_by_addr: HashMap::new(),
             client_id_by_cid: HashMap::new(),
             quic_timeouts: BinaryHeap::new(),
             event_tx,
@@ -565,13 +567,32 @@ impl ShardState {
     }
 
     fn register_session(&mut self, client_id: ClientId, session: Session) {
-        let client_addr = session.client_addr;
-        let local_cid = session.local_cid.clone();
         self.sessions.insert(client_id, session);
-        self.client_id_by_addr.insert(client_addr, client_id);
-        self.client_id_by_cid.insert(local_cid, client_id);
+        self.reconcile_session(client_id);
         self.refresh_quic_timeout(client_id);
         let _ = self.event_tx.send(NetworkEvent::ClientConnected(client_id));
+    }
+
+    fn reconcile_session(&mut self, client_id: ClientId) {
+        let Some(session) = self.sessions.get_mut(&client_id) else {
+            return;
+        };
+
+        drain_path_events(session);
+        advertise_spare_scids(&mut session.conn, self.worker_id, self.worker_count);
+        while session.conn.retired_scid_next().is_some() {}
+
+        let old_scids = std::mem::take(&mut session.tracked_scids);
+        let new_scids: HashSet<Vec<u8>> =
+            session.conn.source_ids().map(|cid| cid.as_ref().to_vec()).collect();
+        session.tracked_scids = new_scids.clone();
+
+        for cid in old_scids.difference(&new_scids) {
+            self.client_id_by_cid.remove(cid);
+        }
+        for cid in &new_scids {
+            self.client_id_by_cid.insert(cid.clone(), client_id);
+        }
     }
 
     fn process_due_quic_timeouts(&mut self) {
@@ -667,16 +688,12 @@ fn handle_io_command(cmd: IoCommand, shard: &mut ShardState) {
 fn handle_received_datagram(shard: &mut ShardState, from: SocketAddr, dcid: &[u8], data: Vec<u8>) {
     if let Some(client_id) = shard.client_id_by_cid.get(dcid).copied() {
         let local_addr = shard.local_addr;
-        let previous_addr = shard.sessions.get(&client_id).map(|session| session.client_addr);
         shard.with_session_and_refresh(client_id, |session| {
             let mut data = data;
             session.client_addr = from;
             recv_on_session(session, &mut data, from, local_addr, "conn.recv");
         });
-        if let Some(previous_addr) = previous_addr.filter(|addr| *addr != from) {
-            shard.client_id_by_addr.remove(&previous_addr);
-        }
-        shard.client_id_by_addr.insert(from, client_id);
+        shard.reconcile_session(client_id);
     } else {
         handle_add_connection(shard, from, data);
     }
@@ -718,8 +735,7 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
         },
     };
 
-    let mut session =
-        Session::new(client_id, client_addr, server_cid, shard.event_tx.clone(), conn);
+    let mut session = Session::new(client_id, client_addr, shard.event_tx.clone(), conn);
     recv_on_session(
         &mut session,
         &mut pkt_buf,
@@ -738,6 +754,56 @@ fn generate_server_cid_for_worker(worker_id: usize, worker_count: usize) -> Vec<
         rand::rng().fill_bytes(&mut cid);
         if worker_index_for_cid(&cid, worker_count) == worker_id {
             return cid;
+        }
+    }
+}
+
+fn advertise_spare_scids(conn: &mut Connection, worker_id: usize, worker_count: usize) {
+    while conn.active_scids() < TARGET_ACTIVE_SCIDS && conn.scids_left() > 0 {
+        let cid = generate_server_cid_for_worker(worker_id, worker_count);
+        let cid = quiche::ConnectionId::from_ref(&cid);
+        if let Err(err) = conn.new_scid(&cid, rand::random::<u128>(), false) {
+            log::debug!("failed to advertise spare server CID: {err:?}");
+            break;
+        }
+    }
+}
+
+fn drain_path_events(session: &mut Session) {
+    while let Some(event) = session.conn.path_event_next() {
+        match event {
+            quiche::PathEvent::New(local, peer) => {
+                log::debug!("client {} observed new path {} -> {}", session.client_id, local, peer);
+            },
+            quiche::PathEvent::Validated(local, peer) => {
+                log::debug!("client {} validated path {} -> {}", session.client_id, local, peer);
+            },
+            quiche::PathEvent::FailedValidation(local, peer) => {
+                log::debug!(
+                    "client {} path validation failed {} -> {}",
+                    session.client_id,
+                    local,
+                    peer
+                );
+            },
+            quiche::PathEvent::Closed(local, peer) => {
+                log::debug!("client {} closed path {} -> {}", session.client_id, local, peer);
+            },
+            quiche::PathEvent::ReusedSourceConnectionId(seq, old, new) => {
+                log::warn!(
+                    "client {} reused CID seq {} from {} -> {} to {} -> {}",
+                    session.client_id,
+                    seq,
+                    old.0,
+                    old.1,
+                    new.0,
+                    new.1
+                );
+            },
+            quiche::PathEvent::PeerMigrated(_, peer) => {
+                session.client_addr = peer;
+                log::info!("client {} migrated to {}", session.client_id, peer);
+            },
         }
     }
 }
@@ -1075,6 +1141,8 @@ fn build_server_quic_config() -> Result<quiche::Config> {
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
+    config.set_active_connection_id_limit(ACTIVE_CONNECTION_ID_LIMIT);
+    config.set_disable_active_migration(false);
     config.enable_dgram(true, 64, 64);
     config.verify_peer(false);
     Ok(config)
@@ -1109,7 +1177,7 @@ struct Session {
     event_tx: mpsc::Sender<NetworkEvent>,
     conn: Connection,
     client_addr: SocketAddr,
-    local_cid: Vec<u8>,
+    tracked_scids: HashSet<Vec<u8>>,
     streams: HashMap<u64, QuicStreamState>,
     next_server_uni_stream_id: u64,
     sequence_streams: HashMap<Uuid, u64>,
@@ -1141,16 +1209,16 @@ impl Session {
     fn new(
         client_id: ClientId,
         client_addr: SocketAddr,
-        local_cid: Vec<u8>,
         event_tx: mpsc::Sender<NetworkEvent>,
         conn: Connection,
     ) -> Self {
+        let tracked_scids = conn.source_ids().map(|cid| cid.as_ref().to_vec()).collect();
         Self {
             client_id,
             event_tx,
             conn,
             client_addr,
-            local_cid,
+            tracked_scids,
             streams: HashMap::new(),
             next_server_uni_stream_id: FIRST_SERVER_UNI_STREAM_ID,
             sequence_streams: HashMap::new(),

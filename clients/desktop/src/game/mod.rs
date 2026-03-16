@@ -9,14 +9,15 @@ use sha2::{Digest, Sha256};
 mod app;
 mod bindings;
 mod network;
+mod network_migration;
 mod packet_chain;
 #[allow(dead_code)]
 mod packets {
     include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 }
 mod persistence;
-use self::packets as protocol;
 use self::packet_chain::PacketChain;
+use self::packets as protocol;
 mod renderer;
 
 const LERP_ALPHA: f32 = 0.35;
@@ -381,6 +382,14 @@ impl ClientGame {
         Ok(())
     }
 
+    pub(super) fn handle_network_change(&mut self) -> Result<()> {
+        self.net.handle_network_change()?;
+        self.smoothed_path_rtt = None;
+        self.pending_ping_nonces.clear();
+        self.last_ping_sent_at = Instant::now();
+        Ok(())
+    }
+
     pub(in crate::game) fn binding_prompt(&self) -> Option<BindingPromptState> {
         self.bindings.binding_prompt()
     }
@@ -421,7 +430,9 @@ impl ClientGame {
     pub(super) fn render_states(&self) -> Vec<RenderState> {
         self.elements
             .values()
-            .filter(|e| e.visible && e.texture_id.and_then(|id| self.texture_resource(id)).is_some())
+            .filter(|e| {
+                e.visible && e.texture_id.and_then(|id| self.texture_resource(id)).is_some()
+            })
             .map(|e| RenderState {
                 x: e.draw.x,
                 y: e.draw.y,
@@ -754,7 +765,12 @@ impl ClientGame {
                 }
             },
             protocol::decode::DecodedServerMessage::Resource(resource) => {
-                self.store_resource(resource.id, resource.resource_type, resource.usage_count, resource.blob)?;
+                self.store_resource(
+                    resource.id,
+                    resource.resource_type,
+                    resource.usage_count,
+                    resource.blob,
+                )?;
             },
         }
 
@@ -877,7 +893,9 @@ impl ClientGame {
         let element_ids: Vec<u32> = self
             .elements
             .iter()
-            .filter_map(|(&element_id, element)| (element.texture_id == Some(resource_id)).then_some(element_id))
+            .filter_map(|(&element_id, element)| {
+                (element.texture_id == Some(resource_id)).then_some(element_id)
+            })
             .collect();
 
         for element_id in element_ids {

@@ -11,6 +11,8 @@ use rand::Rng;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(5);
+const ACTIVE_CONNECTION_ID_LIMIT: u64 = 4;
+const TARGET_ACTIVE_SCIDS: usize = ACTIVE_CONNECTION_ID_LIMIT as usize;
 
 pub(super) struct IncomingPackets {
     pub(super) datagrams: Vec<Vec<u8>>,
@@ -19,6 +21,7 @@ pub(super) struct IncomingPackets {
 
 enum WorkerCommand {
     SendDatagram(Vec<u8>),
+    RebindSocket(UdpSocket),
     Shutdown,
 }
 
@@ -137,6 +140,14 @@ impl QuicClient {
             .send(WorkerCommand::SendDatagram(payload.to_vec()))
             .context("client network worker is unavailable")
     }
+
+    pub(super) fn handle_network_change(&mut self) -> Result<()> {
+        let socket = UdpSocket::bind("0.0.0.0:0").context("failed to rebind UDP socket")?;
+        socket.set_nonblocking(true).context("failed to set rebound UDP socket non-blocking")?;
+        self.command_tx
+            .send(WorkerCommand::RebindSocket(socket))
+            .context("client network worker is unavailable")
+    }
 }
 
 impl Drop for QuicClient {
@@ -150,10 +161,10 @@ impl Drop for QuicClient {
 
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
-    socket: UdpSocket,
+    mut socket: UdpSocket,
     mut conn: quiche::Connection,
     server_addr: SocketAddr,
-    local_addr: SocketAddr,
+    mut local_addr: SocketAddr,
     command_rx: mpsc::Receiver<WorkerCommand>,
     incoming_tx: mpsc::Sender<WorkerIncoming>,
     is_established: Arc<AtomicBool>,
@@ -165,12 +176,19 @@ fn run_worker(
     let mut app_buf = [0u8; 4096];
     let mut stream_states: HashMap<u64, QuicStreamState> = HashMap::new();
 
+    advertise_spare_scids(&mut conn);
     flush_outgoing(&socket, &mut conn, &mut send_buf)?;
 
     loop {
         let mut had_activity = false;
 
-        if process_worker_commands(&command_rx, &mut conn, &mut had_activity)? {
+        if process_worker_commands(
+            &command_rx,
+            &mut socket,
+            &mut conn,
+            &mut local_addr,
+            &mut had_activity,
+        )? {
             return Ok(());
         }
         recv_udp(&socket, &mut conn, &mut recv_buf, server_addr, local_addr, &mut had_activity)?;
@@ -183,6 +201,9 @@ fn run_worker(
                 had_activity = true;
             }
         }
+
+        drain_path_events(&mut conn);
+        advertise_spare_scids(&mut conn);
 
         if flush_outgoing(&socket, &mut conn, &mut send_buf)? {
             had_activity = true;
@@ -207,7 +228,9 @@ fn run_worker(
 
 fn process_worker_commands(
     command_rx: &mpsc::Receiver<WorkerCommand>,
+    socket: &mut UdpSocket,
     conn: &mut quiche::Connection,
+    local_addr: &mut SocketAddr,
     had_activity: &mut bool,
 ) -> Result<bool> {
     while let Ok(cmd) = command_rx.try_recv() {
@@ -216,10 +239,73 @@ fn process_worker_commands(
                 let _ = conn.dgram_send(&payload);
                 *had_activity = true;
             },
+            WorkerCommand::RebindSocket(new_socket) => {
+                let new_local_addr =
+                    new_socket.local_addr().context("failed to get rebound local addr")?;
+                let previous_local_addr = *local_addr;
+                let previous_socket = std::mem::replace(socket, new_socket);
+                *local_addr = new_local_addr;
+                if conn.is_established() {
+                    if let Err(err) = conn.migrate_source(*local_addr) {
+                        *socket = previous_socket;
+                        *local_addr = previous_local_addr;
+                        log::warn!("failed to migrate QUIC connection to rebound socket: {err:?}");
+                        continue;
+                    }
+                    log::info!("client migrated QUIC socket to {}", *local_addr);
+                } else {
+                    log::info!("client rebound UDP socket to {}", *local_addr);
+                }
+                *had_activity = true;
+            },
             WorkerCommand::Shutdown => return Ok(true),
         }
     }
     Ok(false)
+}
+
+fn advertise_spare_scids(conn: &mut quiche::Connection) {
+    while conn.active_scids() < TARGET_ACTIVE_SCIDS && conn.scids_left() > 0 {
+        let mut cid = [0u8; quiche::MAX_CONN_ID_LEN];
+        rand::rng().fill_bytes(&mut cid);
+        let cid = quiche::ConnectionId::from_ref(&cid);
+        if let Err(err) = conn.new_scid(&cid, rand::random::<u128>(), false) {
+            log::debug!("failed to advertise spare client CID: {err:?}");
+            break;
+        }
+    }
+}
+
+fn drain_path_events(conn: &mut quiche::Connection) {
+    while let Some(event) = conn.path_event_next() {
+        match event {
+            quiche::PathEvent::New(local, peer) => {
+                log::debug!("client observed path {} -> {}", local, peer);
+            },
+            quiche::PathEvent::Validated(local, peer) => {
+                log::info!("client validated path {} -> {}", local, peer);
+            },
+            quiche::PathEvent::FailedValidation(local, peer) => {
+                log::warn!("client path validation failed {} -> {}", local, peer);
+            },
+            quiche::PathEvent::Closed(local, peer) => {
+                log::debug!("client closed path {} -> {}", local, peer);
+            },
+            quiche::PathEvent::ReusedSourceConnectionId(seq, old, new) => {
+                log::warn!(
+                    "client reused CID seq {} from {} -> {} to {} -> {}",
+                    seq,
+                    old.0,
+                    old.1,
+                    new.0,
+                    new.1
+                );
+            },
+            quiche::PathEvent::PeerMigrated(_, peer) => {
+                log::warn!("server unexpectedly migrated to {}", peer);
+            },
+        }
+    }
 }
 
 fn recv_udp(
@@ -403,6 +489,8 @@ fn build_client_quic_config() -> Result<quiche::Config> {
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(16);
     config.set_initial_max_streams_uni(16);
+    config.set_active_connection_id_limit(ACTIVE_CONNECTION_ID_LIMIT);
+    config.set_disable_active_migration(false);
     config.enable_dgram(true, 64, 64);
     Ok(config)
 }
