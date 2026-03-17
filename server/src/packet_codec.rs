@@ -3,10 +3,6 @@ use crate::packets::{
     PacketPayload, PacketResource, S2CPacket,
 };
 
-pub fn serialize_s2c_packet(packet: &S2CPacket) -> Option<Vec<u8>> {
-    encode_s2c(packet).ok()
-}
-
 pub fn serialize_s2c_packet_message(packet: &S2CPacket) -> Option<Vec<u8>> {
     let envelope = PacketEnvelope::single(crate::packets::PacketTarget::Broadcast, packet.clone());
     serialize_packet_message(&PacketMessage::Envelope(envelope))
@@ -83,7 +79,7 @@ fn serialize_resource_payload(resource: &PacketResource) -> Option<Vec<u8>> {
 }
 
 fn append_packet_frame(framed: &mut Vec<u8>, packet: &S2CPacket) -> Option<()> {
-    let encoded = serialize_s2c_packet(packet)?;
+    let encoded = encode_s2c(packet).ok()?;
     framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
     framed.extend_from_slice(&encoded);
     Some(())
