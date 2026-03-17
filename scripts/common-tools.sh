@@ -19,10 +19,10 @@ setup_net_log_env() {
   local flush_policy="${2:-flow}"
   local console="${3:-1}"
 
-  export WIDEV_NET_LOG=1
-  export WIDEV_NET_LOG_DIR="$log_dir"
-  export WIDEV_NET_LOG_FLUSH="$flush_policy"
-  export WIDEV_NET_LOG_CONSOLE="$console"
+  export WIDEV_NET_TRACE=1
+  export WIDEV_NET_TRACE_DIR="$log_dir"
+  export WIDEV_NET_TRACE_FLUSH="$flush_policy"
+  export WIDEV_NET_TRACE_CONSOLE="$console"
 }
 
 usage() {
@@ -34,7 +34,7 @@ Usage:
   scripts/common-tools.sh flame [name] [duration] [output]
 
 Options:
-  --log[=dir]    Enable per-client network logging to specified directory
+  --log[=dir]    Enable network tracing to specified directory
                  Default directory: ./logs/network
 
 Defaults:
@@ -45,17 +45,17 @@ Defaults:
   duration = 30
   output   = server-flame.svg
 
-Environment Variables (for network logging):
-  WIDEV_NET_LOG=1              Enable logging
-  WIDEV_NET_LOG_DIR=./logs/network   Output directory
-  WIDEV_NET_LOG_FLUSH=flow     Flush policy: every|batch|flow
-  WIDEV_NET_LOG_CONSOLE=1      Also log to console
+Environment Variables (for network tracing):
+  WIDEV_NET_TRACE=1                  Enable tracing
+  WIDEV_NET_TRACE_DIR=./logs/network Output directory
+  WIDEV_NET_TRACE_FLUSH=flow         Flush policy: every|batch|flow
+  WIDEV_NET_TRACE_CONSOLE=1          Also log to console
 
 Examples:
-  scripts/common-tools.sh server                           # Run server without logging
-  scripts/common-tools.sh server --log                     # Run server with logging to ./logs/network
-  scripts/common-tools.sh server --log=./custom-logs       # Run server with logging to custom directory
-  bots --log +  WIDEV_NET_LOG_FLUSH=every scripts/common-tools.sh bots  # Bots with immediate flush
+  scripts/common-tools.sh server                           # Run server without tracing
+  scripts/common-tools.sh server --log                     # Run server with tracing to ./logs/network
+  scripts/common-tools.sh server --log=./custom-logs       # Run server with tracing to custom directory
+  WIDEV_NET_TRACE_FLUSH=every scripts/common-tools.sh bots --log  # Bots with immediate flush
 EOF
 }
 

@@ -9,6 +9,7 @@ anyhow = { workspace = true }
 quiche = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 wincode = { workspace = true }
 rcgen = { workspace = true }
 clap = { workspace = true }

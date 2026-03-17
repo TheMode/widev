@@ -1080,10 +1080,16 @@ fn flush_quic(
     delayed_datagrams: &mut BinaryHeap<PacedDatagram>,
     ready_datagrams: &mut VecDeque<PacedDatagram>,
 ) -> Result<()> {
-    let now = Instant::now();
     loop {
+        let now = Instant::now();
         match session.conn.send(send_buf) {
             Ok((len, send_info)) => {
+                let pacing_delay_ms = if send_info.at > now {
+                    send_info.at.duration_since(now).as_secs_f64() * 1000.0
+                } else {
+                    0.0
+                };
+                session.tracer.on_quic_egress(len, send_info.to, pacing_delay_ms);
                 let datagram = PacedDatagram {
                     at: send_info.at,
                     to: send_info.to,

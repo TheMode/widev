@@ -1,0 +1,1655 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Trace Viewer</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f0f0f;
+    --surface: #161616;
+    --surface2: #1e1e1e;
+    --surface3: #252525;
+    --border: #2a2a2a;
+    --border2: #333;
+    --text: #e8e8e8;
+    --text2: #999;
+    --text3: #666;
+    --accent: #4af;
+    --accent2: #2d88cc;
+    --green: #3c9;
+    --red: #e55;
+    --yellow: #eb7;
+    --purple: #a88ef0;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; }
+
+  /* ---- Layout ---- */
+  #app { display: grid; grid-template-rows: 44px 1fr; height: 100vh; }
+  #header { display: flex; align-items: center; gap: 16px; padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  #header h1 { font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text2); }
+  #header .pill { background: var(--accent); color: #000; font-size: 10px; font-weight: 600; padding: 2px 7px; letter-spacing: 0.05em; text-transform: uppercase; }
+  #header .sep { width: 1px; height: 20px; background: var(--border); }
+
+  #main { display: grid; grid-template-columns: 200px 1fr; overflow: hidden; }
+  #sidebar { border-right: 1px solid var(--border); background: var(--surface); overflow-y: auto; }
+  #content { overflow: hidden; display: flex; flex-direction: column; }
+
+  /* ---- Sidebar ---- */
+  .nav-section { padding: 12px 0 4px; }
+  .nav-label { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); padding: 0 16px 6px; font-weight: 600; }
+  .nav-item { display: flex; align-items: center; gap: 8px; padding: 6px 16px; cursor: pointer; color: var(--text2); font-size: 12px; border-left: 2px solid transparent; }
+  .nav-item:hover { background: var(--surface2); color: var(--text); }
+  .nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(68,170,255,0.05); }
+  .nav-item .badge { margin-left: auto; font-size: 10px; background: var(--surface3); padding: 1px 5px; color: var(--text3); font-family: var(--mono); }
+
+  /* ---- Tabs / Views ---- */
+  .view { display: none; flex-direction: column; height: 100%; overflow: hidden; }
+  .view.active { display: flex; }
+  .view-header { padding: 14px 20px 12px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+  .view-title { font-size: 13px; font-weight: 600; }
+  .view-sub { color: var(--text3); font-size: 12px; }
+
+  /* ---- Upload Drop Zone ---- */
+  #dropzone { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 12px; }
+  #dropzone .dz-box { border: 1px dashed var(--border2); padding: 48px 64px; text-align: center; cursor: pointer; }
+  #dropzone .dz-box:hover { border-color: var(--accent2); }
+  #dropzone h2 { font-size: 14px; font-weight: 500; margin-bottom: 6px; }
+  #dropzone p { color: var(--text3); font-size: 12px; }
+  #dropzone .hint { font-family: var(--mono); font-size: 11px; color: var(--text3); }
+  #file-input { display: none; }
+
+  /* ---- Stats Grid ---- */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .stat-card { background: var(--surface); padding: 14px 16px; }
+  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text3); margin-bottom: 4px; }
+  .stat-value { font-family: var(--mono); font-size: 20px; font-weight: 300; color: var(--text); }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.yellow { color: var(--yellow); }
+  .stat-value.accent { color: var(--accent); }
+  .stat-sub { font-size: 10px; color: var(--text3); margin-top: 2px; font-family: var(--mono); }
+
+  /* ---- Table ---- */
+  .table-wrap { flex: 1; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  thead th { position: sticky; top: 0; background: var(--surface); padding: 8px 12px; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text3); border-bottom: 1px solid var(--border); font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none; }
+  thead th:hover { color: var(--text2); }
+  thead th.sorted { color: var(--accent); }
+  tbody tr { border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: var(--surface2); }
+  tbody tr.selected { background: rgba(68,170,255,0.07); }
+  tbody td { padding: 7px 12px; color: var(--text2); font-family: var(--mono); white-space: nowrap; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+  td.num { text-align: right; }
+  .tag { display: inline-block; padding: 1px 6px; font-size: 10px; font-family: var(--mono); }
+  .tag.green { background: rgba(51,204,153,0.12); color: var(--green); }
+  .tag.red { background: rgba(238,85,85,0.12); color: var(--red); }
+  .tag.yellow { background: rgba(238,187,119,0.12); color: var(--yellow); }
+  .tag.blue { background: rgba(68,170,255,0.12); color: var(--accent); }
+  .tag.purple { background: rgba(168,142,240,0.12); color: var(--purple); }
+  .tag.gray { background: rgba(150,150,150,0.1); color: var(--text3); }
+
+  /* ---- Filters / Toolbar ---- */
+  .toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }
+  .tb-input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-family: var(--mono); font-size: 12px; padding: 5px 10px; outline: none; }
+  .tb-input:focus { border-color: var(--accent2); }
+  .tb-select { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); font-family: var(--sans); font-size: 12px; padding: 5px 10px; outline: none; cursor: pointer; }
+  .tb-select:focus { border-color: var(--accent2); }
+  .tb-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); font-size: 11px; padding: 5px 12px; cursor: pointer; font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.05em; }
+  .tb-btn:hover { border-color: var(--border2); color: var(--text); }
+  .tb-btn.active { border-color: var(--accent2); color: var(--accent); background: rgba(68,170,255,0.07); }
+  .tb-label { font-size: 11px; color: var(--text3); }
+
+  /* ---- Detail Panel ---- */
+  .detail-panel { width: 380px; border-left: 1px solid var(--border); background: var(--surface); overflow-y: auto; flex-shrink: 0; display: none; flex-direction: column; }
+  .detail-panel.open { display: flex; }
+  .dp-header { padding: 12px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .dp-title { font-size: 12px; font-weight: 600; }
+  .dp-close { background: none; border: none; color: var(--text3); cursor: pointer; font-size: 16px; line-height: 1; padding: 2px; }
+  .dp-close:hover { color: var(--text); }
+  .dp-section { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .dp-section-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text3); margin-bottom: 8px; font-weight: 600; }
+  .kv-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 5px; font-size: 11px; }
+  .kv-key { color: var(--text3); white-space: nowrap; flex-shrink: 0; }
+  .kv-val { color: var(--text); font-family: var(--mono); text-align: right; word-break: break-all; }
+  .component-row { background: var(--surface2); padding: 6px 8px; margin-bottom: 4px; font-size: 11px; }
+  .comp-type { color: var(--accent); font-family: var(--mono); }
+  .comp-bytes { color: var(--text3); margin-left: 8px; }
+
+  /* ---- Timeline / Chart ---- */
+  .chart-wrap { position: relative; flex: 1; min-height: 0; }
+  canvas { display: block; }
+
+  /* ---- Flow Timeline ---- */
+  #flow-timeline-wrap { flex: 1; overflow: auto; padding: 16px; }
+  .flow-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 3px; height: 24px; }
+  .flow-bar-label { font-size: 10px; font-family: var(--mono); color: var(--text3); width: 160px; flex-shrink: 0; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .flow-bar-track { flex: 1; height: 10px; background: var(--surface2); position: relative; cursor: pointer; }
+  .flow-bar { position: absolute; height: 100%; top: 0; min-width: 2px; }
+  .flow-bar.droppable { background: var(--yellow); opacity: 0.7; }
+  .flow-bar.normal { background: var(--accent); opacity: 0.6; }
+  .flow-bar.resource { background: var(--purple); opacity: 0.6; }
+  .flow-bar-track:hover .flow-bar { opacity: 1; }
+
+  /* ---- Event Log ---- */
+  #event-log-body tr { cursor: pointer; }
+  .event-type-badge { font-family: var(--mono); font-size: 10px; padding: 1px 6px; }
+
+  /* ---- Scatter / mini charts ---- */
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); flex: 1; overflow: hidden; }
+  .chart-cell { background: var(--surface); display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+  .chart-cell-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text3); padding: 10px 14px 6px; flex-shrink: 0; font-weight: 600; }
+  .chart-cell canvas { flex: 1; min-height: 0; display: block; }
+
+  /* ---- Scrollbar ---- */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); }
+
+  /* ---- Status bar ---- */
+  #statusbar { border-top: 1px solid var(--border); padding: 4px 16px; font-size: 10px; color: var(--text3); font-family: var(--mono); display: flex; gap: 20px; flex-shrink: 0; }
+
+  .split-view { display: flex; flex: 1; overflow: hidden; }
+
+  /* Pager */
+  .pager { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+  .pager button { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); padding: 3px 8px; cursor: pointer; font-size: 11px; }
+  .pager button:disabled { opacity: 0.3; cursor: default; }
+  .pager span { font-size: 11px; color: var(--text3); font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <h1>Network Trace Viewer</h1>
+    <div class="sep"></div>
+    <span id="file-name" style="font-size:12px;color:var(--text3);font-family:var(--mono)">no file loaded</span>
+    <button class="tb-btn" id="load-btn" style="margin-left:4px">Load File</button>
+    <input type="file" id="file-input" accept=".ndjson,.jsonl,.json">
+    <div class="sep"></div>
+    <span id="header-stats" style="font-size:11px;color:var(--text3);font-family:var(--mono)"></span>
+  </div>
+  <div id="main">
+    <div id="sidebar">
+      <div class="nav-section">
+        <div class="nav-label">Overview</div>
+        <div class="nav-item active" data-view="overview">
+          <span>◈</span> Dashboard
+        </div>
+        <div class="nav-item" data-view="performance">
+          <span>◎</span> Performance
+        </div>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Flows</div>
+        <div class="nav-item" data-view="flows">
+          <span>⇌</span> Flow Table <span class="badge" id="badge-flows">—</span>
+        </div>
+        <div class="nav-item" data-view="timeline">
+          <span>▬</span> Timeline
+        </div>
+        <div class="nav-item" data-view="bottleneck">
+          <span>▲</span> Bottleneck
+        </div>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Transport</div>
+        <div class="nav-item" data-view="egress">
+          <span>↑</span> Egress
+        </div>
+        <div class="nav-item" data-view="datagrams">
+          <span>⬡</span> Datagrams <span class="badge" id="badge-datagrams">—</span>
+        </div>
+        <div class="nav-item" data-view="rx">
+          <span>↓</span> RX Events <span class="badge" id="badge-rx">—</span>
+        </div>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Events</div>
+        <div class="nav-item" data-view="eventlog">
+          <span>≡</span> Event Log <span class="badge" id="badge-events">—</span>
+        </div>
+        <div class="nav-item" data-view="scheduler">
+          <span>⧖</span> Scheduler
+        </div>
+      </div>
+    </div>
+
+    <div id="content">
+      <!-- DROP ZONE -->
+      <div id="view-drop" class="view active" style="display:flex">
+        <div id="dropzone">
+          <div class="dz-box" id="dz-box">
+            <h2>Drop an NDJSON trace file here</h2>
+            <p>or click to browse</p>
+          </div>
+          <div class="hint">Supports global_events.ndjson / client_*.events.ndjson</div>
+        </div>
+      </div>
+
+      <!-- OVERVIEW / DASHBOARD -->
+      <div id="view-overview" class="view">
+        <div class="view-header">
+          <span class="view-title">Dashboard</span>
+          <span class="view-sub" id="ov-sub"></span>
+        </div>
+        <div class="stats-grid" id="ov-stats"></div>
+        <div class="chart-grid" id="ov-charts" style="flex:1;overflow:hidden;">
+          <div class="chart-cell">
+            <div class="chart-cell-title">Egress Bytes Over Time</div>
+            <canvas id="chart-egress-time"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Flow Duration Distribution</div>
+            <canvas id="chart-flow-dur"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Event Type Breakdown</div>
+            <canvas id="chart-event-types"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Delivery Outcomes</div>
+            <canvas id="chart-outcomes"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- PERFORMANCE -->
+      <div id="view-performance" class="view">
+        <div class="view-header">
+          <span class="view-title">Performance</span>
+          <span class="view-sub">RTT, throughput, pacing, latency</span>
+        </div>
+        <div class="stats-grid" id="perf-stats"></div>
+        <div class="chart-grid" style="flex:1;overflow:hidden;">
+          <div class="chart-cell">
+            <div class="chart-cell-title">RTT Over Time (ms)</div>
+            <canvas id="chart-rtt"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Pacing Delay Over Time (ms)</div>
+            <canvas id="chart-pacing"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Queued Stream Bytes Over Time</div>
+            <canvas id="chart-queue"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Active Streams Over Time</div>
+            <canvas id="chart-streams"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- FLOWS -->
+      <div id="view-flows" class="view">
+        <div class="view-header">
+          <span class="view-title">Flows</span>
+        </div>
+        <div class="toolbar">
+          <input class="tb-input" id="flow-search" placeholder="Search label, kind, priority..." style="width:220px">
+          <select class="tb-select" id="flow-filter-kind">
+            <option value="">All Kinds</option>
+            <option value="envelope">Envelope</option>
+            <option value="resource">Resource</option>
+            <option value="datagram">Datagram</option>
+          </select>
+          <select class="tb-select" id="flow-filter-outcome">
+            <option value="">All Outcomes</option>
+            <option value="TransportDelivered">TransportDelivered</option>
+            <option value="ClientProcessed">ClientProcessed</option>
+            <option value="TransportDropped">TransportDropped</option>
+            <option value="Aborted">Aborted</option>
+          </select>
+          <select class="tb-select" id="flow-filter-client">
+            <option value="">All Clients</option>
+          </select>
+          <button class="tb-btn" id="flow-clear-btn">Clear</button>
+          <div class="pager">
+            <button id="flow-prev">‹</button>
+            <span id="flow-page-info">1 / 1</span>
+            <button id="flow-next">›</button>
+          </div>
+        </div>
+        <div class="split-view">
+          <div class="table-wrap" style="flex:1">
+            <table>
+              <thead>
+                <tr>
+                  <th data-col="flow_id">Flow ID</th>
+                  <th data-col="client_id">Client</th>
+                  <th data-col="kind">Kind</th>
+                  <th data-col="packet_label">Label</th>
+                  <th data-col="priority">Priority</th>
+                  <th data-col="delivery">Delivery</th>
+                  <th data-col="payload_bytes">Bytes</th>
+                  <th data-col="duration_ms">Duration (ms)</th>
+                  <th data-col="outcome">Outcome</th>
+                </tr>
+              </thead>
+              <tbody id="flow-table-body"></tbody>
+            </table>
+          </div>
+          <div class="detail-panel" id="flow-detail"></div>
+        </div>
+      </div>
+
+      <!-- TIMELINE -->
+      <div id="view-timeline" class="view">
+        <div class="view-header">
+          <span class="view-title">Flow Timeline</span>
+          <span class="view-sub">Gantt view of flows by start time</span>
+        </div>
+        <div class="toolbar">
+          <select class="tb-select" id="tl-filter-kind">
+            <option value="">All Kinds</option>
+            <option value="envelope">Envelope</option>
+            <option value="resource">Resource</option>
+            <option value="datagram">Datagram</option>
+          </select>
+          <select class="tb-select" id="tl-filter-client">
+            <option value="">All Clients</option>
+          </select>
+          <label class="tb-label"><input type="checkbox" id="tl-show-incomplete" style="margin-right:4px">Show Incomplete</label>
+          <span class="tb-label" id="tl-count-label"></span>
+        </div>
+        <div id="flow-timeline-wrap">
+          <div id="flow-timeline-header" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;padding-left:170px;">
+            <div id="tl-axis" style="flex:1;height:16px;position:relative;font-size:9px;color:var(--text3);font-family:var(--mono);"></div>
+          </div>
+          <div id="flow-timeline-rows"></div>
+        </div>
+      </div>
+
+      <!-- BOTTLENECK -->
+      <div id="view-bottleneck" class="view">
+        <div class="view-header">
+          <span class="view-title">Bottleneck Analysis</span>
+          <span class="view-sub">Slow flows, congestion events, drops</span>
+        </div>
+        <div class="stats-grid" id="bn-stats"></div>
+        <div class="split-view" style="flex:1;overflow:hidden;">
+          <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+            <div class="toolbar" style="font-size:11px;color:var(--text3)">Top 50 slowest flows by duration</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr>
+                  <th>Rank</th><th>Flow ID</th><th>Label</th><th>Duration (ms)</th><th>Kind</th><th>Outcome</th><th>Client</th>
+                </tr></thead>
+                <tbody id="bn-table-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="detail-panel" id="bn-detail"></div>
+        </div>
+      </div>
+
+      <!-- EGRESS -->
+      <div id="view-egress" class="view">
+        <div class="view-header"><span class="view-title">QUIC Egress</span></div>
+        <div class="stats-grid" id="eg-stats"></div>
+        <div class="chart-grid" style="flex:1;overflow:hidden;">
+          <div class="chart-cell" style="grid-column:span 2">
+            <div class="chart-cell-title">Bytes/packet sent over time</div>
+            <canvas id="chart-egress-scatter"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Packet size distribution</div>
+            <canvas id="chart-egress-hist"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Pacing delay distribution (ms)</div>
+            <canvas id="chart-pacing-hist"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- DATAGRAMS -->
+      <div id="view-datagrams" class="view">
+        <div class="view-header"><span class="view-title">Datagrams</span></div>
+        <div class="stats-grid" id="dg-stats"></div>
+        <div class="toolbar">
+          <input class="tb-input" id="dg-search" placeholder="Filter by flow ID, label..." style="width:220px">
+          <select class="tb-select" id="dg-filter-status">
+            <option value="">All Statuses</option>
+            <option value="sent">Sent</option>
+            <option value="failed">Failed</option>
+          </select>
+          <div class="pager">
+            <button id="dg-prev">‹</button>
+            <span id="dg-page-info">1 / 1</span>
+            <button id="dg-next">›</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Flow ID</th><th>Client</th><th>Label</th><th>Bytes</th><th>Writable</th><th>Status</th><th>Outcome</th><th>Time (ms)</th>
+            </tr></thead>
+            <tbody id="dg-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- RX -->
+      <div id="view-rx" class="view">
+        <div class="view-header"><span class="view-title">RX Events</span></div>
+        <div class="toolbar">
+          <input class="tb-input" id="rx-search" placeholder="Filter..." style="width:200px">
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Time (ms)</th><th>Client</th><th>Direction</th><th>Transport</th><th>Bytes</th><th>Packet Type</th><th>Detail</th>
+            </tr></thead>
+            <tbody id="rx-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- EVENT LOG -->
+      <div id="view-eventlog" class="view">
+        <div class="view-header"><span class="view-title">Event Log</span></div>
+        <div class="toolbar">
+          <input class="tb-input" id="el-search" placeholder="Search events..." style="width:220px">
+          <select class="tb-select" id="el-filter-type">
+            <option value="">All Types</option>
+          </select>
+          <select class="tb-select" id="el-filter-client">
+            <option value="">All Clients</option>
+          </select>
+          <div class="pager">
+            <button id="el-prev">‹</button>
+            <span id="el-page-info">1 / 1</span>
+            <button id="el-next">›</button>
+          </div>
+        </div>
+        <div class="split-view">
+          <div class="table-wrap" style="flex:1">
+            <table>
+              <thead><tr>
+                <th>Time (ms)</th><th>Client</th><th>Event</th><th>Flow</th><th>Summary</th>
+              </tr></thead>
+              <tbody id="event-log-body"></tbody>
+            </table>
+          </div>
+          <div class="detail-panel" id="el-detail"></div>
+        </div>
+      </div>
+
+      <!-- SCHEDULER -->
+      <div id="view-scheduler" class="view">
+        <div class="view-header"><span class="view-title">Scheduler Events</span></div>
+        <div class="stats-grid" id="sched-stats"></div>
+        <div class="chart-grid" style="flex:1;overflow:hidden;">
+          <div class="chart-cell">
+            <div class="chart-cell-title">Actions Over Time</div>
+            <canvas id="chart-sched-actions"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Queue Depth Over Time</div>
+            <canvas id="chart-sched-queue"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Inflight Messages (snapshot)</div>
+            <canvas id="chart-inflight"></canvas>
+          </div>
+          <div class="chart-cell">
+            <div class="chart-cell-title">Active Sequences (snapshot)</div>
+            <canvas id="chart-active-seq"></canvas>
+          </div>
+        </div>
+      </div>
+    </div><!-- #content -->
+  </div>
+</div><!-- #app -->
+
+<script>
+// ============================================================
+// DATA STATE
+// ============================================================
+let RAW = [];
+let DATA = {
+  flows: [],        // enriched flow objects
+  flowMap: {},      // flow_id -> flow
+  egress: [],
+  datagrams: [],    // paired attempt+result
+  rx: [],
+  snapshots: [],
+  schedulerEvents: [],
+  allEvents: [],
+  clients: new Set(),
+};
+
+// ============================================================
+// FILE LOADING
+// ============================================================
+document.getElementById('load-btn').onclick = () => document.getElementById('file-input').click();
+document.getElementById('file-input').onchange = e => loadFile(e.target.files[0]);
+document.getElementById('dz-box').onclick = () => document.getElementById('file-input').click();
+
+const dropEl = document.getElementById('dz-box');
+dropEl.addEventListener('dragover', e => { e.preventDefault(); dropEl.style.borderColor = 'var(--accent)'; });
+dropEl.addEventListener('dragleave', () => { dropEl.style.borderColor = ''; });
+dropEl.addEventListener('drop', e => { e.preventDefault(); dropEl.style.borderColor = ''; loadFile(e.dataTransfer.files[0]); });
+
+function loadFile(file) {
+  if (!file) return;
+  document.getElementById('file-name').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e => {
+    parseNDJSON(e.target.result);
+    buildData();
+    populateFilters();
+    renderAll();
+    navigateTo('overview');
+  };
+  reader.readAsText(file);
+}
+
+function parseNDJSON(text) {
+  RAW = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    try { RAW.push(JSON.parse(t)); } catch {}
+  }
+}
+
+// ============================================================
+// DATA PROCESSING
+// ============================================================
+function parseSnapshot(cmd) {
+  if (!cmd) return {};
+  const obj = {};
+  const parts = cmd.split(' ');
+  for (const p of parts) {
+    const [k, v] = p.split('=');
+    obj[k] = isNaN(v) ? v : parseFloat(v);
+  }
+  return obj;
+}
+
+function buildData() {
+  DATA.allEvents = RAW;
+  DATA.clients = new Set(RAW.filter(e => e.client_id != null).map(e => e.client_id));
+
+  const flowMap = {};
+  const deliveries = {};
+  const flowAttempts = {}; // flow_id -> datagram attempt
+  const flowResults = {};  // flow_id -> datagram result
+  DATA.egress = [];
+  DATA.rx = [];
+  DATA.snapshots = [];
+  DATA.schedulerEvents = [];
+  DATA.datagrams = [];
+
+  for (const ev of RAW) {
+    if (ev.event === 'flow_registered') {
+      flowMap[ev.flow_id] = {
+        ...ev.context,
+        flow_id: ev.flow_id,
+        client_id: ev.client_id,
+        start_ms: ev.timestamp_ms,
+        end_ms: null,
+        duration_ms: null,
+        outcome: null,
+        events: [ev],
+      };
+    } else if (ev.event === 'delivery_event' && ev.terminal && ev.flow_id != null) {
+      if (flowMap[ev.flow_id]) {
+        flowMap[ev.flow_id].end_ms = ev.timestamp_ms;
+        flowMap[ev.flow_id].duration_ms = ev.timestamp_ms - flowMap[ev.flow_id].start_ms;
+        flowMap[ev.flow_id].outcome = ev.outcome;
+      }
+      deliveries[ev.flow_id] = ev;
+    } else if (ev.event === 'quic_egress') {
+      DATA.egress.push(ev);
+    } else if (ev.event === 'rx_event') {
+      DATA.rx.push(ev);
+    } else if (ev.event === 'scheduler_event' && ev.action === 'snapshot') {
+      const snap = parseSnapshot(ev.command);
+      snap.timestamp_ms = ev.timestamp_ms;
+      snap.client_id = ev.client_id;
+      snap.queue_depth = ev.queue_depth;
+      DATA.snapshots.push(snap);
+    } else if (ev.event === 'scheduler_event') {
+      DATA.schedulerEvents.push(ev);
+    } else if (ev.event === 'datagram_attempt') {
+      flowAttempts[ev.flow_id] = ev;
+    } else if (ev.event === 'datagram_result') {
+      flowResults[ev.flow_id] = ev;
+    }
+  }
+
+  // attach events to flows
+  for (const ev of RAW) {
+    if (ev.flow_id != null && flowMap[ev.flow_id] && ev.event !== 'flow_registered') {
+      flowMap[ev.flow_id].events = flowMap[ev.flow_id].events || [];
+      flowMap[ev.flow_id].events.push(ev);
+    }
+  }
+
+  // build datagrams list
+  for (const fid of Object.keys(flowAttempts)) {
+    const attempt = flowAttempts[fid];
+    const result = flowResults[fid];
+    const flow = flowMap[fid];
+    DATA.datagrams.push({ attempt, result, flow, flow_id: parseInt(fid) });
+  }
+
+  DATA.flows = Object.values(flowMap);
+  DATA.flowMap = flowMap;
+
+  // header stats
+  document.getElementById('header-stats').textContent =
+    `${RAW.length.toLocaleString()} events · ${DATA.flows.length.toLocaleString()} flows · ${DATA.clients.size} client(s)`;
+  document.getElementById('badge-flows').textContent = DATA.flows.length;
+  document.getElementById('badge-datagrams').textContent = DATA.datagrams.length;
+  document.getElementById('badge-events').textContent = RAW.length.toLocaleString();
+  document.getElementById('badge-rx').textContent = DATA.rx.length;
+}
+
+function populateFilters() {
+  const clients = [...DATA.clients].sort((a,b)=>a-b);
+
+  for (const selId of ['flow-filter-client','tl-filter-client','el-filter-client']) {
+    const sel = document.getElementById(selId);
+    sel.innerHTML = '<option value="">All Clients</option>';
+    clients.forEach(c => sel.innerHTML += `<option value="${c}">Client ${c}</option>`);
+  }
+
+  const types = [...new Set(RAW.map(e => e.event))].sort();
+  const elType = document.getElementById('el-filter-type');
+  elType.innerHTML = '<option value="">All Types</option>';
+  types.forEach(t => elType.innerHTML += `<option value="${t}">${t}</option>`);
+}
+
+// ============================================================
+// NAVIGATION
+// ============================================================
+const views = {};
+document.querySelectorAll('.view').forEach(v => views[v.id.replace('view-', '')] = v);
+
+function navigateTo(name) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const v = document.getElementById('view-' + name);
+  if (v) v.classList.add('active');
+  const n = document.querySelector(`[data-view="${name}"]`);
+  if (n) n.classList.add('active');
+  renderView(name);
+}
+
+document.querySelectorAll('.nav-item[data-view]').forEach(item => {
+  item.addEventListener('click', () => {
+    if (RAW.length === 0 && item.dataset.view !== 'drop') return;
+    navigateTo(item.dataset.view);
+  });
+});
+
+function renderAll() {
+  renderView('overview');
+}
+
+function renderView(name) {
+  if (!RAW.length) return;
+  if (name === 'overview') renderOverview();
+  else if (name === 'performance') renderPerformance();
+  else if (name === 'flows') renderFlows();
+  else if (name === 'timeline') renderTimeline();
+  else if (name === 'bottleneck') renderBottleneck();
+  else if (name === 'egress') renderEgress();
+  else if (name === 'datagrams') renderDatagrams();
+  else if (name === 'rx') renderRX();
+  else if (name === 'eventlog') renderEventLog();
+  else if (name === 'scheduler') renderScheduler();
+}
+
+// ============================================================
+// CANVAS HELPERS
+// ============================================================
+function clearCanvas(id) {
+  const c = document.getElementById(id);
+  if (!c) return null;
+  const rect = c.parentElement.getBoundingClientRect();
+  c.width = rect.width || 400;
+  c.height = rect.height || 220;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  return ctx;
+}
+
+const COLORS = {
+  accent: '#4af',
+  green: '#3c9',
+  yellow: '#eb7',
+  red: '#e55',
+  purple: '#a88ef0',
+  gray: '#555',
+};
+
+function drawLineChart(ctx, data, color='#4af', opts={}) {
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const pad = opts.pad || {t:10,r:10,b:30,l:50};
+  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  if (!data.length) return;
+
+  const xs = data.map(d=>d[0]), ys = data.map(d=>d[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = opts.minY ?? Math.min(...ys), maxY = opts.maxY ?? Math.max(...ys);
+  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
+
+  const px = x => pad.l + (x - minX) / rangeX * W;
+  const py = y => pad.t + H - (y - minY) / rangeY * H;
+
+  // grid
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+  for (let i=0;i<=4;i++) {
+    const y = pad.t + i * H/4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l+W, y); ctx.stroke();
+    const val = maxY - (i/4)*rangeY;
+    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='right';
+    ctx.fillText(fmtNum(val), pad.l-4, y+3);
+  }
+  // x labels
+  for (let i=0;i<=4;i++) {
+    const x = pad.l + i * W/4;
+    const val = minX + (i/4)*rangeX;
+    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
+    ctx.fillText(fmtNum(val), x, h-pad.b+12);
+  }
+
+  // line
+  ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+  data.forEach((d,i) => {
+    if (i===0) ctx.moveTo(px(d[0]), py(d[1]));
+    else ctx.lineTo(px(d[0]), py(d[1]));
+  });
+  ctx.stroke();
+}
+
+function drawScatter(ctx, data, color='#4af', opts={}) {
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const pad = opts.pad || {t:10,r:10,b:30,l:50};
+  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  if (!data.length) return;
+
+  const xs = data.map(d=>d[0]), ys = data.map(d=>d[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = 0, maxY = Math.max(...ys);
+  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
+
+  const px = x => pad.l + (x - minX) / rangeX * W;
+  const py = y => pad.t + H - (y - minY) / rangeY * H;
+
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+  for (let i=0;i<=4;i++) {
+    const y = pad.t + i * H/4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l+W, y); ctx.stroke();
+    const val = maxY - (i/4)*rangeY;
+    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='right';
+    ctx.fillText(fmtNum(val), pad.l-4, y+3);
+  }
+  for (let i=0;i<=4;i++) {
+    const x = pad.l + i * W/4;
+    const val = minX + (i/4)*rangeX;
+    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
+    ctx.fillText(fmtNum(val), x, h-pad.b+12);
+  }
+
+  ctx.fillStyle = color + '99';
+  data.forEach(d => {
+    ctx.beginPath();
+    ctx.arc(px(d[0]), py(d[1]), 2.5, 0, Math.PI*2);
+    ctx.fill();
+  });
+}
+
+function drawHistogram(ctx, data, color='#4af', opts={}) {
+  if (!data.length) return;
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const pad = opts.pad || {t:10,r:10,b:30,l:50};
+  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  const bins = opts.bins || 20;
+
+  const minV = Math.min(...data), maxV = Math.max(...data);
+  const range = maxV - minV || 1;
+  const binW = range / bins;
+  const counts = new Array(bins).fill(0);
+  data.forEach(v => {
+    const i = Math.min(bins-1, Math.floor((v - minV) / binW));
+    counts[i]++;
+  });
+  const maxCount = Math.max(...counts);
+
+  const bw = W / bins;
+  counts.forEach((c, i) => {
+    const bh = (c / maxCount) * H;
+    ctx.fillStyle = color + 'aa';
+    ctx.fillRect(pad.l + i*bw, pad.t + H - bh, bw-1, bh);
+  });
+
+  for (let i=0;i<=4;i++) {
+    const x = pad.l + i*W/4;
+    const val = minV + (i/4)*range;
+    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
+    ctx.fillText(fmtNum(val), x, h-pad.b+12);
+  }
+  for (let i=0;i<=4;i++) {
+    const y = pad.t + i*H/4;
+    ctx.strokeStyle='#222'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+W,y); ctx.stroke();
+    ctx.fillStyle='#555'; ctx.font='9px IBM Plex Mono'; ctx.textAlign='right';
+    ctx.fillText(Math.round(maxCount - (i/4)*maxCount), pad.l-4, y+3);
+  }
+}
+
+function drawDonut(ctx, segments, opts={}) {
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const cx = w/2, cy = h/2, r = Math.min(w,h)*0.35, ir = r*0.55;
+  let start = -Math.PI/2;
+  const total = segments.reduce((s,seg) => s+seg.value, 0);
+  segments.forEach(seg => {
+    const angle = (seg.value / total) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, r, start, start+angle);
+    ctx.closePath();
+    ctx.fillStyle = seg.color;
+    ctx.fill();
+    start += angle;
+  });
+  ctx.beginPath();
+  ctx.arc(cx, cy, ir, 0, Math.PI*2);
+  ctx.fillStyle = '#161616';
+  ctx.fill();
+
+  ctx.fillStyle = '#e8e8e8'; ctx.font = `bold 16px IBM Plex Mono`; ctx.textAlign = 'center';
+  ctx.fillText(total.toLocaleString(), cx, cy+4);
+  ctx.fillStyle = '#555'; ctx.font = `10px IBM Plex Sans`;
+  ctx.fillText('total', cx, cy+18);
+
+  // legend
+  let ly = 16;
+  segments.forEach(seg => {
+    ctx.fillStyle = seg.color;
+    ctx.fillRect(w - 120, ly, 10, 10);
+    ctx.fillStyle = '#999'; ctx.font = '10px IBM Plex Sans'; ctx.textAlign = 'left';
+    ctx.fillText(`${seg.label}: ${seg.value}`, w-106, ly+9);
+    ly += 18;
+  });
+}
+
+function drawStackedBar(ctx, series, labels, opts={}) {
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  const pad = {t:10,r:120,b:30,l:50};
+  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  if (!labels.length) return;
+
+  const totals = labels.map((_,i) => series.reduce((s,ser) => s+(ser.data[i]||0), 0));
+  const maxTotal = Math.max(...totals) || 1;
+  const bw = W / labels.length;
+
+  labels.forEach((label, i) => {
+    let y = pad.t + H;
+    series.forEach(ser => {
+      const val = ser.data[i] || 0;
+      const bh = (val / maxTotal) * H;
+      ctx.fillStyle = ser.color;
+      ctx.fillRect(pad.l + i*bw, y - bh, bw-1, bh);
+      y -= bh;
+    });
+    if (i % Math.max(1, Math.floor(labels.length/8)) === 0) {
+      ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
+      ctx.fillText(fmtNum(label), pad.l + (i+0.5)*bw, h-pad.b+12);
+    }
+  });
+
+  for (let i=0;i<=4;i++) {
+    const y = pad.t + i*H/4;
+    ctx.strokeStyle='#222'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+W,y); ctx.stroke();
+    ctx.fillStyle='#555'; ctx.font='9px IBM Plex Mono'; ctx.textAlign='right';
+    ctx.fillText(Math.round(maxTotal*(1-i/4)), pad.l-4, y+3);
+  }
+
+  let lx = w - pad.r + 8, ly = pad.t;
+  series.forEach(ser => {
+    ctx.fillStyle = ser.color; ctx.fillRect(lx, ly, 10, 10);
+    ctx.fillStyle='#999'; ctx.font='9px IBM Plex Sans'; ctx.textAlign='left';
+    ctx.fillText(ser.label, lx+14, ly+9);
+    ly += 16;
+  });
+}
+
+function fmtNum(n) {
+  if (n === undefined || n === null) return '—';
+  if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(1)+'K';
+  if (Math.abs(n) >= 100) return Math.round(n);
+  if (Math.abs(n) >= 10) return n.toFixed(1);
+  return n.toFixed(2);
+}
+
+function statsHtml(stats) {
+  return stats.map(s => `
+    <div class="stat-card">
+      <div class="stat-label">${s.label}</div>
+      <div class="stat-value ${s.cls||''}">${s.value}</div>
+      ${s.sub ? `<div class="stat-sub">${s.sub}</div>` : ''}
+    </div>`).join('');
+}
+
+// ============================================================
+// OVERVIEW
+// ============================================================
+function renderOverview() {
+  const flows = DATA.flows;
+  const totalBytes = DATA.egress.reduce((s,e) => s+e.bytes, 0);
+  const durations = flows.filter(f => f.duration_ms != null).map(f => f.duration_ms);
+  const avgDur = durations.length ? durations.reduce((a,b)=>a+b,0)/durations.length : 0;
+  const maxDur = durations.length ? Math.max(...durations) : 0;
+  const outcomes = {};
+  flows.forEach(f => { if (f.outcome) outcomes[f.outcome] = (outcomes[f.outcome]||0)+1; });
+  const droppable = flows.filter(f => f.priority === 'Droppable').length;
+  const sessions = RAW.filter(e => e.event === 'session_start').length;
+
+  document.getElementById('ov-sub').textContent =
+    `${DATA.clients.size} client sessions · ${fmtBytes(totalBytes)} egress`;
+
+  document.getElementById('ov-stats').innerHTML = statsHtml([
+    { label: 'Total Events', value: RAW.length.toLocaleString(), cls: 'accent' },
+    { label: 'Flows', value: flows.length.toLocaleString() },
+    { label: 'Sessions', value: sessions },
+    { label: 'Egress Bytes', value: fmtBytes(totalBytes), sub: `${DATA.egress.length} packets` },
+    { label: 'Avg Flow Dur', value: avgDur.toFixed(3)+'ms', cls: avgDur > 1 ? 'yellow' : '' },
+    { label: 'Max Flow Dur', value: maxDur.toFixed(3)+'ms', cls: maxDur > 2 ? 'red' : 'green' },
+    { label: 'Droppable', value: droppable, sub: `${flows.length ? ((droppable/flows.length)*100).toFixed(0)+'%' : ''}` },
+    { label: 'Delivered', value: (outcomes['TransportDelivered']||0).toLocaleString(), cls:'green' },
+  ]);
+
+  setTimeout(() => {
+    // Egress bytes over time
+    const egCtx = clearCanvas('chart-egress-time');
+    if (egCtx) {
+      const data = DATA.egress.map(e => [e.timestamp_ms, e.bytes]);
+      drawScatter(egCtx, data, COLORS.accent);
+    }
+
+    // Flow duration distribution
+    const durCtx = clearCanvas('chart-flow-dur');
+    if (durCtx && durations.length) {
+      drawHistogram(durCtx, durations, COLORS.accent);
+    }
+
+    // Event type breakdown
+    const etCtx = clearCanvas('chart-event-types');
+    if (etCtx) {
+      const counts = {};
+      RAW.forEach(e => counts[e.event] = (counts[e.event]||0)+1);
+      const palette = [COLORS.accent, COLORS.green, COLORS.yellow, COLORS.red, COLORS.purple, '#fa8', '#5dd', '#f8a'];
+      const segs = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([k,v],i) => ({
+        label: k.replace('_',' '), value: v, color: palette[i%palette.length]
+      }));
+      drawDonut(etCtx, segs);
+    }
+
+    // Outcomes donut
+    const ocCtx = clearCanvas('chart-outcomes');
+    if (ocCtx) {
+      const segs = Object.entries(outcomes).map(([k,v]) => ({
+        label: k, value: v,
+        color: k === 'TransportDelivered' ? COLORS.green : k === 'ClientProcessed' ? COLORS.accent : COLORS.red
+      }));
+      if (segs.length) drawDonut(ocCtx, segs);
+    }
+  }, 20);
+}
+
+function fmtBytes(b) {
+  if (b >= 1e9) return (b/1e9).toFixed(2)+'GB';
+  if (b >= 1e6) return (b/1e6).toFixed(2)+'MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1)+'KB';
+  return b+'B';
+}
+
+// ============================================================
+// PERFORMANCE
+// ============================================================
+function renderPerformance() {
+  const snaps = DATA.snapshots;
+  const rtts = snaps.filter(s => s.rtt_ms != null && s.rtt_ms !== 333).map(s => s.rtt_ms);
+  const avgRTT = rtts.length ? rtts.reduce((a,b)=>a+b,0)/rtts.length : 0;
+  const minRTT = rtts.length ? Math.min(...rtts) : 0;
+  const maxRTT = rtts.length ? Math.max(...rtts) : 0;
+  const totalEgress = DATA.egress.reduce((s,e)=>s+e.bytes,0);
+  const timeRange = DATA.egress.length > 1 ?
+    (Math.max(...DATA.egress.map(e=>e.timestamp_ms)) - Math.min(...DATA.egress.map(e=>e.timestamp_ms)))/1000 : 1;
+  const throughput = timeRange > 0 ? (totalEgress*8/timeRange/1000) : 0;
+
+  document.getElementById('perf-stats').innerHTML = statsHtml([
+    { label: 'Avg RTT', value: avgRTT.toFixed(2)+'ms', cls: avgRTT > 10 ? 'red' : avgRTT > 5 ? 'yellow' : 'green' },
+    { label: 'Min RTT', value: minRTT.toFixed(2)+'ms', cls:'green' },
+    { label: 'Max RTT', value: maxRTT.toFixed(2)+'ms', cls:'yellow' },
+    { label: 'Throughput', value: fmtNum(throughput)+'kbps' },
+    { label: 'Egress Packets', value: DATA.egress.length },
+    { label: 'Time Range', value: (timeRange*1000).toFixed(0)+'ms' },
+  ]);
+
+  setTimeout(() => {
+    const rttCtx = clearCanvas('chart-rtt');
+    if (rttCtx) {
+      const data = DATA.snapshots.filter(s=>s.rtt_ms!=null&&s.rtt_ms<333).map(s=>[s.timestamp_ms, s.rtt_ms]);
+      if (data.length) drawLineChart(rttCtx, data, COLORS.green);
+    }
+
+    const pacCtx = clearCanvas('chart-pacing');
+    if (pacCtx) {
+      const data = DATA.egress.filter(e=>e.pacing_delay_ms>0).map(e=>[e.timestamp_ms, e.pacing_delay_ms]);
+      if (data.length) drawScatter(pacCtx, data, COLORS.yellow);
+    }
+
+    const qCtx = clearCanvas('chart-queue');
+    if (qCtx) {
+      const data = DATA.snapshots.filter(s=>s.queued_stream_bytes!=null).map(s=>[s.timestamp_ms, s.queued_stream_bytes]);
+      if (data.length) drawLineChart(qCtx, data, COLORS.purple);
+    }
+
+    const sCtx = clearCanvas('chart-streams');
+    if (sCtx) {
+      const data = DATA.snapshots.filter(s=>s.active_streams!=null).map(s=>[s.timestamp_ms, s.active_streams]);
+      if (data.length) drawLineChart(sCtx, data, COLORS.accent);
+    }
+  }, 20);
+}
+
+// ============================================================
+// FLOWS TABLE
+// ============================================================
+let flowPage = 1;
+const FLOW_PAGE_SIZE = 50;
+let flowSort = { col: 'flow_id', dir: 1 };
+
+function getFilteredFlows() {
+  const search = document.getElementById('flow-search').value.toLowerCase();
+  const kind = document.getElementById('flow-filter-kind').value;
+  const outcome = document.getElementById('flow-filter-outcome').value;
+  const client = document.getElementById('flow-filter-client').value;
+
+  return DATA.flows.filter(f => {
+    if (kind && f.kind !== kind) return false;
+    if (outcome && !(f.outcome||'').includes(outcome)) return false;
+    if (client && String(f.client_id) !== String(client)) return false;
+    if (search) {
+      const haystack = `${f.packet_label} ${f.kind} ${f.priority} ${f.delivery} ${f.order}`.toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+    return true;
+  }).sort((a,b) => {
+    let va = a[flowSort.col], vb = b[flowSort.col];
+    if (va == null) va = -Infinity; if (vb == null) vb = -Infinity;
+    return flowSort.dir * (va > vb ? 1 : va < vb ? -1 : 0);
+  });
+}
+
+function renderFlows() {
+  const filtered = getFilteredFlows();
+  const pages = Math.max(1, Math.ceil(filtered.length / FLOW_PAGE_SIZE));
+  flowPage = Math.min(flowPage, pages);
+
+  document.getElementById('flow-page-info').textContent = `${flowPage} / ${pages} (${filtered.length})`;
+  document.getElementById('flow-prev').disabled = flowPage <= 1;
+  document.getElementById('flow-next').disabled = flowPage >= pages;
+
+  const slice = filtered.slice((flowPage-1)*FLOW_PAGE_SIZE, flowPage*FLOW_PAGE_SIZE);
+  const tbody = document.getElementById('flow-table-body');
+  tbody.innerHTML = slice.map(f => `
+    <tr data-fid="${f.flow_id}" style="cursor:pointer">
+      <td>${f.flow_id}</td>
+      <td>${f.client_id}</td>
+      <td><span class="tag ${kindCls(f.kind)}">${f.kind}</span></td>
+      <td title="${f.packet_label}">${f.packet_label}</td>
+      <td><span class="tag ${priorityCls(f.priority)}">${shortPriority(f.priority)}</span></td>
+      <td><span class="tag gray">${shortDelivery(f.delivery)}</span></td>
+      <td class="num">${f.payload_bytes}</td>
+      <td class="num">${f.duration_ms != null ? f.duration_ms.toFixed(3) : '—'}</td>
+      <td><span class="tag ${outcomeCls(f.outcome)}">${shortOutcome(f.outcome)}</span></td>
+    </tr>`).join('');
+
+  tbody.querySelectorAll('tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('selected'));
+      tr.classList.add('selected');
+      showFlowDetail(DATA.flowMap[parseInt(tr.dataset.fid)], 'flow-detail');
+    });
+  });
+
+  // sort headers
+  document.querySelectorAll('#view-flows thead th').forEach(th => {
+    th.classList.toggle('sorted', th.dataset.col === flowSort.col);
+  });
+}
+
+document.getElementById('flow-search').addEventListener('input', () => { flowPage=1; renderFlows(); });
+document.getElementById('flow-filter-kind').addEventListener('change', () => { flowPage=1; renderFlows(); });
+document.getElementById('flow-filter-outcome').addEventListener('change', () => { flowPage=1; renderFlows(); });
+document.getElementById('flow-filter-client').addEventListener('change', () => { flowPage=1; renderFlows(); });
+document.getElementById('flow-clear-btn').addEventListener('click', () => {
+  document.getElementById('flow-search').value='';
+  document.getElementById('flow-filter-kind').value='';
+  document.getElementById('flow-filter-outcome').value='';
+  document.getElementById('flow-filter-client').value='';
+  flowPage=1; renderFlows();
+});
+document.getElementById('flow-prev').addEventListener('click', () => { flowPage--; renderFlows(); });
+document.getElementById('flow-next').addEventListener('click', () => { flowPage++; renderFlows(); });
+
+document.querySelectorAll('#view-flows thead th').forEach(th => {
+  th.addEventListener('click', () => {
+    if (flowSort.col === th.dataset.col) flowSort.dir *= -1;
+    else { flowSort.col = th.dataset.col; flowSort.dir = 1; }
+    renderFlows();
+  });
+});
+
+// ============================================================
+// FLOW DETAIL PANEL
+// ============================================================
+function showFlowDetail(flow, panelId) {
+  const panel = document.getElementById(panelId);
+  if (!flow) return;
+  panel.classList.add('open');
+
+  const ctx = flow;
+  const evRows = (flow.events || []).map(ev => {
+    const t = ((ev.timestamp_ms||0) - flow.start_ms).toFixed(3);
+    return `<div style="display:flex;gap:8px;margin-bottom:4px;font-size:11px;border-bottom:1px solid var(--border);padding-bottom:4px">
+      <span style="color:var(--text3);font-family:var(--mono);width:60px;flex-shrink:0">+${t}ms</span>
+      <span class="tag ${eventTypeCls(ev.event)}" style="flex-shrink:0">${ev.event.replace('_',' ')}</span>
+      <span style="color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${eventSummary(ev)}</span>
+    </div>`;
+  }).join('');
+
+  const comps = (ctx.components || []).map(c =>
+    `<div class="component-row"><span class="comp-type">${c.component_type}</span><span class="comp-bytes">${c.approx_payload_bytes}B</span></div>`
+  ).join('');
+
+  panel.innerHTML = `
+    <div class="dp-header">
+      <div class="dp-title">Flow ${flow.flow_id}</div>
+      <button class="dp-close" onclick="this.closest('.detail-panel').classList.remove('open')">✕</button>
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Context</div>
+      ${kv('Label', flow.packet_label)}
+      ${kv('Kind', flow.kind)}
+      ${kv('Client', flow.client_id)}
+      ${kv('Message ID', flow.message_id || '—')}
+      ${kv('Priority', flow.priority)}
+      ${kv('Order', flow.order)}
+      ${kv('Delivery', flow.delivery)}
+      ${kv('Target', flow.target_label)}
+      ${kv('Bytes', flow.payload_bytes)}
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Timing</div>
+      ${kv('Start', (flow.start_ms||0).toFixed(3)+'ms')}
+      ${kv('End', flow.end_ms != null ? flow.end_ms.toFixed(3)+'ms' : '—')}
+      ${kv('Duration', flow.duration_ms != null ? flow.duration_ms.toFixed(3)+'ms' : '—')}
+      ${kv('Outcome', flow.outcome || '—')}
+    </div>
+    ${ctx.components?.length ? `<div class="dp-section"><div class="dp-section-title">Components (${ctx.components.length})</div>${comps}</div>` : ''}
+    <div class="dp-section">
+      <div class="dp-section-title">Events (${(flow.events||[]).length})</div>
+      ${evRows}
+    </div>`;
+}
+
+function kv(k, v) {
+  return `<div class="kv-row"><span class="kv-key">${k}</span><span class="kv-val">${v}</span></div>`;
+}
+
+function eventSummary(ev) {
+  if (ev.event === 'scheduler_event') return `${ev.action}${ev.queue_name?` q=${ev.queue_name}`:''}${ev.reason?` r=${ev.reason}`:''}`;
+  if (ev.event === 'delivery_event') return `${ev.outcome} terminal=${ev.terminal}`;
+  if (ev.event === 'transport_selected') return `route=${ev.route} eligible=${ev.eligible}`;
+  if (ev.event === 'datagram_attempt') return `bytes=${ev.payload_bytes}`;
+  if (ev.event === 'datagram_result') return `${ev.status} ${ev.detail||''}`;
+  if (ev.event === 'stream_write') return `wrote=${ev.written}/${ev.total} fin=${ev.fin}`;
+  if (ev.event === 'quic_egress') return `${ev.bytes}B → ${ev.destination}`;
+  return JSON.stringify(ev).slice(0,80);
+}
+
+// ============================================================
+// TIMELINE
+// ============================================================
+function renderTimeline() {
+  const kind = document.getElementById('tl-filter-kind').value;
+  const client = document.getElementById('tl-filter-client').value;
+  const showInc = document.getElementById('tl-show-incomplete').checked;
+
+  let flows = DATA.flows.filter(f => {
+    if (kind && f.kind !== kind) return false;
+    if (client && String(f.client_id) !== String(client)) return false;
+    if (!showInc && f.duration_ms == null) return false;
+    return true;
+  }).sort((a,b) => a.start_ms - b.start_ms);
+
+  // Limit for rendering
+  const MAX_TL = 500;
+  let limited = false;
+  if (flows.length > MAX_TL) { flows = flows.slice(0, MAX_TL); limited = true; }
+
+  document.getElementById('tl-count-label').textContent =
+    `${flows.length} flows${limited ? ' (first 500 shown)' : ''}`;
+
+  if (!flows.length) {
+    document.getElementById('flow-timeline-rows').innerHTML = '<div style="padding:24px;color:var(--text3)">No flows to display</div>';
+    return;
+  }
+
+  const minT = Math.min(...flows.map(f => f.start_ms));
+  const maxT = Math.max(...flows.map(f => (f.end_ms || f.start_ms) + 0.5));
+  const range = maxT - minT || 1;
+
+  // Axis
+  const axis = document.getElementById('tl-axis');
+  axis.innerHTML = '';
+  for (let i=0;i<=8;i++) {
+    const t = minT + (i/8)*range;
+    const span = document.createElement('span');
+    span.style.cssText = `position:absolute;left:${(i/8)*100}%;transform:translateX(-50%)`;
+    span.textContent = t.toFixed(0)+'ms';
+    axis.appendChild(span);
+  }
+
+  const rows = document.getElementById('flow-timeline-rows');
+  rows.innerHTML = flows.map(f => {
+    const left = ((f.start_ms - minT) / range * 100).toFixed(4);
+    const dur = f.duration_ms != null ? f.duration_ms : 0.2;
+    const width = Math.max(0.1, (dur / range * 100)).toFixed(4);
+    const cls = f.kind === 'resource' ? 'resource' : f.priority === 'Droppable' ? 'droppable' : 'normal';
+    const label = f.packet_label.length > 22 ? f.packet_label.slice(0,22)+'…' : f.packet_label;
+    return `<div class="flow-bar-row" title="Flow ${f.flow_id}: ${f.packet_label}&#10;Start: ${f.start_ms.toFixed(3)}ms&#10;Duration: ${f.duration_ms!=null?f.duration_ms.toFixed(3)+'ms':'incomplete'}&#10;Outcome: ${f.outcome||'incomplete'}">
+      <div class="flow-bar-label">f${f.flow_id} ${label}</div>
+      <div class="flow-bar-track" data-fid="${f.flow_id}">
+        <div class="flow-bar ${cls}" style="left:${left}%;width:${width}%"></div>
+      </div>
+    </div>`;
+  }).join('');
+
+  rows.querySelectorAll('.flow-bar-track').forEach(track => {
+    track.addEventListener('click', () => {
+      const flow = DATA.flowMap[parseInt(track.dataset.fid)];
+      showFlowDetail(flow, 'flow-detail');
+      navigateTo('flows');
+    });
+  });
+}
+
+['tl-filter-kind','tl-filter-client'].forEach(id => {
+  document.getElementById(id).addEventListener('change', renderTimeline);
+});
+document.getElementById('tl-show-incomplete').addEventListener('change', renderTimeline);
+
+// ============================================================
+// BOTTLENECK
+// ============================================================
+function renderBottleneck() {
+  const withDur = DATA.flows.filter(f => f.duration_ms != null).sort((a,b) => b.duration_ms - a.duration_ms);
+  const avgDur = withDur.length ? withDur.reduce((s,f)=>s+f.duration_ms,0)/withDur.length : 0;
+  const p99 = withDur.length ? withDur[Math.floor(withDur.length*0.01)]?.duration_ms : 0;
+  const p95 = withDur.length ? withDur[Math.floor(withDur.length*0.05)]?.duration_ms : 0;
+  const incomplete = DATA.flows.filter(f => f.duration_ms == null).length;
+
+  document.getElementById('bn-stats').innerHTML = statsHtml([
+    { label: 'P99 Duration', value: (p99||0).toFixed(3)+'ms', cls: 'red' },
+    { label: 'P95 Duration', value: (p95||0).toFixed(3)+'ms', cls: 'yellow' },
+    { label: 'Avg Duration', value: avgDur.toFixed(3)+'ms' },
+    { label: 'Max Duration', value: (withDur[0]?.duration_ms||0).toFixed(3)+'ms', cls:'red' },
+    { label: 'Incomplete Flows', value: incomplete, cls: incomplete > 0 ? 'yellow' : '' },
+  ]);
+
+  const tbody = document.getElementById('bn-table-body');
+  tbody.innerHTML = withDur.slice(0,50).map((f,i) => `
+    <tr data-fid="${f.flow_id}" style="cursor:pointer">
+      <td>${i+1}</td>
+      <td>${f.flow_id}</td>
+      <td title="${f.packet_label}">${f.packet_label}</td>
+      <td class="num" style="color:${f.duration_ms>1?'var(--red)':f.duration_ms>0.5?'var(--yellow)':'var(--green)'}">${f.duration_ms.toFixed(3)}</td>
+      <td><span class="tag ${kindCls(f.kind)}">${f.kind}</span></td>
+      <td><span class="tag ${outcomeCls(f.outcome)}">${shortOutcome(f.outcome)}</span></td>
+      <td>${f.client_id}</td>
+    </tr>`).join('');
+
+  tbody.querySelectorAll('tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      tbody.querySelectorAll('tr').forEach(r=>r.classList.remove('selected'));
+      tr.classList.add('selected');
+      showFlowDetail(DATA.flowMap[parseInt(tr.dataset.fid)], 'bn-detail');
+      document.getElementById('bn-detail').classList.add('open');
+    });
+  });
+}
+
+// ============================================================
+// EGRESS
+// ============================================================
+function renderEgress() {
+  const eg = DATA.egress;
+  const totalB = eg.reduce((s,e)=>s+e.bytes,0);
+  const avgB = eg.length ? totalB/eg.length : 0;
+  const maxB = eg.length ? Math.max(...eg.map(e=>e.bytes)) : 0;
+  const avgPace = eg.filter(e=>e.pacing_delay_ms>0).reduce((s,e)=>s+e.pacing_delay_ms,0) /
+                  (eg.filter(e=>e.pacing_delay_ms>0).length || 1);
+  const approxPct = eg.filter(e=>e.approximate).length / (eg.length||1) * 100;
+
+  document.getElementById('eg-stats').innerHTML = statsHtml([
+    { label: 'Total Packets', value: eg.length.toLocaleString() },
+    { label: 'Total Bytes', value: fmtBytes(totalB) },
+    { label: 'Avg Packet', value: fmtBytes(Math.round(avgB)) },
+    { label: 'Max Packet', value: fmtBytes(maxB) },
+    { label: 'Avg Pacing', value: avgPace.toFixed(4)+'ms' },
+    { label: 'Approx Attr', value: approxPct.toFixed(0)+'%', sub: 'approximate flow attribution' },
+  ]);
+
+  setTimeout(() => {
+    const scCtx = clearCanvas('chart-egress-scatter');
+    if (scCtx) {
+      const data = eg.map(e => [e.timestamp_ms, e.bytes]);
+      drawScatter(scCtx, data, COLORS.accent, { pad:{t:10,r:10,b:30,l:55} });
+    }
+
+    const histCtx = clearCanvas('chart-egress-hist');
+    if (histCtx) {
+      drawHistogram(histCtx, eg.map(e=>e.bytes), COLORS.accent);
+    }
+
+    const pacCtx = clearCanvas('chart-pacing-hist');
+    if (pacCtx) {
+      const pacing = eg.filter(e=>e.pacing_delay_ms>0).map(e=>e.pacing_delay_ms);
+      if (pacing.length) drawHistogram(pacCtx, pacing, COLORS.yellow);
+    }
+  }, 20);
+}
+
+// ============================================================
+// DATAGRAMS
+// ============================================================
+let dgPage = 1;
+const DG_PAGE_SIZE = 100;
+
+function getFilteredDGs() {
+  const search = document.getElementById('dg-search').value.toLowerCase();
+  const status = document.getElementById('dg-filter-status').value;
+
+  return DATA.datagrams.filter(d => {
+    const res = d.result;
+    if (status && res?.status !== status) return false;
+    if (search) {
+      const label = d.flow?.packet_label || '';
+      if (!`${d.flow_id} ${label}`.toLowerCase().includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function renderDatagrams() {
+  const filtered = getFilteredDGs();
+  const pages = Math.max(1, Math.ceil(filtered.length / DG_PAGE_SIZE));
+  dgPage = Math.min(dgPage, pages);
+
+  document.getElementById('dg-page-info').textContent = `${dgPage} / ${pages} (${filtered.length})`;
+  document.getElementById('dg-prev').disabled = dgPage <= 1;
+  document.getElementById('dg-next').disabled = dgPage >= pages;
+
+  const sent = DATA.datagrams.filter(d => d.result?.status === 'sent').length;
+  document.getElementById('dg-stats').innerHTML = statsHtml([
+    { label: 'Total', value: DATA.datagrams.length },
+    { label: 'Sent', value: sent, cls:'green' },
+    { label: 'Failed', value: DATA.datagrams.length - sent, cls: DATA.datagrams.length-sent > 0 ? 'red' : '' },
+    { label: 'Success Rate', value: DATA.datagrams.length ? ((sent/DATA.datagrams.length)*100).toFixed(1)+'%' : '—' },
+  ]);
+
+  const slice = filtered.slice((dgPage-1)*DG_PAGE_SIZE, dgPage*DG_PAGE_SIZE);
+  document.getElementById('dg-table-body').innerHTML = slice.map(d => {
+    const a = d.attempt, r = d.result, f = d.flow;
+    return `<tr>
+      <td>${d.flow_id}</td>
+      <td>${a?.client_id ?? '—'}</td>
+      <td title="${f?.packet_label||''}">${(f?.packet_label||'—').slice(0,30)}</td>
+      <td class="num">${a?.payload_bytes ?? '—'}</td>
+      <td class="num">${a?.writable_len ?? '—'}</td>
+      <td><span class="tag ${r?.status==='sent'?'green':'red'}">${r?.status||'—'}</span></td>
+      <td><span class="tag gray">${r?.terminal_outcome||'—'}</span></td>
+      <td class="num">${(a?.timestamp_ms||0).toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('dg-search').addEventListener('input', () => { dgPage=1; renderDatagrams(); });
+document.getElementById('dg-filter-status').addEventListener('change', () => { dgPage=1; renderDatagrams(); });
+document.getElementById('dg-prev').addEventListener('click', () => { dgPage--; renderDatagrams(); });
+document.getElementById('dg-next').addEventListener('click', () => { dgPage++; renderDatagrams(); });
+
+// ============================================================
+// RX
+// ============================================================
+function renderRX() {
+  const search = document.getElementById('rx-search').value.toLowerCase();
+  const filtered = DATA.rx.filter(e => {
+    if (!search) return true;
+    return `${e.transport} ${e.packet_type} ${e.detail||''}`.toLowerCase().includes(search);
+  });
+
+  document.getElementById('rx-table-body').innerHTML = filtered.slice(0,500).map(e => `<tr>
+    <td>${e.timestamp_ms.toFixed(3)}</td>
+    <td>${e.client_id}</td>
+    <td><span class="tag ${e.direction==='Rx'?'green':'blue'}">${e.direction}</span></td>
+    <td>${e.transport}</td>
+    <td class="num">${e.bytes}</td>
+    <td>${e.packet_type}</td>
+    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${e.detail||'—'}</td>
+  </tr>`).join('');
+}
+
+document.getElementById('rx-search').addEventListener('input', renderRX);
+
+// ============================================================
+// EVENT LOG
+// ============================================================
+let elPage = 1;
+const EL_PAGE_SIZE = 100;
+
+function getFilteredEvents() {
+  const search = document.getElementById('el-search').value.toLowerCase();
+  const type = document.getElementById('el-filter-type').value;
+  const client = document.getElementById('el-filter-client').value;
+
+  return DATA.allEvents.filter(ev => {
+    if (type && ev.event !== type) return false;
+    if (client && String(ev.client_id) !== String(client)) return false;
+    if (search) {
+      const s = JSON.stringify(ev).toLowerCase();
+      if (!s.includes(search)) return false;
+    }
+    return true;
+  });
+}
+
+function renderEventLog() {
+  const filtered = getFilteredEvents();
+  const pages = Math.max(1, Math.ceil(filtered.length / EL_PAGE_SIZE));
+  elPage = Math.min(elPage, pages);
+
+  document.getElementById('el-page-info').textContent = `${elPage} / ${pages} (${filtered.length})`;
+  document.getElementById('el-prev').disabled = elPage <= 1;
+  document.getElementById('el-next').disabled = elPage >= pages;
+
+  const slice = filtered.slice((elPage-1)*EL_PAGE_SIZE, elPage*EL_PAGE_SIZE);
+  const tbody = document.getElementById('event-log-body');
+  tbody.innerHTML = slice.map((ev,i) => `
+    <tr data-idx="${(elPage-1)*EL_PAGE_SIZE+i}">
+      <td>${(ev.timestamp_ms||0).toFixed(3)}</td>
+      <td>${ev.client_id ?? '—'}</td>
+      <td><span class="tag ${eventTypeCls(ev.event)}">${ev.event.replace(/_/g,' ')}</span></td>
+      <td>${ev.flow_id ?? '—'}</td>
+      <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;color:var(--text3)">${eventSummary(ev)}</td>
+    </tr>`).join('');
+
+  tbody.querySelectorAll('tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      tbody.querySelectorAll('tr').forEach(r=>r.classList.remove('selected'));
+      tr.classList.add('selected');
+      const ev = filtered[parseInt(tr.dataset.idx)];
+      showEventDetail(ev);
+    });
+  });
+}
+
+function showEventDetail(ev) {
+  const panel = document.getElementById('el-detail');
+  panel.classList.add('open');
+  const rows = Object.entries(ev).map(([k,v]) => {
+    const val = typeof v === 'object' ? `<pre style="font-size:10px;white-space:pre-wrap;color:var(--text3)">${JSON.stringify(v, null, 2)}</pre>` : `<span class="kv-val">${v ?? '—'}</span>`;
+    return `<div class="kv-row"><span class="kv-key">${k}</span>${val}</div>`;
+  }).join('');
+  panel.innerHTML = `
+    <div class="dp-header">
+      <div class="dp-title">${ev.event}</div>
+      <button class="dp-close" onclick="this.closest('.detail-panel').classList.remove('open')">✕</button>
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Fields</div>
+      ${rows}
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Raw JSON</div>
+      <pre style="font-size:10px;white-space:pre-wrap;color:var(--text3)">${JSON.stringify(ev, null, 2)}</pre>
+    </div>`;
+}
+
+document.getElementById('el-search').addEventListener('input', () => { elPage=1; renderEventLog(); });
+document.getElementById('el-filter-type').addEventListener('change', () => { elPage=1; renderEventLog(); });
+document.getElementById('el-filter-client').addEventListener('change', () => { elPage=1; renderEventLog(); });
+document.getElementById('el-prev').addEventListener('click', () => { elPage--; renderEventLog(); });
+document.getElementById('el-next').addEventListener('click', () => { elPage++; renderEventLog(); });
+
+// ============================================================
+// SCHEDULER
+// ============================================================
+function renderScheduler() {
+  const snaps = DATA.snapshots;
+  const inflights = snaps.map(s => s.inflight_messages || 0);
+  const queues = snaps.map(s => s.queued_stream_bytes || 0);
+  const maxInflight = Math.max(...inflights, 0);
+  const avgInflight = inflights.length ? inflights.reduce((a,b)=>a+b,0)/inflights.length : 0;
+
+  document.getElementById('sched-stats').innerHTML = statsHtml([
+    { label: 'Snapshots', value: snaps.length },
+    { label: 'Max Inflight', value: maxInflight, cls: maxInflight > 5 ? 'red' : '' },
+    { label: 'Avg Inflight', value: avgInflight.toFixed(2) },
+    { label: 'Other Events', value: DATA.schedulerEvents.length },
+  ]);
+
+  setTimeout(() => {
+    const actCtx = clearCanvas('chart-sched-actions');
+    if (actCtx) {
+      // Bucket snapshot count per time window
+      if (snaps.length) {
+        const times = snaps.map(s=>s.timestamp_ms);
+        const min = Math.min(...times), max = Math.max(...times);
+        const BINS = 30;
+        const bw = (max-min)/BINS || 1;
+        const counts = new Array(BINS).fill(0);
+        snaps.forEach(s => {
+          const i = Math.min(BINS-1, Math.floor((s.timestamp_ms-min)/bw));
+          counts[i]++;
+        });
+        drawHistogram(actCtx, counts.flatMap((c,i) => Array(c).fill(min+i*bw)), COLORS.purple);
+      }
+    }
+
+    const qCtx = clearCanvas('chart-sched-queue');
+    if (qCtx && snaps.length) {
+      const data = snaps.filter(s=>s.queued_stream_bytes!=null).map(s=>[s.timestamp_ms, s.queued_stream_bytes]);
+      if (data.length) drawLineChart(qCtx, data, COLORS.yellow);
+    }
+
+    const ifCtx = clearCanvas('chart-inflight');
+    if (ifCtx && snaps.length) {
+      const data = snaps.filter(s=>s.inflight_messages!=null).map(s=>[s.timestamp_ms, s.inflight_messages]);
+      if (data.length) drawLineChart(ifCtx, data, COLORS.green);
+    }
+
+    const asCtx = clearCanvas('chart-active-seq');
+    if (asCtx && snaps.length) {
+      const data = snaps.filter(s=>s.active_sequences!=null).map(s=>[s.timestamp_ms, s.active_sequences]);
+      if (data.length) drawLineChart(asCtx, data, COLORS.accent);
+    }
+  }, 20);
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function kindCls(k) {
+  if (k === 'envelope') return 'blue';
+  if (k === 'resource') return 'purple';
+  if (k === 'datagram') return 'yellow';
+  return 'gray';
+}
+function priorityCls(p) {
+  if (p === 'Droppable') return 'yellow';
+  if (p === 'Normal') return 'green';
+  return 'gray';
+}
+function outcomeCls(o) {
+  if (!o) return 'gray';
+  if (o.includes('Delivered')) return 'green';
+  if (o.includes('Processed')) return 'blue';
+  if (o.includes('Dropped')) return 'red';
+  if (o.includes('Abort')) return 'red';
+  return 'gray';
+}
+function eventTypeCls(e) {
+  const map = {
+    flow_registered:'blue', delivery_event:'green', scheduler_event:'purple',
+    quic_egress:'accent', rx_event:'yellow', session_start:'gray',
+    datagram_attempt:'yellow', datagram_result:'yellow', stream_write:'blue',
+    transport_selected:'gray', dependency_declared:'purple',
+  };
+  return map[e] || 'gray';
+}
+function shortPriority(p) {
+  if (p === 'Normal') return 'Normal';
+  if (p === 'Droppable') return 'Drop';
+  if (p?.startsWith('MaxDelay')) return 'MaxDelay';
+  if (p?.startsWith('Coalescing')) return 'Coal';
+  return p || '—';
+}
+function shortDelivery(d) {
+  if (d === 'FireAndForget') return 'F&F';
+  if (d === 'ObserveTransport') return 'ObsTx';
+  if (d === 'RequireClientReceipt') return 'RCR';
+  return d || '—';
+}
+function shortOutcome(o) {
+  if (!o) return '—';
+  if (o === 'TransportDelivered') return 'Delivered';
+  if (o === 'ClientProcessed') return 'Processed';
+  if (o.startsWith('TransportDropped')) return 'Dropped';
+  return o;
+}
+</script>
+</body>
+</html>

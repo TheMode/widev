@@ -550,10 +550,18 @@ mod tests {
             framed: vec![0; framed_len],
             trace: DispatchTraceMeta {
                 flow_id: 1,
+                client_id: 1,
+                kind: crate::network_trace::FlowKind::Envelope,
                 packet_label: "test".to_string(),
                 message_id: id,
                 payload_bytes: framed_len,
                 target_label: "Broadcast".to_string(),
+                priority: priority_name(priority).to_string(),
+                order: format!("{:?}", order),
+                delivery: "FireAndForget",
+                dependency_label: None,
+                sequence_id: None,
+                components: Vec::new(),
             },
         }
     }
