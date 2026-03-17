@@ -28,10 +28,14 @@ setup_net_log_env() {
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/common-tools.sh server [addr] [--log[=dir]]
+  scripts/common-tools.sh server [addr] [game] [--log[=dir]]
+  scripts/common-tools.sh server --addr=ADDR --game=GAME [--log[=dir]]
   scripts/common-tools.sh client [addr]
+  scripts/common-tools.sh client --addr=ADDR
   scripts/common-tools.sh bots [addr] [count] [flow] [--log[=dir]]
+  scripts/common-tools.sh bots --addr=ADDR --count=N --flow=NAME [--log[=dir]]
   scripts/common-tools.sh flame [name] [duration] [output]
+  scripts/common-tools.sh flame --name=NAME --duration=SECS --output=FILE
 
 Options:
   --log[=dir]    Enable network tracing to specified directory
@@ -53,6 +57,9 @@ Environment Variables (for network tracing):
 
 Examples:
   scripts/common-tools.sh server                           # Run server without tracing
+  scripts/common-tools.sh server red_square                # Run the red_square game
+  scripts/common-tools.sh server 127.0.0.1:4433 red_square
+  scripts/common-tools.sh server --game=red_square         # Run the red_square game
   scripts/common-tools.sh server --log                     # Run server with tracing to ./logs/network
   scripts/common-tools.sh server --log=./custom-logs       # Run server with tracing to custom directory
   WIDEV_NET_TRACE_FLUSH=every scripts/common-tools.sh bots --log  # Bots with immediate flush
@@ -80,17 +87,35 @@ shift || true
 case "$cmd" in
   server)
     addr="$DEFAULT_ADDR"
+    game=""
     log_dir=""
     
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        --log| --log=*)
+        --log|--log=*)
           log_dir="$(parse_log_arg "$1")"
           shift
           ;;
+        --addr=*)
+          addr="${1#--addr=}"
+          shift
+          ;;
+        --bind=*)
+          addr="${1#--bind=}"
+          shift
+          ;;
+        --game=*)
+          game="${1#--game=}"
+          shift
+          ;;
         *)
-          if [[ -z "$addr" || "$addr" == "$DEFAULT_ADDR" ]]; then
+          if [[ "$1" =~ ^[0-9a-zA-Z.-]+:[0-9]+$ ]]; then
             addr="$1"
+          elif [[ -z "$game" ]]; then
+            game="$1"
+          else
+            echo "server: unexpected argument: $1" >&2
+            exit 1
           fi
           shift
           ;;
@@ -104,11 +129,32 @@ case "$cmd" in
     fi
 
     cd "$ROOT_DIR"
-    run_release_binary "widev-server" "widev-server" "$addr"
+    if [[ -n "$game" ]]; then
+      run_release_binary "widev-server" "widev-server" "$addr" "$game"
+    else
+      run_release_binary "widev-server" "widev-server" "$addr"
+    fi
     ;;
 
   client)
-    addr="${1:-$DEFAULT_ADDR}"
+    addr="$DEFAULT_ADDR"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --addr=*)
+          addr="${1#--addr=}"
+          shift
+          ;;
+        *)
+          if [[ "$addr" == "$DEFAULT_ADDR" ]]; then
+            addr="$1"
+          else
+            echo "client: unexpected argument: $1" >&2
+            exit 1
+          fi
+          shift
+          ;;
+      esac
+    done
     cd "$ROOT_DIR"
     run_release_binary "widev-desktop-client" "widev-desktop-client" "$addr"
     ;;
@@ -125,6 +171,18 @@ case "$cmd" in
           log_dir="$(parse_log_arg "$1")"
           shift
           ;;
+        --addr=*)
+          addr="${1#--addr=}"
+          shift
+          ;;
+        --count=*)
+          count="${1#--count=}"
+          shift
+          ;;
+        --flow=*)
+          flow="${1#--flow=}"
+          shift
+          ;;
         *)
           if [[ "$addr" == "$DEFAULT_ADDR" && "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
             addr="$1"
@@ -132,6 +190,9 @@ case "$cmd" in
             count="$1"
           elif [[ "$flow" == "ack-move" ]]; then
             flow="$1"
+          else
+            echo "bots: unexpected argument: $1" >&2
+            exit 1
           fi
           shift
           ;;
@@ -149,9 +210,40 @@ case "$cmd" in
     ;;
 
   flame)
-    name="${1:-widev-server}"
-    duration="${2:-30}"
-    output="${3:-server-flame.svg}"
+    name="widev-server"
+    duration="30"
+    output="server-flame.svg"
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --name=*)
+          name="${1#--name=}"
+          shift
+          ;;
+        --duration=*)
+          duration="${1#--duration=}"
+          shift
+          ;;
+        --output=*)
+          output="${1#--output=}"
+          shift
+          ;;
+        *)
+          if [[ "$name" == "widev-server" ]]; then
+            name="$1"
+          elif [[ "$duration" == "30" ]]; then
+            duration="$1"
+          elif [[ "$output" == "server-flame.svg" ]]; then
+            output="$1"
+          else
+            echo "flame: unexpected argument: $1" >&2
+            exit 1
+          fi
+          shift
+          ;;
+      esac
+    done
+
     cd "$ROOT_DIR"
     scripts/flamegraph.sh --name "$name" --duration "$duration" --output "$output"
     ;;
