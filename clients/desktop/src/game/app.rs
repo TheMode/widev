@@ -54,11 +54,12 @@ struct App {
 struct AppSettings {
     show_latency: bool,
     full_screen_content: bool,
+    lock_window_to_surface: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { show_latency: true, full_screen_content: false }
+        Self { show_latency: true, full_screen_content: false, lock_window_to_surface: false }
     }
 }
 
@@ -70,6 +71,13 @@ struct RenderCache {
     last_render_revision: u64,
     surface_list_sent: bool,
     last_reported_surface_size: Option<(u32, u32)>,
+    last_applied_window_lock: Option<WindowLockState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WindowLockState {
+    enabled: bool,
+    dimensions: Option<(u32, u32)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -80,6 +88,8 @@ struct AppMenu {
     show_latency_item: CheckMenuItem,
     full_screen_content_id: MenuId,
     full_screen_content_item: CheckMenuItem,
+    lock_window_to_surface_id: MenuId,
+    lock_window_to_surface_item: CheckMenuItem,
 }
 
 #[cfg(target_os = "macos")]
@@ -93,9 +103,16 @@ impl AppMenu {
             CheckMenuItem::new("Show Latency", true, settings.show_latency, None);
         let full_screen_content_item =
             CheckMenuItem::new("Full Screen Content", true, settings.full_screen_content, None);
+        let lock_window_to_surface_item = CheckMenuItem::new(
+            "Lock Window to Game Resolution",
+            true,
+            settings.lock_window_to_surface,
+            None,
+        );
         app_menu.append(&quit_item)?;
         view_menu.append(&show_latency_item)?;
         view_menu.append(&full_screen_content_item)?;
+        view_menu.append(&lock_window_to_surface_item)?;
         menu.append(&app_menu)?;
         menu.append(&view_menu)?;
         menu.init_for_nsapp();
@@ -107,6 +124,8 @@ impl AppMenu {
             show_latency_item,
             full_screen_content_id: full_screen_content_item.id().clone(),
             full_screen_content_item,
+            lock_window_to_surface_id: lock_window_to_surface_item.id().clone(),
+            lock_window_to_surface_item,
         })
     }
 }
@@ -116,6 +135,7 @@ enum MenuAction {
     Quit,
     ToggleShowLatency(CheckMenuItem),
     ToggleFullScreenContent(CheckMenuItem),
+    ToggleLockWindowToSurface(CheckMenuItem),
 }
 
 impl App {
@@ -144,9 +164,18 @@ impl App {
     }
 
     fn build_window_attributes(&self) -> winit::window::WindowAttributes {
+        let locked_dimensions = self.current_window_lock_dimensions();
         let mut window_attributes = Window::default_attributes()
             .with_title(self.game.game_name().to_string())
             .with_inner_size(LogicalSize::new(WIDTH as f64, HEIGHT as f64));
+        if let Some((width, height)) = locked_dimensions {
+            let size = LogicalSize::new(width as f64, height as f64);
+            window_attributes = window_attributes
+                .with_inner_size(size)
+                .with_min_inner_size(size)
+                .with_max_inner_size(size)
+                .with_resizable(false);
+        }
         #[cfg(target_os = "macos")]
         {
             window_attributes = window_attributes
@@ -155,6 +184,45 @@ impl App {
                 .with_titlebar_transparent(self.settings.full_screen_content);
         }
         window_attributes
+    }
+
+    fn current_window_lock_dimensions(&self) -> Option<(u32, u32)> {
+        self.settings
+            .lock_window_to_surface
+            .then(|| self.game.surface_state(MAIN_SURFACE_ID).dimension_lock)
+            .flatten()
+    }
+
+    fn apply_window_lock_if_needed(&mut self, surface: super::SurfaceState) {
+        let next_lock = WindowLockState {
+            enabled: self.settings.lock_window_to_surface,
+            dimensions: self
+                .settings
+                .lock_window_to_surface
+                .then_some(surface.dimension_lock)
+                .flatten(),
+        };
+        if self.render_cache.last_applied_window_lock == Some(next_lock) {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            self.render_cache.last_applied_window_lock = Some(next_lock);
+            return;
+        };
+
+        if let Some((width, height)) = next_lock.dimensions {
+            let size = LogicalSize::new(width as f64, height as f64);
+            window.set_min_inner_size(Some(size));
+            window.set_max_inner_size(Some(size));
+            window.set_resizable(false);
+            let _ = window.request_inner_size(size);
+        } else {
+            window.set_min_inner_size(None::<LogicalSize<f64>>);
+            window.set_max_inner_size(None::<LogicalSize<f64>>);
+            window.set_resizable(true);
+        }
+
+        self.render_cache.last_applied_window_lock = Some(next_lock);
     }
 
     fn create_window_and_renderer(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -189,6 +257,7 @@ impl App {
 
     fn sync_surface_state(&mut self) -> Result<()> {
         let surface = self.game.surface_state(MAIN_SURFACE_ID);
+        self.apply_window_lock_if_needed(surface);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_surface_constraints(
                 surface.dimension_lock,
@@ -226,6 +295,8 @@ impl App {
                     menu.show_latency_item.clone(),
                     menu.full_screen_content_id.clone(),
                     menu.full_screen_content_item.clone(),
+                    menu.lock_window_to_surface_id.clone(),
+                    menu.lock_window_to_surface_item.clone(),
                 )
             }) else {
                 return;
@@ -236,6 +307,8 @@ impl App {
                 show_latency_item,
                 full_screen_content_id,
                 full_screen_content_item,
+                lock_window_to_surface_id,
+                lock_window_to_surface_item,
             ) = action_menu;
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let action = if event.id == quit_id {
@@ -244,6 +317,8 @@ impl App {
                     Some(MenuAction::ToggleShowLatency(show_latency_item.clone()))
                 } else if event.id == full_screen_content_id {
                     Some(MenuAction::ToggleFullScreenContent(full_screen_content_item.clone()))
+                } else if event.id == lock_window_to_surface_id {
+                    Some(MenuAction::ToggleLockWindowToSurface(lock_window_to_surface_item.clone()))
                 } else {
                     None
                 };
@@ -267,6 +342,14 @@ impl App {
                             event_loop.exit();
                             return;
                         }
+                    },
+                    Some(MenuAction::ToggleLockWindowToSurface(item)) => {
+                        self.settings.lock_window_to_surface =
+                            !self.settings.lock_window_to_surface;
+                        item.set_checked(self.settings.lock_window_to_surface);
+                        self.render_cache.last_applied_window_lock = None;
+                        self.apply_window_lock_if_needed(self.game.surface_state(MAIN_SURFACE_ID));
+                        self.wake_for_render();
                     },
                     None => {},
                 }
