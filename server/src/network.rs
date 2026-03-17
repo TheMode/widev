@@ -15,9 +15,7 @@ use uuid::Uuid;
 
 use crate::game::{ClientId, NetworkEvent};
 use crate::network_trace::{DispatchTraceMeta, NetworkTracer, SessionSnapshot, SessionTracer};
-use crate::packet_codec::{
-    decode_c2s_packet, serialize_packet_message, serialize_s2c_packet_message,
-};
+use crate::packet_codec::{serialize_packet_message, serialize_s2c_packet_message};
 use crate::packet_scheduler::{
     DispatchKind, DispatchMessage, PacketScheduler, SchedulerAction, SchedulerCommand,
 };
@@ -998,8 +996,8 @@ fn decode_and_forward_c2s(
     transport: &str,
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
-    match decode_c2s_packet(bytes) {
-        Some(crate::packets::C2SPacket::Ping { nonce }) => {
+    match crate::packets::decode_c2s(bytes) {
+        Ok(crate::packets::C2SPacket::Ping { nonce }) => {
             session.tracer.on_rx_packet(
                 transport,
                 bytes.len(),
@@ -1012,7 +1010,7 @@ fn decode_and_forward_c2s(
                 let _ = session.conn.dgram_send(&bytes);
             }
         },
-        Some(crate::packets::C2SPacket::Pong { nonce }) => {
+        Ok(crate::packets::C2SPacket::Pong { nonce }) => {
             let rtt_ms = session
                 .pending_ping_nonces
                 .remove(&nonce)
@@ -1024,7 +1022,7 @@ fn decode_and_forward_c2s(
                 rtt_ms,
             );
         },
-        Some(crate::packets::C2SPacket::Receipt { message_id }) => {
+        Ok(crate::packets::C2SPacket::Receipt { message_id }) => {
             session.tracer.on_rx_packet(
                 transport,
                 bytes.len(),
@@ -1040,7 +1038,7 @@ fn decode_and_forward_c2s(
                 outcome: crate::packets::DeliveryOutcome::ClientProcessed,
             });
         },
-        Some(crate::packets::C2SPacket::Disconnect {}) => {
+        Ok(crate::packets::C2SPacket::Disconnect {}) => {
             session.tracer.on_rx_packet(
                 transport,
                 bytes.len(),
@@ -1050,12 +1048,12 @@ fn decode_and_forward_c2s(
             session.disconnect_requested = true;
             let _ = session.conn.close(true, 0, b"client_disconnect");
         },
-        Some(packet) => {
+        Ok(packet) => {
             session.tracer.on_rx_packet(transport, bytes.len(), &packet, None);
             let _ =
                 event_tx.send(NetworkEvent::ClientPacket { client_id: session.client_id, packet });
         },
-        None => session.tracer.on_rx_decode_failed(transport, bytes.len()),
+        Err(_) => session.tracer.on_rx_decode_failed(transport, bytes.len()),
     }
 }
 

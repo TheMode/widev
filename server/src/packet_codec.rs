@@ -1,6 +1,6 @@
 use crate::packets::{
-    decode_c2s, encode_s2c, C2SPacket, DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage,
-    PacketOrder, PacketPayload, PacketResource, S2CPacket,
+    encode_s2c, DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketOrder,
+    PacketPayload, PacketResource, S2CPacket,
 };
 
 pub fn serialize_s2c_packet(packet: &S2CPacket) -> Option<Vec<u8>> {
@@ -50,10 +50,6 @@ fn serialize_envelope_payload(envelope: &PacketEnvelope) -> Option<Vec<u8>> {
     }
 
     Some(payload)
-}
-
-pub fn decode_c2s_packet(bytes: &[u8]) -> Option<C2SPacket> {
-    decode_c2s(bytes).ok()
 }
 
 fn serialize_resource_payload(resource: &PacketResource) -> Option<Vec<u8>> {

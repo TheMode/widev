@@ -22,7 +22,9 @@ use crate::packets::{
 pub enum FlushPolicy {
     EveryEvent,
     OnFlowComplete,
-    Batched { interval_ms: u64 },
+    Batched {
+        interval_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -300,13 +302,7 @@ impl TraceEvent {
     }
 
     fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::DeliveryEvent {
-                terminal: true,
-                ..
-            }
-        )
+        matches!(self, Self::DeliveryEvent { terminal: true, .. })
     }
 
     fn timestamp_ms(&self) -> f64 {
@@ -349,10 +345,7 @@ pub struct NetworkTracer {
 impl NetworkTracer {
     pub fn from_env() -> Arc<Self> {
         let config = NetworkTraceConfig::from_env();
-        Arc::new(Self {
-            next_flow_id: AtomicU64::new(1),
-            sinks: TraceSinkManager::start(config),
-        })
+        Arc::new(Self { next_flow_id: AtomicU64::new(1), sinks: TraceSinkManager::start(config) })
     }
 
     fn enabled(&self) -> bool {
@@ -385,7 +378,10 @@ impl TraceEmitter {
     }
 
     fn emit_session_start(&self) {
-        self.emit(TraceEvent::SessionStart { timestamp_ms: self.now_ms(), client_id: self.client_id });
+        self.emit(TraceEvent::SessionStart {
+            timestamp_ms: self.now_ms(),
+            client_id: self.client_id,
+        });
     }
 
     fn emit_flow_registered(&self, context: &TraceContext) {
@@ -643,7 +639,13 @@ impl TraceProjector {
         Some(flow)
     }
 
-    fn queue_egress(&mut self, flow_id: u64, message_id: Option<MessageId>, source: &str, approximate: bool) {
+    fn queue_egress(
+        &mut self,
+        flow_id: u64,
+        message_id: Option<MessageId>,
+        source: &str,
+        approximate: bool,
+    ) {
         self.pending_egress.push_back(PendingEgress {
             flow_id,
             message_id: message_id.map(|id| id as u128),
@@ -680,7 +682,8 @@ impl SessionTracer {
         framed_len: usize,
     ) -> DispatchTraceMeta {
         let components = packet_components_from_envelope(envelope, framed_len);
-        let kind = determine_flow_kind(envelope.meta.priority, envelope.meta.order, envelope.id.is_some());
+        let kind =
+            determine_flow_kind(envelope.meta.priority, envelope.meta.order, envelope.id.is_some());
         let context = TraceContext {
             flow_id: self.tracer.next_flow_id(),
             client_id: self.client_id,
@@ -748,7 +751,12 @@ impl SessionTracer {
 
         for event in events {
             match event {
-                SchedulerTraceEvent::DeferredInitial { trace, policy, queue_name, queued_messages } => {
+                SchedulerTraceEvent::DeferredInitial {
+                    trace,
+                    policy,
+                    queue_name,
+                    queued_messages,
+                } => {
                     self.emitter.emit_scheduler_event(
                         Some(trace.flow_id),
                         "deferred_initial",
@@ -1001,12 +1009,21 @@ impl SessionTracer {
             return;
         }
         let pending = self.projector.take_pending_egress();
-        let approximate = pending.is_empty() || pending.iter().any(|entry| entry.approximate) || pending.len() > 1;
+        let approximate = pending.is_empty()
+            || pending.iter().any(|entry| entry.approximate)
+            || pending.len() > 1;
         let flow_ids = pending.iter().map(|entry| entry.flow_id).collect();
         let message_ids = pending.iter().filter_map(|entry| entry.message_id).collect();
         let sources = pending.iter().map(|entry| entry.source.clone()).collect();
-        self.emitter
-            .emit_quic_egress(bytes, destination, pacing_delay_ms, approximate, flow_ids, message_ids, sources);
+        self.emitter.emit_quic_egress(
+            bytes,
+            destination,
+            pacing_delay_ms,
+            approximate,
+            flow_ids,
+            message_ids,
+            sources,
+        );
     }
 
     pub fn on_transport_outcome(&mut self, message_id: MessageId, outcome: DeliveryOutcome) {
@@ -1017,7 +1034,10 @@ impl SessionTracer {
                 flow_id,
                 Some(message_id),
                 outcome_label.clone(),
-                matches!(outcome, DeliveryOutcome::TransportDropped { .. } | DeliveryOutcome::ClientProcessed),
+                matches!(
+                    outcome,
+                    DeliveryOutcome::TransportDropped { .. } | DeliveryOutcome::ClientProcessed
+                ),
                 None,
             );
         }
@@ -1196,9 +1216,7 @@ impl TraceSinkManager {
     fn start(config: NetworkTraceConfig) -> Self {
         let (sender, receiver) = mpsc::channel();
         if !config.enabled {
-            return Self {
-                inner: Arc::new(TraceSinkInner { sender, enabled: false }),
-            };
+            return Self { inner: Arc::new(TraceSinkInner { sender, enabled: false }) };
         }
 
         thread::spawn(move || run_sink_thread(receiver, config));
@@ -1330,12 +1348,7 @@ impl TimelineProjector {
             state.events.push(event.clone());
         }
 
-        if let TraceEvent::DeliveryEvent {
-            flow_id: Some(flow_id),
-            terminal: true,
-            ..
-        } = event
-        {
+        if let TraceEvent::DeliveryEvent { flow_id: Some(flow_id), terminal: true, .. } = event {
             if let Some(state) = self.flows.remove(&flow_id) {
                 blocks.push(TraceRenderer::render_flow_block(&state, verbose, false));
             }
@@ -1372,14 +1385,8 @@ fn event_flow_ids(event: &TraceEvent) -> Vec<u64> {
         | TraceEvent::StreamWrite { flow_id, .. }
         | TraceEvent::DatagramAttempt { flow_id, .. }
         | TraceEvent::DatagramResult { flow_id, .. } => vec![*flow_id],
-        TraceEvent::SchedulerEvent {
-            flow_id: Some(flow_id),
-            ..
-        }
-        | TraceEvent::DeliveryEvent {
-            flow_id: Some(flow_id),
-            ..
-        } => vec![*flow_id],
+        TraceEvent::SchedulerEvent { flow_id: Some(flow_id), .. }
+        | TraceEvent::DeliveryEvent { flow_id: Some(flow_id), .. } => vec![*flow_id],
         TraceEvent::QuicEgress { flow_ids, .. } => flow_ids.clone(),
         TraceEvent::SessionStart { .. }
         | TraceEvent::SchedulerEvent { flow_id: None, .. }
@@ -1606,20 +1613,20 @@ impl TraceRenderer {
         .collect()
     }
 
-    fn render_flow_block(state: &TimelineFlowState, verbose: bool, incomplete: bool) -> Vec<String> {
+    fn render_flow_block(
+        state: &TimelineFlowState,
+        verbose: bool,
+        incomplete: bool,
+    ) -> Vec<String> {
         let mut lines = Vec::new();
         let context = &state.context;
         let flow_id = context.flow_id;
-        let final_outcome = state
-            .events
-            .iter()
-            .rev()
-            .find_map(|event| match event {
-                TraceEvent::DeliveryEvent { outcome, terminal, detail, .. } if *terminal => {
-                    Some((outcome.clone(), detail.clone()))
-                },
-                _ => None,
-            });
+        let final_outcome = state.events.iter().rev().find_map(|event| match event {
+            TraceEvent::DeliveryEvent { outcome, terminal, detail, .. } if *terminal => {
+                Some((outcome.clone(), detail.clone()))
+            },
+            _ => None,
+        });
         let total_ms = state
             .events
             .last()
@@ -1639,10 +1646,7 @@ impl TraceRenderer {
         lines.push(format!(
             "  kind={}  message={}  components={}  total={}ms{}",
             flow_kind_label(context.kind),
-            context
-                .message_id
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+            context.message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
             context.components.len(),
             fmt_ms(total_ms),
             if incomplete { "  status=incomplete" } else { "" }
@@ -1657,7 +1661,12 @@ impl TraceRenderer {
             let components = context
                 .components
                 .iter()
-                .map(|component| format!("#{}:{}~{}B", component.index, component.component_type, component.approx_payload_bytes))
+                .map(|component| {
+                    format!(
+                        "#{}:{}~{}B",
+                        component.index, component.component_type, component.approx_payload_bytes
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!("  components={components}"));
@@ -1705,11 +1714,9 @@ impl TraceRenderer {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string())
             )),
-            TraceEvent::DependencyDeclared {
-                dependency_kind,
-                dependency_value,
-                ..
-            } => Some(format!("dependency {}={}", dependency_kind, dependency_value)),
+            TraceEvent::DependencyDeclared { dependency_kind, dependency_value, .. } => {
+                Some(format!("dependency {}={}", dependency_kind, dependency_value))
+            },
             TraceEvent::SchedulerEvent {
                 action,
                 queue_name,
@@ -1750,7 +1757,8 @@ impl TraceRenderer {
                 writable_len,
                 ..
             } => {
-                let mut parts = vec![format!("transport route={route}"), format!("eligible={eligible}")];
+                let mut parts =
+                    vec![format!("transport route={route}"), format!("eligible={eligible}")];
                 if let Some(stream_id) = stream_id {
                     parts.push(format!("stream={stream_id}"));
                 }
@@ -1778,9 +1786,7 @@ impl TraceRenderer {
                 queued_after,
                 inflight_before,
                 inflight_after,
-                message_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string())
+                message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string())
             )),
             TraceEvent::StreamWrite {
                 stream_id,
@@ -1803,23 +1809,12 @@ impl TraceRenderer {
                 }
                 Some(line)
             },
-            TraceEvent::DatagramAttempt {
-                payload_bytes,
-                writable_len,
-                ..
-            } => Some(format!(
+            TraceEvent::DatagramAttempt { payload_bytes, writable_len, .. } => Some(format!(
                 "datagram attempt bytes={} writable={}",
                 payload_bytes,
-                writable_len
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                writable_len.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string())
             )),
-            TraceEvent::DatagramResult {
-                status,
-                detail,
-                terminal_outcome,
-                ..
-            } => Some(format!(
+            TraceEvent::DatagramResult { status, detail, terminal_outcome, .. } => Some(format!(
                 "datagram result status={} terminal={} {}",
                 status,
                 terminal_outcome.as_deref().unwrap_or("-"),
@@ -1837,24 +1832,15 @@ impl TraceRenderer {
                 "quic egress bytes={} dest={} pace={:.3}ms approx={} flows={:?} sources={:?}",
                 bytes, destination, pacing_delay_ms, approximate, flow_ids, sources
             )),
-            TraceEvent::DeliveryEvent {
-                message_id,
-                outcome,
-                terminal,
-                detail,
-                ..
-            } => Some(format!(
-                "delivery outcome={} terminal={} msg={}{}",
-                outcome,
-                terminal,
-                message_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                detail
-                    .as_ref()
-                    .map(|value| format!(" detail={value}"))
-                    .unwrap_or_default()
-            )),
+            TraceEvent::DeliveryEvent { message_id, outcome, terminal, detail, .. } => {
+                Some(format!(
+                    "delivery outcome={} terminal={} msg={}{}",
+                    outcome,
+                    terminal,
+                    message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
+                    detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()
+                ))
+            },
             TraceEvent::SessionStart { .. } | TraceEvent::RxEvent { .. } => {
                 if verbose {
                     None
@@ -1878,7 +1864,10 @@ fn fmt_ms(value: f64) -> String {
     format!("{value:.3}")
 }
 
-fn packet_components_from_envelope(envelope: &PacketEnvelope, framed_len: usize) -> Vec<PacketComponent> {
+fn packet_components_from_envelope(
+    envelope: &PacketEnvelope,
+    framed_len: usize,
+) -> Vec<PacketComponent> {
     match &envelope.payload {
         crate::packets::PacketPayload::Single(packet) => vec![PacketComponent {
             index: 0,
@@ -1941,7 +1930,8 @@ fn envelope_label(envelope: &PacketEnvelope) -> String {
     match &envelope.payload {
         crate::packets::PacketPayload::Single(packet) => variant_name(packet),
         crate::packets::PacketPayload::Bundle(bundle) => {
-            let first = bundle.first().map(variant_name).unwrap_or_else(|| "EmptyBundle".to_string());
+            let first =
+                bundle.first().map(variant_name).unwrap_or_else(|| "EmptyBundle".to_string());
             format!("{first} bundle={}", bundle.len())
         },
     }
@@ -2035,10 +2025,7 @@ mod tests {
     }
 
     fn temp_log_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("widev-trace-test-{unique}"))
     }
 
