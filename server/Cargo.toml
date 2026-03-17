@@ -15,6 +15,7 @@ rcgen = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+strum = { workspace = true }
 mio = { version = "1.1.1", features = ["os-poll", "net"] }
 quinn-udp = { version = "0.5.14", features = ["fast-apple-datapath"] }
 uuid = { version = "1.22.0", features = ["v7"] }

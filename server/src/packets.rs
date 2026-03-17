@@ -2,11 +2,13 @@ include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 
 use std::time::Duration;
 
+use strum::IntoStaticStr;
 use thiserror::Error;
 
 use crate::game::ClientId;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum PacketPriority {
     /// Send as soon as practical using the normal transport path.
     ///
