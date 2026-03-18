@@ -7,16 +7,13 @@ use clap::Parser;
 mod game;
 mod game_state;
 mod games;
-mod network;
-mod network_trace;
-mod packet_codec;
-mod packet_scheduler;
-#[allow(dead_code)]
-mod packets;
+mod net;
+
+pub use net::{network_trace, packet_codec, packet_scheduler, packets};
 
 use game::Game;
 use game_state::GameState;
-use network::NetworkRuntime;
+use net::network::NetworkRuntime;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
