@@ -77,7 +77,7 @@ use uuid::Uuid;
 
 use crate::network_trace::{DispatchTraceMeta, SchedulerTraceEvent};
 use crate::packets::{
-    DeliveryPolicy, DropReason, MessageId, PacketMeta, PacketOrder, PacketPriority,
+    DeliveryPolicy, DropReason, MessageId, PacketMeta, PacketOrder, PacketPriority, RetryReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr)]
@@ -357,11 +357,17 @@ impl PacketScheduler {
     /// Requeue a message that could not be sent due to congestion.
     ///
     /// The message is inserted at the front of its queue to preserve ordering.
-    pub fn requeue_deferred_message(&mut self, message: DispatchMessage, now: Instant) {
+    pub fn requeue_deferred_message(
+        &mut self,
+        message: DispatchMessage,
+        now: Instant,
+        reason: RetryReason,
+    ) {
         let scheduled = ScheduledMessage::new(message, now);
         self.trace_events.push(SchedulerTraceEvent::RequeuedCongestion {
             trace: scheduled.message.trace().clone(),
             queued_messages: self.queue_len_for_domain(scheduled.message.domain()) + 1,
+            reason,
         });
         match scheduled.message.domain() {
             OrderDomain::Independent => {
@@ -688,14 +694,14 @@ mod tests {
         let actions = scheduler.push(SchedulerCommand::Message(env.clone()), now);
         assert!(matches!(actions.as_slice(), [SchedulerAction::DispatchMessage { .. }]));
 
-        scheduler.requeue_deferred_message(env.clone(), now);
+        scheduler.requeue_deferred_message(env.clone(), now, RetryReason::Congestion);
         let actions = scheduler.poll(now + Duration::from_millis(10), false);
         assert!(matches!(
             actions.as_slice(),
             [SchedulerAction::DispatchMessage { force_flush: false, .. }]
         ));
 
-        scheduler.requeue_deferred_message(env, now);
+        scheduler.requeue_deferred_message(env, now, RetryReason::Congestion);
         let actions = scheduler.poll(now + Duration::from_millis(60), false);
         assert!(matches!(
             actions.as_slice(),
@@ -751,7 +757,7 @@ mod tests {
             128,
         );
         scheduler.push(SchedulerCommand::Message(first.clone()), now);
-        scheduler.requeue_deferred_message(first, now);
+        scheduler.requeue_deferred_message(first, now, RetryReason::Congestion);
 
         // Second message for same sequence should queue behind
         let second = envelope(PacketPriority::Normal, PacketOrder::Sequence(seq_id), 64);
@@ -780,7 +786,7 @@ mod tests {
             128,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
-        scheduler.requeue_deferred_message(msg, now);
+        scheduler.requeue_deferred_message(msg, now, RetryReason::Congestion);
 
         let actions = scheduler.push(SchedulerCommand::SequenceClose(seq_id), now);
         assert!(actions.is_empty());
@@ -809,7 +815,7 @@ mod tests {
             128,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
-        scheduler.requeue_deferred_message(msg, now);
+        scheduler.requeue_deferred_message(msg, now, RetryReason::Congestion);
         scheduler.push(SchedulerCommand::SequenceClose(seq_id), now);
 
         let actions = scheduler.push(SchedulerCommand::Clear, now);
@@ -878,7 +884,7 @@ mod tests {
             64,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
-        scheduler.requeue_deferred_message(msg, now);
+        scheduler.requeue_deferred_message(msg, now, RetryReason::Congestion);
 
         // Queue close while pending
         scheduler.push(SchedulerCommand::SequenceClose(seq_id), now);

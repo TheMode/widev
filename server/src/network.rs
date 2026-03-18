@@ -21,7 +21,7 @@ use crate::packet_scheduler::{
 };
 use crate::packets::{
     DropReason, PacketControl, PacketEnvelope, PacketMessage, PacketOrder, PacketPriority,
-    PacketResource, PacketTarget,
+    PacketResource, PacketTarget, RetryReason,
 };
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -1335,6 +1335,7 @@ impl Session {
 
     fn requeue_pending_write(&mut self, stream_id: u64, chunk: PendingStreamWrite) {
         if let Some(state) = self.streams.get_mut(&stream_id) {
+            self.tracer.on_flow_retry(chunk.trace.flow_id, RetryReason::Congestion);
             state.pending_writes.push_front(chunk);
         }
     }
@@ -1439,7 +1440,12 @@ impl Session {
                         None
                     },
                     EnvelopeDispatchResult::DeferredByCongestion => {
-                        self.scheduler.requeue_deferred_message(message, Instant::now());
+                        self.tracer.on_flow_retry(message.trace().flow_id, RetryReason::Congestion);
+                        self.scheduler.requeue_deferred_message(
+                            message,
+                            Instant::now(),
+                            RetryReason::Congestion,
+                        );
                         None
                     },
                 }

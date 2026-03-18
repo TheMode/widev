@@ -2,6 +2,7 @@ include!(concat!(env!("OUT_DIR"), "/packets_gen.rs"));
 
 use std::time::Duration;
 
+use serde::Serialize;
 use strum::IntoStaticStr;
 use thiserror::Error;
 
@@ -79,6 +80,15 @@ pub enum DropReason {
     ExpiredDeadline,
     CongestionBudgetExceeded,
     DatagramRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryReason {
+    Congestion,
+    Timeout,
+    Nack,
+    Other,
 }
 
 pub type PacketBundle = Vec<S2CPacket>;

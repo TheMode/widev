@@ -37,6 +37,9 @@
   #header h1 { font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text2); }
   #header .pill { background: var(--accent); color: #000; font-size: 10px; font-weight: 600; padding: 2px 7px; letter-spacing: 0.05em; text-transform: uppercase; }
   #header .sep { width: 1px; height: 20px; background: var(--border); }
+  #file-name { font-size: 12px; color: var(--text3); font-family: var(--mono); }
+  #load-btn { margin-left: 4px; }
+  #header-stats { font-size: 11px; color: var(--text3); font-family: var(--mono); }
 
   #main { display: grid; grid-template-columns: 200px 1fr; overflow: hidden; }
   #sidebar { border-right: 1px solid var(--border); background: var(--surface); overflow-y: auto; }
@@ -158,11 +161,44 @@
 
   .split-view { display: flex; flex: 1; overflow: hidden; }
 
-  /* Pager */
+  /* ---- Pager ---- */
   .pager { display: flex; align-items: center; gap: 6px; margin-left: auto; }
   .pager button { background: var(--surface2); border: 1px solid var(--border); color: var(--text2); padding: 3px 8px; cursor: pointer; font-size: 11px; }
   .pager button:disabled { opacity: 0.3; cursor: default; }
   .pager span { font-size: 11px; color: var(--text3); font-family: var(--mono); }
+
+  /* ---- Timeline axis ---- */
+  #flow-timeline-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; padding-left: 170px; }
+  #tl-axis { flex: 1; height: 16px; position: relative; font-size: 9px; color: var(--text3); font-family: var(--mono); }
+
+  /* ---- JS-generated element styles ---- */
+  tr.clickable  { cursor: pointer; }
+  .tag.flex-shrink { flex-shrink: 0; }
+  .empty-state  { padding: 24px; color: var(--text3); }
+  pre.json-preview { font-size: 10px; white-space: pre-wrap; color: var(--text3); }
+
+  /* ---- Bottleneck duration coloring ---- */
+  .dur-fast  { color: var(--green); }
+  .dur-med   { color: var(--yellow); }
+  .dur-slow  { color: var(--red); }
+  #bn-toolbar { font-size: 11px; color: var(--text3); }
+  .split-view-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .split-view.fill { flex: 1; overflow: hidden; }
+  .chart-cell.span-2 { grid-column: span 2; }
+
+  /* ---- Detail panel event row ---- */
+  .event-row { display: flex; gap: 8px; margin-bottom: 4px; font-size: 11px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .event-row-time { color: var(--text3); font-family: var(--mono); width: 60px; flex-shrink: 0; }
+  .event-row-summary { color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- Toolbar input widths ---- */
+  .tb-input-wide { width: 220px; }
+  .tb-input-med  { width: 200px; }
+  .tb-label-check { margin-right: 4px; }
+
+  /* ---- RX detail cell ---- */
+  td.detail-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+  td.summary-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; color: var(--text3); }
 </style>
 </head>
 <body>
@@ -170,11 +206,11 @@
   <div id="header">
     <h1>Network Trace Viewer</h1>
     <div class="sep"></div>
-    <span id="file-name" style="font-size:12px;color:var(--text3);font-family:var(--mono)">no file loaded</span>
-    <button class="tb-btn" id="load-btn" style="margin-left:4px">Load File</button>
+    <span id="file-name">no file loaded</span>
+    <button class="tb-btn" id="load-btn">Load File</button>
     <input type="file" id="file-input" accept=".ndjson,.jsonl,.json">
     <div class="sep"></div>
-    <span id="header-stats" style="font-size:11px;color:var(--text3);font-family:var(--mono)"></span>
+    <span id="header-stats"></span>
   </div>
   <div id="main">
     <div id="sidebar">
@@ -224,7 +260,7 @@
 
     <div id="content">
       <!-- DROP ZONE -->
-      <div id="view-drop" class="view active" style="display:flex">
+      <div id="view-drop" class="view active">
         <div id="dropzone">
           <div class="dz-box" id="dz-box">
             <h2>Drop an NDJSON trace file here</h2>
@@ -241,7 +277,7 @@
           <span class="view-sub" id="ov-sub"></span>
         </div>
         <div class="stats-grid" id="ov-stats"></div>
-        <div class="chart-grid" id="ov-charts" style="flex:1;overflow:hidden;">
+        <div class="chart-grid" id="ov-charts">
           <div class="chart-cell">
             <div class="chart-cell-title">Egress Bytes Over Time</div>
             <canvas id="chart-egress-time"></canvas>
@@ -268,7 +304,7 @@
           <span class="view-sub">RTT, throughput, pacing, latency</span>
         </div>
         <div class="stats-grid" id="perf-stats"></div>
-        <div class="chart-grid" style="flex:1;overflow:hidden;">
+        <div class="chart-grid">
           <div class="chart-cell">
             <div class="chart-cell-title">RTT Over Time (ms)</div>
             <canvas id="chart-rtt"></canvas>
@@ -294,7 +330,7 @@
           <span class="view-title">Flows</span>
         </div>
         <div class="toolbar">
-          <input class="tb-input" id="flow-search" placeholder="Search label, kind, priority..." style="width:220px">
+          <input class="tb-input tb-input-wide" id="flow-search" placeholder="Search label, kind, priority...">
           <select class="tb-select" id="flow-filter-kind">
             <option value="">All Kinds</option>
             <option value="envelope">Envelope</option>
@@ -319,7 +355,7 @@
           </div>
         </div>
         <div class="split-view">
-          <div class="table-wrap" style="flex:1">
+          <div class="table-wrap">
             <table>
               <thead>
                 <tr>
@@ -357,12 +393,12 @@
           <select class="tb-select" id="tl-filter-client">
             <option value="">All Clients</option>
           </select>
-          <label class="tb-label"><input type="checkbox" id="tl-show-incomplete" style="margin-right:4px">Show Incomplete</label>
+          <label class="tb-label"><input type="checkbox" class="tb-label-check" id="tl-show-incomplete">Show Incomplete</label>
           <span class="tb-label" id="tl-count-label"></span>
         </div>
         <div id="flow-timeline-wrap">
-          <div id="flow-timeline-header" style="display:flex;align-items:center;gap:10px;margin-bottom:6px;padding-left:170px;">
-            <div id="tl-axis" style="flex:1;height:16px;position:relative;font-size:9px;color:var(--text3);font-family:var(--mono);"></div>
+        <div id="flow-timeline-header">
+            <div id="tl-axis"></div>
           </div>
           <div id="flow-timeline-rows"></div>
         </div>
@@ -375,9 +411,9 @@
           <span class="view-sub">Slow flows, congestion events, drops</span>
         </div>
         <div class="stats-grid" id="bn-stats"></div>
-        <div class="split-view" style="flex:1;overflow:hidden;">
-          <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
-            <div class="toolbar" style="font-size:11px;color:var(--text3)">Top 50 slowest flows by duration</div>
+        <div class="split-view fill">
+          <div class="split-view-main">
+            <div class="toolbar" id="bn-toolbar">Top 50 slowest flows by duration</div>
             <div class="table-wrap">
               <table>
                 <thead><tr>
@@ -395,8 +431,8 @@
       <div id="view-egress" class="view">
         <div class="view-header"><span class="view-title">QUIC Egress</span></div>
         <div class="stats-grid" id="eg-stats"></div>
-        <div class="chart-grid" style="flex:1;overflow:hidden;">
-          <div class="chart-cell" style="grid-column:span 2">
+        <div class="chart-grid">
+          <div class="chart-cell span-2">
             <div class="chart-cell-title">Bytes/packet sent over time</div>
             <canvas id="chart-egress-scatter"></canvas>
           </div>
@@ -416,7 +452,7 @@
         <div class="view-header"><span class="view-title">Datagrams</span></div>
         <div class="stats-grid" id="dg-stats"></div>
         <div class="toolbar">
-          <input class="tb-input" id="dg-search" placeholder="Filter by flow ID, label..." style="width:220px">
+          <input class="tb-input tb-input-wide" id="dg-search" placeholder="Filter by flow ID, label...">
           <select class="tb-select" id="dg-filter-status">
             <option value="">All Statuses</option>
             <option value="sent">Sent</option>
@@ -442,7 +478,7 @@
       <div id="view-rx" class="view">
         <div class="view-header"><span class="view-title">RX Events</span></div>
         <div class="toolbar">
-          <input class="tb-input" id="rx-search" placeholder="Filter..." style="width:200px">
+          <input class="tb-input tb-input-med" id="rx-search" placeholder="Filter...">
         </div>
         <div class="table-wrap">
           <table>
@@ -458,7 +494,7 @@
       <div id="view-eventlog" class="view">
         <div class="view-header"><span class="view-title">Event Log</span></div>
         <div class="toolbar">
-          <input class="tb-input" id="el-search" placeholder="Search events..." style="width:220px">
+          <input class="tb-input tb-input-wide" id="el-search" placeholder="Search events...">
           <select class="tb-select" id="el-filter-type">
             <option value="">All Types</option>
           </select>
@@ -472,7 +508,7 @@
           </div>
         </div>
         <div class="split-view">
-          <div class="table-wrap" style="flex:1">
+          <div class="table-wrap">
             <table>
               <thead><tr>
                 <th>Time (ms)</th><th>Client</th><th>Event</th><th>Flow</th><th>Summary</th>
@@ -488,7 +524,7 @@
       <div id="view-scheduler" class="view">
         <div class="view-header"><span class="view-title">Scheduler Events</span></div>
         <div class="stats-grid" id="sched-stats"></div>
-        <div class="chart-grid" style="flex:1;overflow:hidden;">
+        <div class="chart-grid">
           <div class="chart-cell">
             <div class="chart-cell-title">Actions Over Time</div>
             <canvas id="chart-sched-actions"></canvas>
@@ -512,6 +548,28 @@
 </div><!-- #app -->
 
 <script>
+/**
+ * Network Trace Viewer
+ *
+ * Sections (search by the === marker):
+ *  DATA STATE        – mutable globals holding parsed trace data
+ *  FILE LOADING      – drag-drop / file-input → parseNDJSON → buildData
+ *  DATA PROCESSING   – buildData(), populateFilters()
+ *  NAVIGATION        – navigateTo(), renderView() dispatch
+ *  CANVAS HELPERS    – clearCanvas(), COLORS, draw* primitives
+ *  OVERVIEW          – renderOverview()
+ *  PERFORMANCE       – renderPerformance()
+ *  FLOWS TABLE       – renderFlows(), getFilteredFlows(), sort/filter listeners
+ *  FLOW DETAIL PANEL – showFlowDetail(), kv(), eventSummary()
+ *  TIMELINE          – renderTimeline()
+ *  BOTTLENECK        – renderBottleneck()
+ *  EGRESS            – renderEgress()
+ *  DATAGRAMS         – renderDatagrams(), getFilteredDGs()
+ *  RX                – renderRX()
+ *  EVENT LOG         – renderEventLog(), showEventDetail()
+ *  SCHEDULER         – renderScheduler()
+ *  HELPERS           – kindCls(), priorityCls(), outcomeCls(), shortPriority(), etc.
+ */
 // ============================================================
 // DATA STATE
 // ============================================================
@@ -602,6 +660,8 @@ function buildData() {
         end_ms: null,
         duration_ms: null,
         outcome: null,
+        retry_count: 0,
+        retry_reason: null,
         events: [ev],
       };
     } else if (ev.event === 'delivery_event' && ev.terminal && ev.flow_id != null) {
@@ -609,6 +669,8 @@ function buildData() {
         flowMap[ev.flow_id].end_ms = ev.timestamp_ms;
         flowMap[ev.flow_id].duration_ms = ev.timestamp_ms - flowMap[ev.flow_id].start_ms;
         flowMap[ev.flow_id].outcome = ev.outcome;
+        flowMap[ev.flow_id].retry_count = ev.retry_count ?? 0;
+        flowMap[ev.flow_id].retry_reason = ev.retry_reason ?? null;
       }
       deliveries[ev.flow_id] = ev;
     } else if (ev.event === 'quic_egress') {
@@ -1113,7 +1175,7 @@ function renderFlows() {
   const slice = filtered.slice((flowPage-1)*FLOW_PAGE_SIZE, flowPage*FLOW_PAGE_SIZE);
   const tbody = document.getElementById('flow-table-body');
   tbody.innerHTML = slice.map(f => `
-    <tr data-fid="${f.flow_id}" style="cursor:pointer">
+    <tr data-fid="${f.flow_id}" class="clickable">
       <td>${f.flow_id}</td>
       <td>${f.client_id}</td>
       <td><span class="tag ${kindCls(f.kind)}">${f.kind}</span></td>
@@ -1122,7 +1184,7 @@ function renderFlows() {
       <td><span class="tag gray">${shortDelivery(f.delivery)}</span></td>
       <td class="num">${f.payload_bytes}</td>
       <td class="num">${f.duration_ms != null ? f.duration_ms.toFixed(3) : '—'}</td>
-      <td><span class="tag ${outcomeCls(f.outcome)}">${shortOutcome(f.outcome)}</span></td>
+      <td><span class="tag ${outcomeCls(f.outcome)}" title="retries=${f.retry_count ?? 0}${f.retry_reason ? ` reason=${f.retry_reason}` : ''}">${shortOutcome(f.outcome)}</span></td>
     </tr>`).join('');
 
   tbody.querySelectorAll('tr').forEach(tr => {
@@ -1172,10 +1234,10 @@ function showFlowDetail(flow, panelId) {
   const ctx = flow;
   const evRows = (flow.events || []).map(ev => {
     const t = ((ev.timestamp_ms||0) - flow.start_ms).toFixed(3);
-    return `<div style="display:flex;gap:8px;margin-bottom:4px;font-size:11px;border-bottom:1px solid var(--border);padding-bottom:4px">
-      <span style="color:var(--text3);font-family:var(--mono);width:60px;flex-shrink:0">+${t}ms</span>
-      <span class="tag ${eventTypeCls(ev.event)}" style="flex-shrink:0">${ev.event.replace('_',' ')}</span>
-      <span style="color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${eventSummary(ev)}</span>
+    return `<div class="event-row">
+      <span class="event-row-time">+${t}ms</span>
+      <span class="tag flex-shrink ${eventTypeCls(ev.event)}">${ev.event.replace('_',' ')}</span>
+      <span class="event-row-summary">${eventSummary(ev)}</span>
     </div>`;
   }).join('');
 
@@ -1206,6 +1268,8 @@ function showFlowDetail(flow, panelId) {
       ${kv('End', flow.end_ms != null ? flow.end_ms.toFixed(3)+'ms' : '—')}
       ${kv('Duration', flow.duration_ms != null ? flow.duration_ms.toFixed(3)+'ms' : '—')}
       ${kv('Outcome', flow.outcome || '—')}
+      ${kv('Retries', flow.retry_count ?? 0)}
+      ${kv('Retry Reason', flow.retry_reason || '—')}
     </div>
     ${ctx.components?.length ? `<div class="dp-section"><div class="dp-section-title">Components (${ctx.components.length})</div>${comps}</div>` : ''}
     <div class="dp-section">
@@ -1220,7 +1284,7 @@ function kv(k, v) {
 
 function eventSummary(ev) {
   if (ev.event === 'scheduler_event') return `${ev.action}${ev.queue_name?` q=${ev.queue_name}`:''}${ev.reason?` r=${ev.reason}`:''}`;
-  if (ev.event === 'delivery_event') return `${ev.outcome} terminal=${ev.terminal}`;
+  if (ev.event === 'delivery_event') return `${ev.outcome} terminal=${ev.terminal} retries=${ev.retry_count ?? 0}${ev.retry_reason ? ` reason=${ev.retry_reason}` : ''}`;
   if (ev.event === 'transport_selected') return `route=${ev.route} eligible=${ev.eligible}`;
   if (ev.event === 'datagram_attempt') return `bytes=${ev.payload_bytes}`;
   if (ev.event === 'datagram_result') return `${ev.status} ${ev.detail||''}`;
@@ -1253,7 +1317,7 @@ function renderTimeline() {
     `${flows.length} flows${limited ? ' (first 500 shown)' : ''}`;
 
   if (!flows.length) {
-    document.getElementById('flow-timeline-rows').innerHTML = '<div style="padding:24px;color:var(--text3)">No flows to display</div>';
+    document.getElementById('flow-timeline-rows').innerHTML = '<div class="empty-state">No flows to display</div>';
     return;
   }
 
@@ -1279,7 +1343,7 @@ function renderTimeline() {
     const width = Math.max(0.1, (dur / range * 100)).toFixed(4);
     const cls = f.kind === 'resource' ? 'resource' : f.priority === 'Droppable' ? 'droppable' : 'normal';
     const label = f.packet_label.length > 22 ? f.packet_label.slice(0,22)+'…' : f.packet_label;
-    return `<div class="flow-bar-row" title="Flow ${f.flow_id}: ${f.packet_label}&#10;Start: ${f.start_ms.toFixed(3)}ms&#10;Duration: ${f.duration_ms!=null?f.duration_ms.toFixed(3)+'ms':'incomplete'}&#10;Outcome: ${f.outcome||'incomplete'}">
+    return `<div class="flow-bar-row" title="Flow ${f.flow_id}: ${f.packet_label}&#10;Start: ${f.start_ms.toFixed(3)}ms&#10;Duration: ${f.duration_ms!=null?f.duration_ms.toFixed(3)+'ms':'incomplete'}&#10;Outcome: ${f.outcome||'incomplete'}&#10;Retries: ${f.retry_count ?? 0}${f.retry_reason ? `&#10;Reason: ${f.retry_reason}` : ''}">
       <div class="flow-bar-label">f${f.flow_id} ${label}</div>
       <div class="flow-bar-track" data-fid="${f.flow_id}">
         <div class="flow-bar ${cls}" style="left:${left}%;width:${width}%"></div>
@@ -1321,13 +1385,13 @@ function renderBottleneck() {
 
   const tbody = document.getElementById('bn-table-body');
   tbody.innerHTML = withDur.slice(0,50).map((f,i) => `
-    <tr data-fid="${f.flow_id}" style="cursor:pointer">
+    <tr data-fid="${f.flow_id}" class="clickable">
       <td>${i+1}</td>
       <td>${f.flow_id}</td>
       <td title="${f.packet_label}">${f.packet_label}</td>
-      <td class="num" style="color:${f.duration_ms>1?'var(--red)':f.duration_ms>0.5?'var(--yellow)':'var(--green)'}">${f.duration_ms.toFixed(3)}</td>
+      <td class="num ${f.duration_ms>1?'dur-slow':f.duration_ms>0.5?'dur-med':'dur-fast'}">${f.duration_ms.toFixed(3)}</td>
       <td><span class="tag ${kindCls(f.kind)}">${f.kind}</span></td>
-      <td><span class="tag ${outcomeCls(f.outcome)}">${shortOutcome(f.outcome)}</span></td>
+      <td><span class="tag ${outcomeCls(f.outcome)}" title="retries=${f.retry_count ?? 0}${f.retry_reason ? ` reason=${f.retry_reason}` : ''}">${shortOutcome(f.outcome)}</span></td>
       <td>${f.client_id}</td>
     </tr>`).join('');
 
@@ -1458,7 +1522,7 @@ function renderRX() {
     <td>${e.transport}</td>
     <td class="num">${e.bytes}</td>
     <td>${e.packet_type}</td>
-    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${e.detail||'—'}</td>
+    <td class="detail-cell">${e.detail||'—'}</td>
   </tr>`).join('');
 }
 
@@ -1503,7 +1567,7 @@ function renderEventLog() {
       <td>${ev.client_id ?? '—'}</td>
       <td><span class="tag ${eventTypeCls(ev.event)}">${ev.event.replace(/_/g,' ')}</span></td>
       <td>${ev.flow_id ?? '—'}</td>
-      <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;color:var(--text3)">${eventSummary(ev)}</td>
+      <td class="summary-cell">${eventSummary(ev)}</td>
     </tr>`).join('');
 
   tbody.querySelectorAll('tr').forEach(tr => {
@@ -1520,7 +1584,9 @@ function showEventDetail(ev) {
   const panel = document.getElementById('el-detail');
   panel.classList.add('open');
   const rows = Object.entries(ev).map(([k,v]) => {
-    const val = typeof v === 'object' ? `<pre style="font-size:10px;white-space:pre-wrap;color:var(--text3)">${JSON.stringify(v, null, 2)}</pre>` : `<span class="kv-val">${v ?? '—'}</span>`;
+    const val = typeof v === 'object'
+      ? `<pre class="json-preview">${JSON.stringify(v, null, 2)}</pre>`
+      : `<span class="kv-val">${v ?? '—'}</span>`;
     return `<div class="kv-row"><span class="kv-key">${k}</span>${val}</div>`;
   }).join('');
   panel.innerHTML = `
@@ -1534,7 +1600,7 @@ function showEventDetail(ev) {
     </div>
     <div class="dp-section">
       <div class="dp-section-title">Raw JSON</div>
-      <pre style="font-size:10px;white-space:pre-wrap;color:var(--text3)">${JSON.stringify(ev, null, 2)}</pre>
+      <pre class="json-preview">${JSON.stringify(ev, null, 2)}</pre>
     </div>`;
 }
 

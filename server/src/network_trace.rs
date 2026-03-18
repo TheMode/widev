@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::game::ClientId;
 use crate::packets::{
     C2SPacket, DeliveryOutcome, DeliveryPolicy, DropReason, MessageId, PacketControl,
-    PacketEnvelope, PacketOrder, PacketPriority, PacketResource, PacketTarget,
+    PacketEnvelope, PacketOrder, PacketPriority, PacketResource, PacketTarget, RetryReason,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +144,7 @@ pub enum SchedulerTraceEvent {
     RequeuedCongestion {
         trace: DispatchTraceMeta,
         queued_messages: usize,
+        reason: RetryReason,
     },
     DispatchReady {
         trace: DispatchTraceMeta,
@@ -270,6 +271,8 @@ pub enum TraceEvent {
         message_id: Option<u128>,
         outcome: String,
         terminal: bool,
+        retry_count: u32,
+        retry_reason: Option<RetryReason>,
         detail: Option<String>,
     },
     RxEvent {
@@ -335,6 +338,8 @@ struct PendingEgress {
 struct ActiveFlow {
     context: TraceContext,
     await_client_receipt: bool,
+    retry_count: u32,
+    retry_reason: Option<RetryReason>,
 }
 
 pub struct NetworkTracer {
@@ -568,6 +573,8 @@ impl TraceEmitter {
         message_id: Option<MessageId>,
         outcome: String,
         terminal: bool,
+        retry_count: u32,
+        retry_reason: Option<RetryReason>,
         detail: Option<String>,
     ) {
         self.emit(TraceEvent::DeliveryEvent {
@@ -577,6 +584,8 @@ impl TraceEmitter {
             message_id: message_id.map(|id| id as u128),
             outcome,
             terminal,
+            retry_count,
+            retry_reason,
             detail,
         });
     }
@@ -620,7 +629,15 @@ impl TraceProjector {
         if let Some(message_id) = context.message_id {
             self.flow_by_message_id.insert(message_id, context.flow_id);
         }
-        self.active_flows.insert(context.flow_id, ActiveFlow { context, await_client_receipt });
+        self.active_flows.insert(
+            context.flow_id,
+            ActiveFlow {
+                context,
+                await_client_receipt,
+                retry_count: 0,
+                retry_reason: None,
+            },
+        );
     }
 
     fn get_flow(&self, flow_id: u64) -> Option<&ActiveFlow> {
@@ -637,6 +654,14 @@ impl TraceProjector {
             self.flow_by_message_id.remove(&message_id);
         }
         Some(flow)
+    }
+
+    fn record_retry(&mut self, flow_id: u64, reason: RetryReason) {
+        let Some(flow) = self.active_flows.get_mut(&flow_id) else {
+            return;
+        };
+        flow.retry_count = flow.retry_count.saturating_add(1);
+        flow.retry_reason = Some(reason);
     }
 
     fn queue_egress(
@@ -768,7 +793,11 @@ impl SessionTracer {
                         Some(false),
                     );
                 },
-                SchedulerTraceEvent::RequeuedCongestion { trace, queued_messages } => {
+                SchedulerTraceEvent::RequeuedCongestion {
+                    trace,
+                    queued_messages,
+                    reason,
+                } => {
                     self.emitter.emit_scheduler_event(
                         Some(trace.flow_id),
                         "requeued_congestion",
@@ -776,7 +805,7 @@ impl SessionTracer {
                         Some(queued_messages),
                         None,
                         Some(trace.order.clone()),
-                        Some("congestion".to_string()),
+                        Some(describe_retry_reason(reason).to_string()),
                         None,
                     );
                 },
@@ -910,6 +939,10 @@ impl SessionTracer {
         }
     }
 
+    pub fn on_flow_retry(&mut self, flow_id: u64, reason: RetryReason) {
+        self.projector.record_retry(flow_id, reason);
+    }
+
     pub fn on_stream_transport_selected(
         &mut self,
         trace: &DispatchTraceMeta,
@@ -1038,6 +1071,8 @@ impl SessionTracer {
                     outcome,
                     DeliveryOutcome::TransportDropped { .. } | DeliveryOutcome::ClientProcessed
                 ),
+                0,
+                None,
                 None,
             );
         }
@@ -1072,16 +1107,20 @@ impl SessionTracer {
     }
 
     pub fn on_flow_aborted(&mut self, flow_id: u64, reason: &str) {
+        let Some(flow) = self.projector.finish_flow(flow_id) else {
+            return;
+        };
         if self.tracer.enabled() {
             self.emitter.emit_delivery(
                 Some(flow_id),
-                None,
+                flow.context.message_id,
                 "Aborted".to_string(),
                 true,
+                flow.retry_count,
+                flow.retry_reason,
                 Some(reason.to_string()),
             );
         }
-        self.projector.finish_flow(flow_id);
     }
 
     pub fn on_control(&self, control: PacketControl) {
@@ -1180,6 +1219,8 @@ impl SessionTracer {
                 flow.context.message_id,
                 describe_delivery_outcome(outcome),
                 true,
+                flow.retry_count,
+                flow.retry_reason,
                 detail,
             );
         }
@@ -1622,9 +1663,14 @@ impl TraceRenderer {
         let context = &state.context;
         let flow_id = context.flow_id;
         let final_outcome = state.events.iter().rev().find_map(|event| match event {
-            TraceEvent::DeliveryEvent { outcome, terminal, detail, .. } if *terminal => {
-                Some((outcome.clone(), detail.clone()))
-            },
+            TraceEvent::DeliveryEvent {
+                outcome,
+                terminal,
+                detail,
+                retry_count,
+                retry_reason,
+                ..
+            } if *terminal => Some((outcome.clone(), detail.clone(), *retry_count, *retry_reason)),
             _ => None,
         });
         let total_ms = state
@@ -1689,10 +1735,14 @@ impl TraceRenderer {
             }
         }
 
-        if let Some((outcome, detail)) = final_outcome {
+        if let Some((outcome, detail, retry_count, retry_reason)) = final_outcome {
             lines.push(format!(
-                "  outcome={}{}",
+                "  outcome={} retry_count={}{}{}",
                 outcome,
+                retry_count,
+                retry_reason
+                    .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
+                    .unwrap_or_default(),
                 detail.map(|value| format!(" ({value})")).unwrap_or_default()
             ));
         } else if incomplete {
@@ -1832,11 +1882,23 @@ impl TraceRenderer {
                 "quic egress bytes={} dest={} pace={:.3}ms approx={} flows={:?} sources={:?}",
                 bytes, destination, pacing_delay_ms, approximate, flow_ids, sources
             )),
-            TraceEvent::DeliveryEvent { message_id, outcome, terminal, detail, .. } => {
+            TraceEvent::DeliveryEvent {
+                message_id,
+                outcome,
+                terminal,
+                retry_count,
+                retry_reason,
+                detail,
+                ..
+            } => {
                 Some(format!(
-                    "delivery outcome={} terminal={} msg={}{}",
+                    "delivery outcome={} terminal={} retry_count={}{} msg={}{}",
                     outcome,
                     terminal,
+                    retry_count,
+                    retry_reason
+                        .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
+                        .unwrap_or_default(),
                     message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
                     detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()
                 ))
@@ -2002,6 +2064,15 @@ fn describe_delivery_outcome(outcome: DeliveryOutcome) -> String {
     }
 }
 
+fn describe_retry_reason(reason: RetryReason) -> &'static str {
+    match reason {
+        RetryReason::Congestion => "congestion",
+        RetryReason::Timeout => "timeout",
+        RetryReason::Nack => "nack",
+        RetryReason::Other => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2104,5 +2175,52 @@ mod tests {
         assert!(global_events.contains("\"flow_registered\""));
         assert!(client_events.contains("\"delivery_event\""));
         assert!(client_timeline.contains("delivery outcome=TransportDelivered"));
+    }
+
+    #[test]
+    fn terminal_delivery_event_includes_retry_metadata() {
+        let log_dir = temp_log_dir();
+        let tracer = make_tracer(log_dir.clone());
+        let mut session = SessionTracer::new(tracer, 12);
+        let envelope = PacketEnvelope::single(
+            PacketTarget::Client(12),
+            crate::packets::S2CPacket::Ping { nonce: 1 },
+        );
+
+        let trace = session.register_envelope(&envelope, 32);
+        session.on_flow_retry(trace.flow_id, RetryReason::Congestion);
+        session.on_flow_retry(trace.flow_id, RetryReason::Congestion);
+        session.on_flow_outcome(trace.flow_id, DeliveryOutcome::TransportDelivered);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let client_events =
+            fs::read_to_string(log_dir.join("clients").join("client_12.events.ndjson")).unwrap();
+        let client_timeline =
+            fs::read_to_string(log_dir.join("clients").join("client_12.timeline.log")).unwrap();
+
+        assert!(client_events.contains("\"retry_count\":2"));
+        assert!(client_events.contains("\"retry_reason\":\"congestion\""));
+        assert!(client_timeline.contains("retry_count=2"));
+        assert!(client_timeline.contains("retry_reason=congestion"));
+    }
+
+    #[test]
+    fn terminal_delivery_event_records_zero_retries_by_default() {
+        let log_dir = temp_log_dir();
+        let tracer = make_tracer(log_dir.clone());
+        let mut session = SessionTracer::new(tracer, 13);
+        let envelope = PacketEnvelope::single(
+            PacketTarget::Client(13),
+            crate::packets::S2CPacket::Ping { nonce: 1 },
+        );
+
+        let trace = session.register_envelope(&envelope, 32);
+        session.on_flow_outcome(trace.flow_id, DeliveryOutcome::TransportDelivered);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let client_events =
+            fs::read_to_string(log_dir.join("clients").join("client_13.events.ndjson")).unwrap();
+        assert!(client_events.contains("\"retry_count\":0"));
+        assert!(client_events.contains("\"retry_reason\":null"));
     }
 }
