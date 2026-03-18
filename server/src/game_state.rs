@@ -45,10 +45,6 @@ impl GameState {
     }
 
     pub fn drain_outbox(&mut self) -> Vec<PacketMessage> {
-        let mut out = Vec::new();
-        while let Some(message) = self.outbox.pop_front() {
-            out.push(message);
-        }
-        out
+        self.outbox.drain(..).collect()
     }
 }
