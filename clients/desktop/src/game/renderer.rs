@@ -972,7 +972,9 @@ impl Renderer {
         }
         self.instance_staging.clear();
         self.instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
-            center: [state.x, state.y],
+            // Game-space positions are top-left corners; the quad geometry is
+            // centered, so convert to a center point here.
+            center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
             size: [state.width, state.height],
             color: unpack_color(state.color),
         }));
@@ -989,7 +991,9 @@ impl Renderer {
         }
         self.textured_instance_staging.clear();
         self.textured_instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
-            center: [state.x, state.y],
+            // Game-space positions are top-left corners; the quad geometry is
+            // centered, so convert to a center point here.
+            center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
             size: [state.width, state.height],
             color: unpack_color(state.color),
         }));

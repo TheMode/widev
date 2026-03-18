@@ -3,13 +3,11 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use uuid::Uuid;
-
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
     DeliveryPolicy, InputType, MessageId, PacketBundle, PacketEnvelope, PacketResource,
-    PacketTarget, S2CPacket,
+    PacketTarget, PacketControl, S2CPacket,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -125,12 +123,21 @@ impl PongGame {
         }
     }
 
+    fn begin_transition(&mut self, state: &mut GameState, client_id: ClientId) {
+        state.control(PacketControl::Barrier { target: PacketTarget::Client(client_id) });
+    }
+
     fn send_waiting_screen(&mut self, state: &mut GameState, client_id: ClientId) {
         let message_id = state.alloc_message_id();
 
         let bundle = vec![
             S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
             S2CPacket::SetGameName { name: "Pong".to_string() },
+            S2CPacket::SurfaceLockDimensions {
+                surface_id: 1,
+                width: GAME_WIDTH as u32,
+                height: GAME_HEIGHT as u32,
+            },
             S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
             S2CPacket::SurfaceClearBackground { surface_id: 1, color: [0.1, 0.0, 0.15, 1.0] },
             S2CPacket::BindingDeclare {
@@ -150,13 +157,12 @@ impl PongGame {
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
                 .id(message_id)
                 .delivery(DeliveryPolicy::RequireClientReceipt)
-                .sequence(Uuid::now_v7()),
+                .independent(),
         );
     }
 
     fn send_game_bootstrap(&mut self, state: &mut GameState, match_id: u64, client_id: ClientId) {
         let message_id = state.alloc_message_id();
-        let bootstrap_sequence_id = Uuid::now_v7();
         let Some(m) = self.matches.get(&match_id) else { return };
 
         let is_player1 = m.player1 == client_id;
@@ -174,12 +180,17 @@ impl PongGame {
                 self.texture_png.clone(),
                 None,
             )
-            .sequence(bootstrap_sequence_id),
+            .independent(),
         );
 
         let bundle = vec![
             S2CPacket::ServerHello { tick_rate_hz: state.ticks_per_second() },
             S2CPacket::SetGameName { name: "Pong".to_string() },
+            S2CPacket::SurfaceLockDimensions {
+                surface_id: 1,
+                width: GAME_WIDTH as u32,
+                height: GAME_HEIGHT as u32,
+            },
             S2CPacket::SurfaceLockAspectRatio { surface_id: 1, numerator: 4, denominator: 3 },
             S2CPacket::SurfaceClearBackground { surface_id: 1, color: [0.1, 0.0, 0.15, 1.0] },
             S2CPacket::BindingDeclare {
@@ -239,7 +250,7 @@ impl PongGame {
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
                 .id(message_id)
                 .delivery(DeliveryPolicy::RequireClientReceipt)
-                .sequence(bootstrap_sequence_id),
+                .independent(),
         );
     }
 
@@ -255,11 +266,155 @@ impl PongGame {
         state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
     }
 
+    fn active_match_ids(&self) -> Vec<u64> {
+        self.matches.keys().copied().collect()
+    }
+
+    fn advance_match(m: &mut Match, dt_seconds: f32) {
+        if m.winner.is_some() {
+            return;
+        }
+
+        Self::move_paddle(&mut m.paddle1, dt_seconds);
+        Self::move_paddle(&mut m.paddle2, dt_seconds);
+
+        Self::move_ball(&mut m.ball, dt_seconds);
+        Self::bounce_ball_off_walls(&mut m.ball);
+        Self::bounce_ball_off_paddles(m);
+        Self::apply_score_updates(m);
+    }
+
+    fn move_paddle(paddle: &mut Paddle, dt_seconds: f32) {
+        let dy = (paddle.input.down as i8 - paddle.input.up as i8) as f32;
+        paddle.y = (paddle.y + dy * PADDLE_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT - PADDLE_HEIGHT);
+    }
+
+    fn move_ball(ball: &mut Ball, dt_seconds: f32) {
+        ball.x += ball.vx * dt_seconds;
+        ball.y += ball.vy * dt_seconds;
+    }
+
+    fn bounce_ball_off_walls(ball: &mut Ball) {
+        if ball.y <= 0.0 {
+            ball.y = 0.0;
+            ball.vy = -ball.vy;
+        } else if ball.y + BALL_SIZE >= GAME_HEIGHT {
+            ball.y = GAME_HEIGHT - BALL_SIZE;
+            ball.vy = -ball.vy;
+        }
+    }
+
+    fn bounce_ball_off_paddles(m: &mut Match) {
+        let ball_left = m.ball.x;
+        let ball_right = m.ball.x + BALL_SIZE;
+        let ball_top = m.ball.y;
+        let ball_bottom = m.ball.y + BALL_SIZE;
+
+        let paddle1_left = m.paddle1.x;
+        let paddle1_right = m.paddle1.x + PADDLE_WIDTH;
+        let paddle1_top = m.paddle1.y;
+        let paddle1_bottom = m.paddle1.y + PADDLE_HEIGHT;
+        let paddle1_hit = ball_right >= paddle1_left
+            && ball_left <= paddle1_right
+            && ball_bottom >= paddle1_top
+            && ball_top <= paddle1_bottom
+            && m.ball.vx < 0.0;
+        if paddle1_hit {
+            m.ball.x = paddle1_right;
+            Self::bounce_from_paddle(&mut m.ball, m.paddle1.y, true);
+        }
+
+        let paddle2_left = m.paddle2.x;
+        let paddle2_right = m.paddle2.x + PADDLE_WIDTH;
+        let paddle2_top = m.paddle2.y;
+        let paddle2_bottom = m.paddle2.y + PADDLE_HEIGHT;
+        let paddle2_hit = ball_right >= paddle2_left
+            && ball_left <= paddle2_right
+            && ball_bottom >= paddle2_top
+            && ball_top <= paddle2_bottom
+            && m.ball.vx > 0.0;
+        if paddle2_hit {
+            m.ball.x = paddle2_left - BALL_SIZE;
+            Self::bounce_from_paddle(&mut m.ball, m.paddle2.y, false);
+        }
+    }
+
+    fn bounce_from_paddle(ball: &mut Ball, paddle_y: f32, left_paddle: bool) {
+        ball.speed = (ball.speed * 1.05).min(BALL_SPEED_MAX);
+        let rel_y =
+            (ball.y + BALL_SIZE / 2.0 - paddle_y - PADDLE_HEIGHT / 2.0) / (PADDLE_HEIGHT / 2.0);
+        ball.vy = rel_y * ball.speed * 0.5;
+        ball.vx = if left_paddle { ball.speed } else { -ball.speed };
+    }
+
+    fn apply_score_updates(m: &mut Match) {
+        if m.ball.x + BALL_SIZE < 0.0 {
+            m.score2 += 1;
+            log::info!("score: {} - {}", m.score1, m.score2);
+            if m.score2 >= 7 {
+                m.winner = Some(m.player2);
+            } else {
+                m.ball = Self::spawn_ball(true);
+            }
+        } else if m.ball.x > GAME_WIDTH {
+            m.score1 += 1;
+            log::info!("score: {} - {}", m.score1, m.score2);
+            if m.score1 >= 7 {
+                m.winner = Some(m.player1);
+            } else {
+                m.ball = Self::spawn_ball(false);
+            }
+        }
+    }
+
+    fn collect_finished_matches(&self) -> Vec<u64> {
+        self.matches
+            .iter()
+            .filter_map(|(&match_id, m)| m.winner.map(|_| match_id))
+            .collect()
+    }
+
+    fn resolve_finished_match(&mut self, state: &mut GameState, match_id: u64) {
+        let Some(m) = self.matches.remove(&match_id) else {
+            return;
+        };
+
+        log::info!("match {} won by player {}", match_id, m.winner.unwrap());
+        self.begin_transition(state, m.player1);
+        self.begin_transition(state, m.player2);
+        self.send_match_cleanup(state, m.player1);
+        self.send_match_cleanup(state, m.player2);
+        self.matchmaking_queue.push_back(m.player1);
+        self.matchmaking_queue.push_back(m.player2);
+        self.try_start_match(state);
+        if !self.is_client_in_match(m.player1) {
+            self.send_waiting_screen(state, m.player1);
+        }
+        if !self.is_client_in_match(m.player2) {
+            self.send_waiting_screen(state, m.player2);
+        }
+    }
+
+    fn resolve_finished_matches(&mut self, state: &mut GameState) {
+        for match_id in self.collect_finished_matches() {
+            self.resolve_finished_match(state, match_id);
+        }
+    }
+
+    fn broadcast_match_states(&mut self, state: &mut GameState) {
+        for match_id in self.active_match_ids() {
+            let Some(m) = self.matches.get(&match_id) else { continue };
+            if m.winner.is_none() {
+                self.send_score_update(state, match_id);
+            }
+        }
+    }
+
     fn send_match_cleanup(&mut self, state: &mut GameState, client_id: ClientId) {
-        state.send(PacketEnvelope::single(
-            PacketTarget::Client(client_id),
-            S2CPacket::ResetScene {},
-        ));
+        state.send(
+            PacketEnvelope::single(PacketTarget::Client(client_id), S2CPacket::ResetScene {})
+                .independent(),
+        );
     }
 
     fn remove_from_queue(&mut self, client_id: ClientId) {
@@ -313,6 +468,7 @@ impl Game for PongGame {
 
                 if let Some((match_id, m)) = self.find_match_and_remove_player(client_id) {
                     let remaining = if m.player1 == client_id { m.player2 } else { m.player1 };
+                    self.begin_transition(state, remaining);
                     self.send_match_cleanup(state, remaining);
                     log::info!("match {} ended, player {} wins by disconnect", match_id, remaining);
                     self.matchmaking_queue.push_back(remaining);
@@ -351,114 +507,15 @@ impl Game for PongGame {
 
     fn on_tick(&mut self, state: &mut GameState, _now: Instant, dt: Duration) {
         let dt_seconds = dt.as_secs_f32();
-
-        let match_ids: Vec<u64> = self.matches.keys().copied().collect();
-        let mut matches_to_end = Vec::new();
-
+        let match_ids = self.active_match_ids();
         for match_id in match_ids {
-            let Some(m) = self.matches.get_mut(&match_id) else { continue };
-            if m.winner.is_some() {
-                continue;
-            }
-
-            let dy1 = (m.paddle1.input.down as i8 - m.paddle1.input.up as i8) as f32;
-            m.paddle1.y = (m.paddle1.y + dy1 * PADDLE_SPEED * dt_seconds)
-                .clamp(0.0, GAME_HEIGHT - PADDLE_HEIGHT);
-
-            let dy2 = (m.paddle2.input.down as i8 - m.paddle2.input.up as i8) as f32;
-            m.paddle2.y = (m.paddle2.y + dy2 * PADDLE_SPEED * dt_seconds)
-                .clamp(0.0, GAME_HEIGHT - PADDLE_HEIGHT);
-
-            m.ball.x += m.ball.vx * dt_seconds;
-            m.ball.y += m.ball.vy * dt_seconds;
-
-            if m.ball.y <= 0.0 {
-                m.ball.y = 0.0;
-                m.ball.vy = -m.ball.vy;
-            } else if m.ball.y + BALL_SIZE >= GAME_HEIGHT {
-                m.ball.y = GAME_HEIGHT - BALL_SIZE;
-                m.ball.vy = -m.ball.vy;
-            }
-
-            let paddle1_hit = m.ball.x <= m.paddle1.x + PADDLE_WIDTH
-                && m.ball.x + BALL_SIZE >= m.paddle1.x
-                && m.ball.y + BALL_SIZE >= m.paddle1.y
-                && m.ball.y <= m.paddle1.y + PADDLE_HEIGHT;
-            if paddle1_hit {
-                m.ball.x = m.paddle1.x + PADDLE_WIDTH;
-                m.ball.vx = -m.ball.vx.abs();
-                m.ball.speed = (m.ball.speed * 1.05).min(BALL_SPEED_MAX);
-                let rel_y = (m.ball.y + BALL_SIZE / 2.0 - m.paddle1.y - PADDLE_HEIGHT / 2.0)
-                    / (PADDLE_HEIGHT / 2.0);
-                m.ball.vy = rel_y * m.ball.speed * 0.5;
-                m.ball.vx = m.ball.speed;
-            }
-
-            let paddle2_hit = m.ball.x + BALL_SIZE >= m.paddle2.x
-                && m.ball.x <= m.paddle2.x + PADDLE_WIDTH
-                && m.ball.y + BALL_SIZE >= m.paddle2.y
-                && m.ball.y <= m.paddle2.y + PADDLE_HEIGHT;
-            if paddle2_hit {
-                m.ball.x = m.paddle2.x - BALL_SIZE;
-                m.ball.vx = m.ball.vx.abs();
-                m.ball.speed = (m.ball.speed * 1.05).min(BALL_SPEED_MAX);
-                let rel_y = (m.ball.y + BALL_SIZE / 2.0 - m.paddle2.y - PADDLE_HEIGHT / 2.0)
-                    / (PADDLE_HEIGHT / 2.0);
-                m.ball.vy = rel_y * m.ball.speed * 0.5;
-                m.ball.vx = -m.ball.speed;
-            }
-
-            if m.ball.x + BALL_SIZE < 0.0 {
-                m.score2 += 1;
-                log::info!("score: {} - {}", m.score1, m.score2);
-                if m.score2 >= 7 {
-                    m.winner = Some(m.player2);
-                } else {
-                    m.ball = Self::spawn_ball(true);
-                }
-            } else if m.ball.x > GAME_WIDTH {
-                m.score1 += 1;
-                log::info!("score: {} - {}", m.score1, m.score2);
-                if m.score1 >= 7 {
-                    m.winner = Some(m.player1);
-                } else {
-                    m.ball = Self::spawn_ball(false);
-                }
+            if let Some(m) = self.matches.get_mut(&match_id) {
+                Self::advance_match(m, dt_seconds);
             }
         }
 
-        let match_ids: Vec<u64> = self.matches.keys().copied().collect();
-        for match_id in match_ids {
-            let Some(m) = self.matches.get(&match_id) else { continue };
-            if let Some(winner) = m.winner {
-                log::info!("match {} won by player {}", match_id, winner);
-                matches_to_end.push(match_id);
-            }
-        }
-
-        for match_id in matches_to_end {
-            if let Some(m) = self.matches.remove(&match_id) {
-                self.send_match_cleanup(state, m.player1);
-                self.send_match_cleanup(state, m.player2);
-                self.matchmaking_queue.push_back(m.player1);
-                self.matchmaking_queue.push_back(m.player2);
-                self.try_start_match(state);
-                if !self.is_client_in_match(m.player1) {
-                    self.send_waiting_screen(state, m.player1);
-                }
-                if !self.is_client_in_match(m.player2) {
-                    self.send_waiting_screen(state, m.player2);
-                }
-            }
-        }
-
-        let match_ids: Vec<u64> = self.matches.keys().copied().collect();
-        for match_id in match_ids {
-            let Some(m) = self.matches.get(&match_id) else { continue };
-            if m.winner.is_none() {
-                self.send_score_update(state, match_id);
-            }
-        }
+        self.resolve_finished_matches(state);
+        self.broadcast_match_states(state);
     }
 }
 
