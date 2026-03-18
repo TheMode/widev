@@ -199,7 +199,8 @@
   /* ---- RX detail cell ---- */
   td.detail-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
   td.summary-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; color: var(--text3); }
-</style>
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -556,7 +557,7 @@
  *  FILE LOADING      – drag-drop / file-input → parseNDJSON → buildData
  *  DATA PROCESSING   – buildData(), populateFilters()
  *  NAVIGATION        – navigateTo(), renderView() dispatch
- *  CANVAS HELPERS    – clearCanvas(), COLORS, draw* primitives
+ *  CHART HELPERS     – clearCanvas(), COLORS, draw* wrappers
  *  OVERVIEW          – renderOverview()
  *  PERFORMANCE       – renderPerformance()
  *  FLOWS TABLE       – renderFlows(), getFilteredFlows(), sort/filter listeners
@@ -777,17 +778,17 @@ function renderView(name) {
 }
 
 // ============================================================
-// CANVAS HELPERS
+// CHART HELPERS
 // ============================================================
 function clearCanvas(id) {
   const c = document.getElementById(id);
   if (!c) return null;
-  const rect = c.parentElement.getBoundingClientRect();
-  c.width = rect.width || 400;
-  c.height = rect.height || 220;
-  const ctx = c.getContext('2d');
-  ctx.clearRect(0,0,c.width,c.height);
-  return ctx;
+  const chart = CHARTS.get(id);
+  if (chart) {
+    chart.destroy();
+    CHARTS.delete(id);
+  }
+  return c;
 }
 
 const COLORS = {
@@ -799,197 +800,399 @@ const COLORS = {
   gray: '#555',
 };
 
+const CHARTS = new Map();
+const SERIES_PALETTE = [
+  COLORS.accent,
+  COLORS.green,
+  COLORS.yellow,
+  COLORS.purple,
+  '#5dd',
+  '#fa8',
+  '#9ad',
+  '#f6a',
+];
+
+function initChartTheme() {
+  if (typeof Chart === 'undefined') return;
+  Chart.defaults.color = '#999';
+  Chart.defaults.font.family = 'IBM Plex Sans, sans-serif';
+  Chart.defaults.borderColor = '#2a2a2a';
+  Chart.defaults.animation = false;
+  Chart.defaults.plugins.legend.labels.usePointStyle = true;
+  Chart.defaults.plugins.legend.labels.boxWidth = 10;
+  Chart.defaults.plugins.legend.labels.boxHeight = 10;
+  Chart.defaults.plugins.legend.labels.color = '#999';
+  Chart.defaults.plugins.tooltip.backgroundColor = '#141414';
+  Chart.defaults.plugins.tooltip.borderColor = '#2a2a2a';
+  Chart.defaults.plugins.tooltip.borderWidth = 1;
+  Chart.defaults.plugins.tooltip.titleColor = '#e8e8e8';
+  Chart.defaults.plugins.tooltip.bodyColor = '#cfcfcf';
+}
+
+initChartTheme();
+
 function drawLineChart(ctx, data, color='#4af', opts={}) {
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const pad = opts.pad || {t:10,r:10,b:30,l:50};
-  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
-  if (!data.length) return;
-
-  const xs = data.map(d=>d[0]), ys = data.map(d=>d[1]);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = opts.minY ?? Math.min(...ys), maxY = opts.maxY ?? Math.max(...ys);
-  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
-
-  const px = x => pad.l + (x - minX) / rangeX * W;
-  const py = y => pad.t + H - (y - minY) / rangeY * H;
-
-  // grid
-  ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
-  for (let i=0;i<=4;i++) {
-    const y = pad.t + i * H/4;
-    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l+W, y); ctx.stroke();
-    const val = maxY - (i/4)*rangeY;
-    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='right';
-    ctx.fillText(fmtNum(val), pad.l-4, y+3);
-  }
-  // x labels
-  for (let i=0;i<=4;i++) {
-    const x = pad.l + i * W/4;
-    const val = minX + (i/4)*rangeX;
-    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
-    ctx.fillText(fmtNum(val), x, h-pad.b+12);
-  }
-
-  // line
-  ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = 1.5;
-  data.forEach((d,i) => {
-    if (i===0) ctx.moveTo(px(d[0]), py(d[1]));
-    else ctx.lineTo(px(d[0]), py(d[1]));
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined') return null;
+  return renderChart(canvas.id, {
+    type: 'line',
+    data: {
+      datasets: [{
+        label: opts.label || 'Series',
+        data: data.map(([x, y]) => ({ x, y })),
+        borderColor: color,
+        backgroundColor: color,
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 2,
+      }],
+    },
+    options: chartBaseOptions({
+      yMin: opts.minY,
+      yMax: opts.maxY,
+      xMin: opts.minX,
+      xMax: opts.maxX,
+      yLabel: opts.yLabel || '',
+      xLabel: opts.xLabel || '',
+    }),
   });
-  ctx.stroke();
 }
 
 function drawScatter(ctx, data, color='#4af', opts={}) {
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const pad = opts.pad || {t:10,r:10,b:30,l:50};
-  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
-  if (!data.length) return;
-
-  const xs = data.map(d=>d[0]), ys = data.map(d=>d[1]);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = 0, maxY = Math.max(...ys);
-  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
-
-  const px = x => pad.l + (x - minX) / rangeX * W;
-  const py = y => pad.t + H - (y - minY) / rangeY * H;
-
-  ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
-  for (let i=0;i<=4;i++) {
-    const y = pad.t + i * H/4;
-    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l+W, y); ctx.stroke();
-    const val = maxY - (i/4)*rangeY;
-    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='right';
-    ctx.fillText(fmtNum(val), pad.l-4, y+3);
-  }
-  for (let i=0;i<=4;i++) {
-    const x = pad.l + i * W/4;
-    const val = minX + (i/4)*rangeX;
-    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
-    ctx.fillText(fmtNum(val), x, h-pad.b+12);
-  }
-
-  ctx.fillStyle = color + '99';
-  data.forEach(d => {
-    ctx.beginPath();
-    ctx.arc(px(d[0]), py(d[1]), 2.5, 0, Math.PI*2);
-    ctx.fill();
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined') return null;
+  return renderChart(canvas.id, {
+    type: 'line',
+    data: {
+      datasets: [{
+        label: opts.label || 'Series',
+        data: data.map(([x, y]) => ({ x, y })),
+        borderColor: color,
+        backgroundColor: color,
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 0,
+      }],
+    },
+    options: chartBaseOptions({
+      yMin: opts.minY ?? 0,
+      yMax: opts.maxY,
+      xMin: opts.minX,
+      xMax: opts.maxX,
+      yLabel: opts.yLabel || '',
+      xLabel: opts.xLabel || '',
+    }),
   });
 }
 
 function drawHistogram(ctx, data, color='#4af', opts={}) {
-  if (!data.length) return;
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const pad = opts.pad || {t:10,r:10,b:30,l:50};
-  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined' || !data.length) return null;
   const bins = opts.bins || 20;
-
-  const minV = Math.min(...data), maxV = Math.max(...data);
+  const minV = Math.min(...data);
+  const maxV = Math.max(...data);
   const range = maxV - minV || 1;
   const binW = range / bins;
   const counts = new Array(bins).fill(0);
   data.forEach(v => {
-    const i = Math.min(bins-1, Math.floor((v - minV) / binW));
-    counts[i]++;
+    const i = Math.min(bins - 1, Math.floor((v - minV) / binW));
+    counts[i] += 1;
   });
-  const maxCount = Math.max(...counts);
+  const labels = counts.map((_, i) => `${fmtNum(minV + i * binW)}-${fmtNum(minV + (i + 1) * binW)}`);
 
-  const bw = W / bins;
-  counts.forEach((c, i) => {
-    const bh = (c / maxCount) * H;
-    ctx.fillStyle = color + 'aa';
-    ctx.fillRect(pad.l + i*bw, pad.t + H - bh, bw-1, bh);
+  return renderChart(canvas.id, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: opts.label || 'Frequency',
+        data: counts,
+        backgroundColor: `${color}cc`,
+        borderWidth: 0,
+      }],
+    },
+    options: chartCategoryOptions({
+      showLegend: false,
+      yLabel: opts.yLabel || 'Count',
+    }),
   });
-
-  for (let i=0;i<=4;i++) {
-    const x = pad.l + i*W/4;
-    const val = minV + (i/4)*range;
-    ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
-    ctx.fillText(fmtNum(val), x, h-pad.b+12);
-  }
-  for (let i=0;i<=4;i++) {
-    const y = pad.t + i*H/4;
-    ctx.strokeStyle='#222'; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+W,y); ctx.stroke();
-    ctx.fillStyle='#555'; ctx.font='9px IBM Plex Mono'; ctx.textAlign='right';
-    ctx.fillText(Math.round(maxCount - (i/4)*maxCount), pad.l-4, y+3);
-  }
 }
 
 function drawDonut(ctx, segments, opts={}) {
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const cx = w/2, cy = h/2, r = Math.min(w,h)*0.35, ir = r*0.55;
-  let start = -Math.PI/2;
-  const total = segments.reduce((s,seg) => s+seg.value, 0);
-  segments.forEach(seg => {
-    const angle = (seg.value / total) * Math.PI * 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, r, start, start+angle);
-    ctx.closePath();
-    ctx.fillStyle = seg.color;
-    ctx.fill();
-    start += angle;
-  });
-  ctx.beginPath();
-  ctx.arc(cx, cy, ir, 0, Math.PI*2);
-  ctx.fillStyle = '#161616';
-  ctx.fill();
-
-  ctx.fillStyle = '#e8e8e8'; ctx.font = `bold 16px IBM Plex Mono`; ctx.textAlign = 'center';
-  ctx.fillText(total.toLocaleString(), cx, cy+4);
-  ctx.fillStyle = '#555'; ctx.font = `10px IBM Plex Sans`;
-  ctx.fillText('total', cx, cy+18);
-
-  // legend
-  let ly = 16;
-  segments.forEach(seg => {
-    ctx.fillStyle = seg.color;
-    ctx.fillRect(w - 120, ly, 10, 10);
-    ctx.fillStyle = '#999'; ctx.font = '10px IBM Plex Sans'; ctx.textAlign = 'left';
-    ctx.fillText(`${seg.label}: ${seg.value}`, w-106, ly+9);
-    ly += 18;
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined' || !segments.length) return null;
+  const total = segments.reduce((s, seg) => s + seg.value, 0);
+  return renderChart(canvas.id, {
+    type: 'doughnut',
+    data: {
+      labels: segments.map(seg => seg.label),
+      datasets: [{
+        data: segments.map(seg => seg.value),
+        backgroundColor: segments.map(seg => seg.color),
+        borderColor: '#161616',
+        borderWidth: 1,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '60%',
+      plugins: {
+        legend: {
+          display: true,
+          position: 'right',
+          labels: {
+            color: '#999',
+            font: { family: 'IBM Plex Sans', size: 10 },
+          },
+        },
+        tooltip: {
+          backgroundColor: '#141414',
+          titleColor: '#e8e8e8',
+          bodyColor: '#cfcfcf',
+          borderColor: '#2a2a2a',
+          borderWidth: 1,
+        },
+      },
+    },
+    plugins: [{
+      id: 'centerLabel',
+      afterDraw(chart) {
+        const { ctx, chartArea } = chart;
+        const cx = (chartArea.left + chartArea.right) / 2;
+        const cy = (chartArea.top + chartArea.bottom) / 2;
+        ctx.save();
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#e8e8e8';
+        ctx.font = '500 16px IBM Plex Mono';
+        ctx.fillText(total.toLocaleString(), cx, cy + 4);
+        ctx.fillStyle = '#666';
+        ctx.font = '10px IBM Plex Sans';
+        ctx.fillText(opts.centerLabel || 'total', cx, cy + 18);
+        ctx.restore();
+      },
+    }],
   });
 }
 
 function drawStackedBar(ctx, series, labels, opts={}) {
-  const w = ctx.canvas.width, h = ctx.canvas.height;
-  const pad = {t:10,r:120,b:30,l:50};
-  const W = w - pad.l - pad.r, H = h - pad.t - pad.b;
-  if (!labels.length) return;
-
-  const totals = labels.map((_,i) => series.reduce((s,ser) => s+(ser.data[i]||0), 0));
-  const maxTotal = Math.max(...totals) || 1;
-  const bw = W / labels.length;
-
-  labels.forEach((label, i) => {
-    let y = pad.t + H;
-    series.forEach(ser => {
-      const val = ser.data[i] || 0;
-      const bh = (val / maxTotal) * H;
-      ctx.fillStyle = ser.color;
-      ctx.fillRect(pad.l + i*bw, y - bh, bw-1, bh);
-      y -= bh;
-    });
-    if (i % Math.max(1, Math.floor(labels.length/8)) === 0) {
-      ctx.fillStyle = '#555'; ctx.font = '9px IBM Plex Mono'; ctx.textAlign='center';
-      ctx.fillText(fmtNum(label), pad.l + (i+0.5)*bw, h-pad.b+12);
-    }
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined' || !labels.length) return null;
+  return renderChart(canvas.id, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: series.map((ser, index) => ({
+        label: ser.label,
+        data: ser.data,
+        backgroundColor: ser.color || SERIES_PALETTE[index % SERIES_PALETTE.length],
+        borderWidth: 0,
+      })),
+    },
+    options: {
+      ...chartCategoryOptions({ showLegend: true, stacked: true, yLabel: opts.yLabel || 'Count' }),
+    },
   });
+}
 
-  for (let i=0;i<=4;i++) {
-    const y = pad.t + i*H/4;
-    ctx.strokeStyle='#222'; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(pad.l+W,y); ctx.stroke();
-    ctx.fillStyle='#555'; ctx.font='9px IBM Plex Mono'; ctx.textAlign='right';
-    ctx.fillText(Math.round(maxTotal*(1-i/4)), pad.l-4, y+3);
+function renderChart(id, config) {
+  if (typeof Chart === 'undefined') return null;
+  const canvas = document.getElementById(id);
+  if (!canvas) return null;
+  const existing = CHARTS.get(id);
+  if (existing) existing.destroy();
+  const chart = new Chart(canvas, config);
+  CHARTS.set(id, chart);
+  return chart;
+}
+
+function chartBaseOptions({
+  showLegend = false,
+  stacked = false,
+  yMin = undefined,
+  yMax = undefined,
+  xMin = undefined,
+  xMax = undefined,
+  yLabel = '',
+  xLabel = '',
+} = {}) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    normalized: true,
+    parsing: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: {
+        display: showLegend,
+        position: 'top',
+        labels: {
+          color: '#999',
+          font: { family: 'IBM Plex Sans', size: 10 },
+        },
+      },
+      tooltip: {
+        backgroundColor: '#141414',
+        titleColor: '#e8e8e8',
+        bodyColor: '#cfcfcf',
+        borderColor: '#2a2a2a',
+        borderWidth: 1,
+      },
+    },
+    scales: {
+      x: {
+        type: 'linear',
+        min: xMin,
+        max: xMax,
+        grid: { color: '#2a2a2a' },
+        ticks: {
+          color: '#666',
+          font: { family: 'IBM Plex Mono', size: 9 },
+          callback: value => fmtNum(value),
+        },
+        title: xLabel ? { display: true, text: xLabel, color: '#666' } : undefined,
+      },
+      y: {
+        stacked,
+        min: yMin,
+        max: yMax,
+        grid: { color: '#2a2a2a' },
+        ticks: {
+          color: '#666',
+          font: { family: 'IBM Plex Mono', size: 9 },
+          callback: value => fmtNum(value),
+        },
+        title: yLabel ? { display: true, text: yLabel, color: '#666' } : undefined,
+      },
+    },
+  };
+}
+
+function chartCategoryOptions({ showLegend = false, stacked = false, yLabel = '' } = {}) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    normalized: true,
+    parsing: false,
+    plugins: {
+      legend: {
+        display: showLegend,
+        position: 'right',
+        labels: {
+          color: '#999',
+          font: { family: 'IBM Plex Sans', size: 10 },
+        },
+      },
+      tooltip: {
+        backgroundColor: '#141414',
+        titleColor: '#e8e8e8',
+        bodyColor: '#cfcfcf',
+        borderColor: '#2a2a2a',
+        borderWidth: 1,
+      },
+    },
+    scales: {
+      x: {
+        stacked,
+        grid: { color: '#2a2a2a' },
+        ticks: {
+          color: '#666',
+          font: { family: 'IBM Plex Mono', size: 9 },
+        },
+      },
+      y: {
+        stacked,
+        beginAtZero: true,
+        grid: { color: '#2a2a2a' },
+        ticks: {
+          color: '#666',
+          font: { family: 'IBM Plex Mono', size: 9 },
+          callback: value => fmtNum(value),
+        },
+        title: yLabel ? { display: true, text: yLabel, color: '#666' } : undefined,
+      },
+    },
+  };
+}
+
+function buildGroupedSeries(rows, valueFn, {
+  xFn = row => row.timestamp_ms,
+  labelFn = client => `Client ${client}`,
+  filterFn = () => true,
+} = {}) {
+  const byClient = new Map();
+  for (const row of rows) {
+    if (!filterFn(row)) continue;
+    const clientId = row.client_id ?? 'unknown';
+    const x = xFn(row);
+    const y = valueFn(row);
+    if (x == null || y == null || Number.isNaN(x) || Number.isNaN(y)) continue;
+    if (!byClient.has(clientId)) byClient.set(clientId, []);
+    byClient.get(clientId).push({ x, y });
   }
 
-  let lx = w - pad.r + 8, ly = pad.t;
-  series.forEach(ser => {
-    ctx.fillStyle = ser.color; ctx.fillRect(lx, ly, 10, 10);
-    ctx.fillStyle='#999'; ctx.font='9px IBM Plex Sans'; ctx.textAlign='left';
-    ctx.fillText(ser.label, lx+14, ly+9);
-    ly += 16;
+  return [...byClient.entries()]
+    .sort(([a], [b]) => String(a).localeCompare(String(b), 'en', { numeric: true }))
+    .map(([clientId, points], index) => ({
+      label: labelFn(clientId),
+      color: SERIES_PALETTE[index % SERIES_PALETTE.length],
+      points: points.sort((a, b) => a.x - b.x),
+    }));
+}
+
+function drawMultiLineChart(ctx, series, opts = {}) {
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined') return null;
+  return renderChart(canvas.id, {
+    type: 'line',
+    data: {
+      datasets: series.map((ser, index) => ({
+        label: ser.label,
+        data: ser.points,
+        borderColor: ser.color || SERIES_PALETTE[index % SERIES_PALETTE.length],
+        backgroundColor: ser.color || SERIES_PALETTE[index % SERIES_PALETTE.length],
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 2,
+      })),
+    },
+    options: chartBaseOptions({
+      showLegend: series.length > 1,
+      yMin: opts.minY,
+      yMax: opts.maxY,
+      xMin: opts.minX,
+      xMax: opts.maxX,
+      yLabel: opts.yLabel || '',
+      xLabel: opts.xLabel || '',
+    }),
+  });
+}
+
+function drawMultiScatterChart(ctx, series, opts = {}) {
+  const canvas = ctx?.canvas ?? ctx;
+  if (!canvas?.id || typeof Chart === 'undefined') return null;
+  return renderChart(canvas.id, {
+    type: 'line',
+    data: {
+      datasets: series.map((ser, index) => ({
+        label: ser.label,
+        data: ser.points,
+        borderColor: ser.color || SERIES_PALETTE[index % SERIES_PALETTE.length],
+        backgroundColor: ser.color || SERIES_PALETTE[index % SERIES_PALETTE.length],
+        fill: false,
+        pointRadius: 0,
+        pointHoverRadius: 0,
+      })),
+    },
+    options: chartBaseOptions({
+      showLegend: series.length > 1,
+      yMin: opts.minY,
+      yMax: opts.maxY,
+      xMin: opts.minX,
+      xMax: opts.maxX,
+      yLabel: opts.yLabel || '',
+      xLabel: opts.xLabel || '',
+    }),
   });
 }
 
@@ -1044,7 +1247,7 @@ function renderOverview() {
     const egCtx = clearCanvas('chart-egress-time');
     if (egCtx) {
       const data = DATA.egress.map(e => [e.timestamp_ms, e.bytes]);
-      drawScatter(egCtx, data, COLORS.accent);
+      drawLineChart(egCtx, data, COLORS.accent, { label: 'Egress Bytes' });
     }
 
     // Flow duration distribution
@@ -1110,26 +1313,42 @@ function renderPerformance() {
   setTimeout(() => {
     const rttCtx = clearCanvas('chart-rtt');
     if (rttCtx) {
-      const data = DATA.snapshots.filter(s=>s.rtt_ms!=null&&s.rtt_ms<333).map(s=>[s.timestamp_ms, s.rtt_ms]);
-      if (data.length) drawLineChart(rttCtx, data, COLORS.green);
+      const series = buildGroupedSeries(
+        DATA.snapshots,
+        s => (s.rtt_ms != null && s.rtt_ms < 333 ? s.rtt_ms : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(rttCtx, series, { yLabel: 'ms' });
     }
 
     const pacCtx = clearCanvas('chart-pacing');
     if (pacCtx) {
-      const data = DATA.egress.filter(e=>e.pacing_delay_ms>0).map(e=>[e.timestamp_ms, e.pacing_delay_ms]);
-      if (data.length) drawScatter(pacCtx, data, COLORS.yellow);
+      const series = buildGroupedSeries(
+        DATA.egress,
+        e => (e.pacing_delay_ms > 0 ? e.pacing_delay_ms : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiScatterChart(pacCtx, series, { yLabel: 'ms' });
     }
 
     const qCtx = clearCanvas('chart-queue');
     if (qCtx) {
-      const data = DATA.snapshots.filter(s=>s.queued_stream_bytes!=null).map(s=>[s.timestamp_ms, s.queued_stream_bytes]);
-      if (data.length) drawLineChart(qCtx, data, COLORS.purple);
+      const series = buildGroupedSeries(
+        DATA.snapshots,
+        s => (s.queued_stream_bytes != null ? s.queued_stream_bytes : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(qCtx, series, { yLabel: 'bytes' });
     }
 
     const sCtx = clearCanvas('chart-streams');
     if (sCtx) {
-      const data = DATA.snapshots.filter(s=>s.active_streams!=null).map(s=>[s.timestamp_ms, s.active_streams]);
-      if (data.length) drawLineChart(sCtx, data, COLORS.accent);
+      const series = buildGroupedSeries(
+        DATA.snapshots,
+        s => (s.active_streams != null ? s.active_streams : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(sCtx, series, { yLabel: 'streams' });
     }
   }, 20);
 }
@@ -1647,20 +1866,32 @@ function renderScheduler() {
 
     const qCtx = clearCanvas('chart-sched-queue');
     if (qCtx && snaps.length) {
-      const data = snaps.filter(s=>s.queued_stream_bytes!=null).map(s=>[s.timestamp_ms, s.queued_stream_bytes]);
-      if (data.length) drawLineChart(qCtx, data, COLORS.yellow);
+      const series = buildGroupedSeries(
+        snaps,
+        s => (s.queued_stream_bytes != null ? s.queued_stream_bytes : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(qCtx, series, { yLabel: 'bytes' });
     }
 
     const ifCtx = clearCanvas('chart-inflight');
     if (ifCtx && snaps.length) {
-      const data = snaps.filter(s=>s.inflight_messages!=null).map(s=>[s.timestamp_ms, s.inflight_messages]);
-      if (data.length) drawLineChart(ifCtx, data, COLORS.green);
+      const series = buildGroupedSeries(
+        snaps,
+        s => (s.inflight_messages != null ? s.inflight_messages : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(ifCtx, series, { yLabel: 'messages' });
     }
 
     const asCtx = clearCanvas('chart-active-seq');
     if (asCtx && snaps.length) {
-      const data = snaps.filter(s=>s.active_sequences!=null).map(s=>[s.timestamp_ms, s.active_sequences]);
-      if (data.length) drawLineChart(asCtx, data, COLORS.accent);
+      const series = buildGroupedSeries(
+        snaps,
+        s => (s.active_sequences != null ? s.active_sequences : null),
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(asCtx, series, { yLabel: 'sequences' });
     }
   }, 20);
 }
