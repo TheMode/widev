@@ -185,6 +185,18 @@ pub enum TraceEvent {
         timestamp_ms: f64,
         client_id: ClientId,
     },
+    SessionSnapshot {
+        timestamp_ms: f64,
+        client_id: ClientId,
+        established: bool,
+        rtt_ms: Option<f64>,
+        queued_stream_bytes: usize,
+        inflight_messages: usize,
+        active_streams: usize,
+        active_sequences: usize,
+        pending_pings: usize,
+        send_quantum: usize,
+    },
     FlowRegistered {
         timestamp_ms: f64,
         client_id: ClientId,
@@ -308,6 +320,7 @@ impl TraceEvent {
     fn client_id(&self) -> ClientId {
         match self {
             Self::SessionStart { client_id, .. }
+            | Self::SessionSnapshot { client_id, .. }
             | Self::FlowRegistered { client_id, .. }
             | Self::DependencyDeclared { client_id, .. }
             | Self::SchedulerEvent { client_id, .. }
@@ -330,6 +343,7 @@ impl TraceEvent {
     fn timestamp_ms(&self) -> f64 {
         match self {
             Self::SessionStart { timestamp_ms, .. }
+            | Self::SessionSnapshot { timestamp_ms, .. }
             | Self::FlowRegistered { timestamp_ms, .. }
             | Self::DependencyDeclared { timestamp_ms, .. }
             | Self::SchedulerEvent { timestamp_ms, .. }
@@ -1249,25 +1263,20 @@ impl SessionTracer {
         if !self.tracer.enabled() {
             return;
         }
-        self.emitter.emit_scheduler_event(
-            None,
-            "snapshot",
-            None,
-            Some(snapshot.inflight_messages),
-            Some(format!(
-                "established={} active_streams={} active_sequences={} pending_pings={} send_quantum={} queued_stream_bytes={} rtt_ms={}",
-                snapshot.established,
-                snapshot.active_streams,
-                snapshot.active_sequences,
-                snapshot.pending_pings,
-                snapshot.send_quantum,
-                snapshot.queued_stream_bytes,
-                snapshot.rtt_ms.map(|value| format!("{value:.2}")).unwrap_or_else(|| "none".to_string())
-            )),
-            None,
-            None,
-            None,
-        );
+        let timestamp_ms = self.emitter.now_ms();
+        let client_id = self.emitter.client_id;
+        self.emitter.emit(TraceEvent::SessionSnapshot {
+            timestamp_ms,
+            client_id,
+            established: snapshot.established,
+            rtt_ms: snapshot.rtt_ms,
+            queued_stream_bytes: snapshot.queued_stream_bytes,
+            inflight_messages: snapshot.inflight_messages,
+            active_streams: snapshot.active_streams,
+            active_sequences: snapshot.active_sequences,
+            pending_pings: snapshot.pending_pings,
+            send_quantum: snapshot.send_quantum,
+        });
     }
 
     fn finish_flow(&mut self, flow_id: u64, outcome: DeliveryOutcome, detail: Option<String>) {
@@ -1492,6 +1501,7 @@ fn event_flow_ids(event: &TraceEvent) -> Vec<u64> {
         | TraceEvent::DeliveryEvent { flow_id: Some(flow_id), .. } => vec![*flow_id],
         TraceEvent::QuicEgress { flow_ids, .. } => flow_ids.clone(),
         TraceEvent::SessionStart { .. }
+        | TraceEvent::SessionSnapshot { .. }
         | TraceEvent::SchedulerEvent { flow_id: None, .. }
         | TraceEvent::DeliveryEvent { flow_id: None, .. }
         | TraceEvent::RxEvent { .. } => Vec::new(),
@@ -1631,6 +1641,31 @@ impl TraceRenderer {
         match event {
             TraceEvent::SessionStart { timestamp_ms, client_id } => {
                 vec![format!("[T+{}ms] client={client_id} session_start", fmt_ms(*timestamp_ms))]
+            },
+            TraceEvent::SessionSnapshot {
+                timestamp_ms,
+                client_id,
+                established,
+                rtt_ms,
+                queued_stream_bytes,
+                inflight_messages,
+                active_streams,
+                active_sequences,
+                pending_pings,
+                send_quantum,
+            } => {
+                vec![format!(
+                    "[T+{}ms] client={client_id} session_snapshot established={} rtt_ms={} queued_stream_bytes={} inflight_messages={} active_streams={} active_sequences={} pending_pings={} send_quantum={}",
+                    fmt_ms(*timestamp_ms),
+                    established,
+                    rtt_ms.map(|value| format!("{value:.2}")).unwrap_or_else(|| "none".to_string()),
+                    queued_stream_bytes,
+                    inflight_messages,
+                    active_streams,
+                    active_sequences,
+                    pending_pings,
+                    send_quantum
+                )]
             },
             TraceEvent::SchedulerEvent {
                 timestamp_ms,
@@ -1983,7 +2018,9 @@ impl TraceRenderer {
                     detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()
                 ))
             },
-            TraceEvent::SessionStart { .. } | TraceEvent::RxEvent { .. } => {
+            TraceEvent::SessionStart { .. }
+            | TraceEvent::SessionSnapshot { .. }
+            | TraceEvent::RxEvent { .. } => {
                 if verbose {
                     None
                 } else {

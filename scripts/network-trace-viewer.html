@@ -685,23 +685,11 @@ function parseNDJSON(text) {
 // ============================================================
 // DATA PROCESSING
 // ============================================================
-function parseSnapshot(cmd) {
-  if (!cmd) return {};
-  const obj = {};
-  const parts = cmd.split(' ');
-  for (const p of parts) {
-    const [k, v] = p.split('=');
-    obj[k] = isNaN(v) ? v : parseFloat(v);
-  }
-  return obj;
-}
-
 function buildData() {
   DATA.allEvents = RAW;
   DATA.clients = new Set(RAW.filter(e => e.client_id != null).map(e => e.client_id));
 
   const flowMap = {};
-  const deliveries = {};
   const flowAttempts = {}; // flow_id -> datagram attempt
   const flowResults = {};  // flow_id -> datagram result
   DATA.egress = [];
@@ -732,17 +720,12 @@ function buildData() {
         flowMap[ev.flow_id].retry_count = ev.retry_count ?? 0;
         flowMap[ev.flow_id].retry_reason = ev.retry_reason ?? null;
       }
-      deliveries[ev.flow_id] = ev;
     } else if (ev.event === 'quic_egress') {
       DATA.egress.push(ev);
     } else if (ev.event === 'rx_event') {
       DATA.rx.push(ev);
-    } else if (ev.event === 'scheduler_event' && ev.action === 'snapshot') {
-      const snap = parseSnapshot(ev.command);
-      snap.timestamp_ms = ev.timestamp_ms;
-      snap.client_id = ev.client_id;
-      snap.queue_depth = ev.queue_depth;
-      DATA.snapshots.push(snap);
+    } else if (ev.event === 'session_snapshot') {
+      DATA.snapshots.push(ev);
     } else if (ev.event === 'scheduler_event') {
       DATA.schedulerEvents.push(ev);
     } else if (ev.event === 'datagram_attempt') {
@@ -1408,8 +1391,12 @@ function renderOverview() {
     // Egress bytes over time
     const egCtx = clearCanvas('chart-egress-time');
     if (egCtx) {
-      const data = DATA.egress.map(e => [e.timestamp_ms, e.bytes]);
-      drawLineChart(egCtx, data, COLORS.accent, { label: 'Egress Bytes' });
+      const series = buildGroupedSeries(
+        DATA.egress,
+        e => e.bytes,
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiLineChart(egCtx, series, { yLabel: 'bytes' });
     }
 
     // Flow duration distribution
@@ -1666,6 +1653,9 @@ function kv(k, v) {
 }
 
 function eventSummary(ev) {
+  if (ev.event === 'session_snapshot') {
+    return snapshotSummary(ev);
+  }
   if (ev.event === 'scheduler_event') return `${ev.action}${ev.queue_name?` q=${ev.queue_name}`:''}${ev.reason?` r=${ev.reason}`:''}`;
   if (ev.event === 'delivery_event') return `${ev.outcome} terminal=${ev.terminal} retries=${ev.retry_count ?? 0}${ev.retry_reason ? ` reason=${ev.retry_reason}` : ''}`;
   if (ev.event === 'transport_selected') return `route=${ev.route} eligible=${ev.eligible}`;
@@ -1678,6 +1668,15 @@ function eventSummary(ev) {
   }
   if (ev.event === 'quic_egress') return `${ev.bytes}B → ${ev.destination}`;
   return JSON.stringify(ev).slice(0,80);
+}
+
+function snapshotSummary(snap) {
+  const rtt = snap.rtt_ms != null ? `${Number(snap.rtt_ms).toFixed(2)}ms` : '—';
+  const queue = snap.queued_stream_bytes != null ? fmtBytes(snap.queued_stream_bytes) : '—';
+  const inflight = snap.inflight_messages ?? '—';
+  const streams = snap.active_streams ?? '—';
+  const sequences = snap.active_sequences ?? '—';
+  return `established=${!!snap.established} rtt=${rtt} queue=${queue} inflight=${inflight} streams=${streams} seq=${sequences}`;
 }
 
 // ============================================================
@@ -2374,8 +2373,12 @@ function renderEgress() {
   setTimeout(() => {
     const scCtx = clearCanvas('chart-egress-scatter');
     if (scCtx) {
-      const data = eg.map(e => [e.timestamp_ms, e.bytes]);
-      drawScatter(scCtx, data, COLORS.accent, { pad:{t:10,r:10,b:30,l:55} });
+      const series = buildGroupedSeries(
+        eg,
+        e => e.bytes,
+        { labelFn: clientId => `Client ${clientId}` }
+      );
+      if (series.length) drawMultiScatterChart(scCtx, series, { yLabel: 'bytes' });
     }
 
     const histCtx = clearCanvas('chart-egress-hist');
@@ -2564,11 +2567,17 @@ function renderScheduler() {
   const queues = snaps.map(s => s.queued_stream_bytes || 0);
   const maxInflight = Math.max(...inflights, 0);
   const avgInflight = inflights.length ? inflights.reduce((a,b)=>a+b,0)/inflights.length : 0;
+  const established = snaps.filter(s => s.established).length;
+  const latest = snaps[snaps.length - 1] || null;
+  const avgQueue = queues.length ? queues.reduce((a,b)=>a+b,0)/queues.length : 0;
 
   document.getElementById('sched-stats').innerHTML = statsHtml([
     { label: 'Snapshots', value: snaps.length },
+    { label: 'Established', value: established, sub: snaps.length ? `${((established/snaps.length)*100).toFixed(0)}%` : '—' },
     { label: 'Max Inflight', value: maxInflight, cls: maxInflight > 5 ? 'red' : '' },
     { label: 'Avg Inflight', value: avgInflight.toFixed(2) },
+    { label: 'Avg Queue', value: fmtBytes(Math.round(avgQueue)) },
+    { label: 'Latest RTT', value: latest?.rtt_ms != null ? `${latest.rtt_ms.toFixed(2)}ms` : '—' },
     { label: 'Other Events', value: DATA.schedulerEvents.length },
   ]);
 
@@ -2646,7 +2655,7 @@ function outcomeCls(o) {
 }
 function eventTypeCls(e) {
   const map = {
-    flow_registered:'blue', delivery_event:'green', scheduler_event:'purple',
+    flow_registered:'blue', delivery_event:'green', scheduler_event:'purple', session_snapshot:'accent',
     quic_egress:'accent', rx_event:'yellow', session_start:'gray',
     datagram_attempt:'yellow', datagram_result:'yellow', stream_write:'blue',
     stream_backpressure:'yellow',
