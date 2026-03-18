@@ -37,11 +37,11 @@
 //!         DropMessage    DispatchMessage   CloseSequence   DispatchMessage
 //! ```
 //!
-//! ## Order Domains
+//! ## Ordering
 //!
-//! Messages belong to order domains that constrain dispatch order:
-//! - **Independent**: No ordering constraints
-//! - **Sequence(Uuid)**: Must dispatch in order within same sequence_id
+//! Messages belong to ordering categories that constrain dispatch order:
+//! - **Independent/Dependency**: No sequence ordering constraints
+//! - **Sequence/SequenceEnd(Uuid)**: Must dispatch in order within same sequence_id
 //!
 //! ## Priority Policies
 //!
@@ -80,12 +80,6 @@ use crate::packets::{
     DeliveryPolicy, DropReason, MessageId, PacketMeta, PacketOrder, PacketPriority, RetryReason,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr)]
-pub enum OrderDomain {
-    Independent,
-    Sequence(Uuid),
-}
-
 #[derive(Clone)]
 pub struct DispatchMessage {
     pub kind: DispatchKind,
@@ -114,10 +108,6 @@ impl DispatchMessage {
 
     pub fn priority(&self) -> PacketPriority {
         self.meta.priority
-    }
-
-    pub fn domain(&self) -> OrderDomain {
-        domain_for_order(self.meta.order)
     }
 
     pub fn payload_len(&self) -> usize {
@@ -366,14 +356,14 @@ impl PacketScheduler {
         let scheduled = ScheduledMessage::new(message, now);
         self.trace_events.push(SchedulerTraceEvent::RequeuedCongestion {
             trace: scheduled.message.trace().clone(),
-            queued_messages: self.queue_len_for_domain(scheduled.message.domain()) + 1,
+            queued_messages: self.queue_len_for_order(scheduled.message.order()) + 1,
             reason,
         });
-        match scheduled.message.domain() {
-            OrderDomain::Independent => {
+        match scheduled.message.order() {
+            PacketOrder::Independent | PacketOrder::Dependency(_) => {
                 self.pending_independent.push_front(scheduled);
             },
-            OrderDomain::Sequence(sequence_id) => {
+            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
                 self.pending_sequences.entry(sequence_id).or_default().push_front(scheduled);
             },
         }
@@ -418,11 +408,11 @@ impl PacketScheduler {
             return vec![SchedulerAction::DispatchMessage { message, force_flush: false }];
         }
 
-        let queued_messages = self.queue_len_for_domain(message.domain()) + 1;
+        let queued_messages = self.queue_len_for_order(message.order()) + 1;
         self.trace_events.push(SchedulerTraceEvent::DeferredInitial {
             trace: message.trace().clone(),
             policy: message.priority().into(),
-            queue_name: message.domain().into(),
+            queue_name: order_to_queue_name(message.order()),
             queued_messages,
         });
 
@@ -485,20 +475,20 @@ impl PacketScheduler {
 
     fn enqueue_message(&mut self, message: DispatchMessage, now: Instant) {
         let scheduled = ScheduledMessage::new(message, now);
-        match scheduled.message.domain() {
-            OrderDomain::Independent => {
+        match scheduled.message.order() {
+            PacketOrder::Independent | PacketOrder::Dependency(_) => {
                 self.pending_independent.push_back(scheduled);
             },
-            OrderDomain::Sequence(sequence_id) => {
+            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
                 self.pending_sequences.entry(sequence_id).or_default().push_back(scheduled);
             },
         }
     }
 
-    fn queue_len_for_domain(&self, domain: OrderDomain) -> usize {
-        match domain {
-            OrderDomain::Independent => self.pending_independent.len(),
-            OrderDomain::Sequence(sequence_id) => {
+    fn queue_len_for_order(&self, order: PacketOrder) -> usize {
+        match order {
+            PacketOrder::Independent | PacketOrder::Dependency(_) => self.pending_independent.len(),
+            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
                 self.pending_sequences.get(&sequence_id).map(|q| q.len()).unwrap_or(0)
             },
         }
@@ -532,7 +522,7 @@ impl PacketScheduler {
                     self.trace_events.push(SchedulerTraceEvent::Dropped {
                         trace: scheduled.message.trace().clone(),
                         reason: DropReason::ExpiredDeadline,
-                        queue_name: scheduled.message.domain().into(),
+                        queue_name: order_to_queue_name(scheduled.message.order()),
                     });
                     actions.push(SchedulerAction::DropMessage {
                         message: scheduled.message,
@@ -546,7 +536,7 @@ impl PacketScheduler {
                     self.trace_events.push(SchedulerTraceEvent::DispatchReady {
                         trace: scheduled.message.trace().clone(),
                         force_flush,
-                        queue_name: scheduled.message.domain().into(),
+                        queue_name: order_to_queue_name(scheduled.message.order()),
                     });
                     actions.push(SchedulerAction::DispatchMessage {
                         message: scheduled.message,
@@ -558,12 +548,10 @@ impl PacketScheduler {
     }
 }
 
-pub fn domain_for_order(order: PacketOrder) -> OrderDomain {
+fn order_to_queue_name(order: PacketOrder) -> &'static str {
     match order {
-        PacketOrder::Independent | PacketOrder::Dependency(_) => OrderDomain::Independent,
-        PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
-            OrderDomain::Sequence(sequence_id)
-        },
+        PacketOrder::Independent | PacketOrder::Dependency(_) => "independent",
+        PacketOrder::Sequence(_) | PacketOrder::SequenceEnd(_) => "sequence",
     }
 }
 
