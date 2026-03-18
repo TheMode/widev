@@ -4387,6 +4387,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smol",
+ "strum",
  "taffy",
  "wgpu",
  "wincode",
