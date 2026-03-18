@@ -199,6 +199,14 @@
   /* ---- RX detail cell ---- */
   td.detail-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
   td.summary-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; color: var(--text3); }
+
+  /* ---- Lineage ---- */
+  #ln-scroll { flex: 1; overflow: auto; background: var(--bg); }
+  #ln-svg { display: block; }
+  .chain-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; margin-bottom: 4px; background: var(--surface2); color: var(--text); cursor: pointer; font-size: 11px; border: 1px solid transparent; }
+  .chain-row:hover { border-color: var(--border2); }
+  .chain-row-id { color: var(--text3); font-family: var(--mono); flex-shrink: 0; }
+  .chain-row-label { color: var(--text2); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -228,6 +236,9 @@
         <div class="nav-label">Flows</div>
         <div class="nav-item" data-view="flows">
           <span>⇌</span> Flow Table <span class="badge" id="badge-flows">—</span>
+        </div>
+        <div class="nav-item" data-view="lineage">
+          <span>⧖</span> Lineage <span class="badge" id="badge-lineage">—</span>
         </div>
         <div class="nav-item" data-view="timeline">
           <span>▬</span> Timeline
@@ -375,6 +386,37 @@
             </table>
           </div>
           <div class="detail-panel" id="flow-detail"></div>
+        </div>
+      </div>
+
+      <!-- LINEAGE -->
+      <div id="view-lineage" class="view">
+        <div class="view-header">
+          <span class="view-title">Flow Lineage</span>
+          <span class="view-sub" id="ln-sub"></span>
+        </div>
+        <div class="toolbar">
+          <select class="tb-select" id="ln-filter-client">
+            <option value="">All Clients</option>
+          </select>
+          <select class="tb-select" id="ln-filter-kind">
+            <option value="">All Kinds</option>
+            <option value="envelope">Envelope</option>
+            <option value="resource">Resource</option>
+            <option value="datagram">Datagram</option>
+          </select>
+          <button class="tb-btn active" id="ln-orphan-toggle">Show independent</button>
+          <label class="tb-label">
+            Zoom
+            <input type="range" id="ln-zoom" min="10" max="120" value="40" step="5" style="width:80px;margin-left:6px">
+          </label>
+          <button class="tb-btn" id="ln-reset">Reset</button>
+        </div>
+        <div class="split-view" style="flex:1;overflow:hidden">
+          <div id="ln-scroll">
+            <svg id="ln-svg"></svg>
+          </div>
+          <div class="detail-panel" id="ln-detail"></div>
         </div>
       </div>
 
@@ -578,6 +620,13 @@ let RAW = [];
 let DATA = {
   flows: [],        // enriched flow objects
   flowMap: {},      // flow_id -> flow
+  lineage: {
+    connected: [],
+    orphans: [],
+    depMap: {},
+    childMap: {},
+    edgeTypeMap: {},
+  },
   egress: [],
   datagrams: [],    // paired attempt+result
   rx: [],
@@ -585,6 +634,16 @@ let DATA = {
   schedulerEvents: [],
   allEvents: [],
   clients: new Set(),
+};
+
+let LINEAGE_STATE = {
+  selectedId: null,
+  client: '',
+  kind: '',
+  showOrphans: true,
+  timeScale: 40,
+  zoomTimer: null,
+  lastLayout: null,
 };
 
 // ============================================================
@@ -711,20 +770,86 @@ function buildData() {
 
   DATA.flows = Object.values(flowMap);
   DATA.flowMap = flowMap;
+  DATA.lineage = buildLineageData(DATA.flows);
 
   // header stats
   document.getElementById('header-stats').textContent =
     `${RAW.length.toLocaleString()} events · ${DATA.flows.length.toLocaleString()} flows · ${DATA.clients.size} client(s)`;
   document.getElementById('badge-flows').textContent = DATA.flows.length;
+  document.getElementById('badge-lineage').textContent = DATA.flows.length;
   document.getElementById('badge-datagrams').textContent = DATA.datagrams.length;
   document.getElementById('badge-events').textContent = RAW.length.toLocaleString();
   document.getElementById('badge-rx').textContent = DATA.rx.length;
 }
 
+function buildLineageData(flows) {
+  const depSets = {};
+  const childSets = {};
+  const edgeTypeMap = {};
+  const byMessageId = new Map();
+  const bySequence = new Map();
+
+  const ensure = flowId => {
+    depSets[flowId] ||= new Set();
+    childSets[flowId] ||= new Set();
+    edgeTypeMap[flowId] ||= {};
+  };
+  const addEdge = (childId, parentId, type) => {
+    if (parentId == null || parentId === childId) return;
+    ensure(childId);
+    ensure(parentId);
+    depSets[childId].add(parentId);
+    childSets[parentId].add(childId);
+    edgeTypeMap[childId][parentId] =
+      edgeTypeMap[childId][parentId] === 'explicit' ? 'explicit' : type;
+  };
+
+  flows.forEach(flow => {
+    ensure(flow.flow_id);
+    flow.deps = [];
+    if (flow.message_id != null) byMessageId.set(String(flow.message_id), flow.flow_id);
+    if (flow.sequence_id) {
+      const key = `${flow.client_id}:${flow.sequence_id}`;
+      const group = bySequence.get(key) || [];
+      group.push(flow);
+      bySequence.set(key, group);
+    }
+  });
+
+  flows.forEach(flow => {
+    if (flow.dependency_label) {
+      addEdge(flow.flow_id, byMessageId.get(String(flow.dependency_label)), 'explicit');
+    }
+  });
+
+  bySequence.forEach(group => {
+    group
+      .sort((a, b) => (a.start_ms ?? 0) - (b.start_ms ?? 0) || a.flow_id - b.flow_id)
+      .forEach((flow, index) => {
+        if (index > 0) addEdge(flow.flow_id, group[index - 1].flow_id, 'sequence');
+      });
+  });
+
+  const depMap = {};
+  const childMap = {};
+  const connected = [];
+  const orphans = [];
+  flows.forEach(flow => {
+    const deps = [...(depSets[flow.flow_id] || [])];
+    const children = [...(childSets[flow.flow_id] || [])];
+    depMap[flow.flow_id] = deps;
+    childMap[flow.flow_id] = children;
+    flow.deps = deps;
+    (deps.length || children.length ? connected : orphans).push(flow);
+  });
+
+  return { connected, orphans, depMap, childMap, edgeTypeMap };
+}
+
 function populateFilters() {
   const clients = [...DATA.clients].sort((a,b)=>a-b);
 
-  for (const selId of ['flow-filter-client','tl-filter-client','el-filter-client']) {
+  for (const selId of ['flow-filter-client','tl-filter-client','el-filter-client','ln-filter-client']) {
     const sel = document.getElementById(selId);
     sel.innerHTML = '<option value="">All Clients</option>';
     clients.forEach(c => sel.innerHTML += `<option value="${c}">Client ${c}</option>`);
@@ -768,6 +893,7 @@ function renderView(name) {
   if (name === 'overview') renderOverview();
   else if (name === 'performance') renderPerformance();
   else if (name === 'flows') renderFlows();
+  else if (name === 'lineage') renderLineage();
   else if (name === 'timeline') renderTimeline();
   else if (name === 'bottleneck') renderBottleneck();
   else if (name === 'egress') renderEgress();
@@ -1626,6 +1752,563 @@ function renderTimeline() {
   document.getElementById(id).addEventListener('change', renderTimeline);
 });
 document.getElementById('tl-show-incomplete').addEventListener('change', renderTimeline);
+
+// ============================================================
+// LINEAGE
+// ============================================================
+const LINEAGE_LAYOUT = {
+  PAD_LEFT: 48,
+  PAD_RIGHT: 24,
+  PAD_TOP: 40,
+  PAD_BOTTOM: 32,
+  NODE_W: 148,
+  COL_GAP: 16,
+  DIVIDER_GAP: 24,
+  BREATHING_MS: 0.15,
+  GAP_THRESHOLD_MS: 8,
+  GAP_COLLAPSED_PX: 16,
+  MIN_FLOW_STEP_PX: 72,
+  SEPARATOR_CLEARANCE_PX: 18,
+};
+
+function lineageEl(id) {
+  return document.getElementById(id);
+}
+
+function renderLineage() {
+  const layout = buildLineageLayout();
+  const svg = lineageEl('ln-svg');
+  const detail = lineageEl('ln-detail');
+  LINEAGE_STATE.lastLayout = layout;
+  lineageEl('ln-orphan-toggle').classList.toggle('active', LINEAGE_STATE.showOrphans);
+
+  if (!layout.visible.length) return showLineageEmpty('No flows match the current filters');
+  if (!layout.rendered.length) {
+    return showLineageEmpty(`${layout.visible.length} visible · ${layout.orphans.length} independent hidden`);
+  }
+
+  lineageEl('ln-sub').textContent =
+    `${layout.visible.length} visible · ${layout.connected.length} connected · ${layout.orphans.length} independent`;
+  svg.setAttribute('width', layout.svgWidth);
+  svg.setAttribute('height', layout.svgHeight);
+  svg.setAttribute('viewBox', `0 0 ${layout.svgWidth} ${layout.svgHeight}`);
+  svg.innerHTML = buildLineageSvg(layout);
+
+  if (LINEAGE_STATE.selectedId != null) {
+    renderLineageDetail(LINEAGE_STATE.selectedId, layout.graph);
+  } else {
+    detail.classList.remove('open');
+    detail.innerHTML = '';
+  }
+}
+
+function buildLineageLayout() {
+  const visible = getVisibleLineageFlows();
+  const visibleIds = new Set(visible.map(flow => flow.flow_id));
+  if (LINEAGE_STATE.selectedId != null && !visibleIds.has(LINEAGE_STATE.selectedId)) LINEAGE_STATE.selectedId = null;
+
+  const graph = projectLineageGraph(visible);
+  assignLineageColumns(graph.connected, graph.edgeTypeMap);
+  assignLineageColumns(graph.orphans, {});
+
+  const showOrphans = LINEAGE_STATE.showOrphans && graph.orphans.length > 0;
+  const rendered = showOrphans ? visible.slice() : graph.connected.slice();
+  const renderedIds = new Set(rendered.map(flow => flow.flow_id));
+  if (LINEAGE_STATE.selectedId != null && !renderedIds.has(LINEAGE_STATE.selectedId)) LINEAGE_STATE.selectedId = null;
+  if (!rendered.length) return { visible, rendered, connected: graph.connected, orphans: graph.orphans, graph };
+
+  const minT = Math.min(...rendered.map(flow => flow.start_ms ?? 0));
+  const maxEnd = Math.max(...rendered.map(lineageFlowEnd));
+  const connectedCols = maxLineageColumn(graph.connected);
+  const orphanCols = maxLineageColumn(graph.orphans);
+  const connectedWidth = connectedCols
+    ? LINEAGE_LAYOUT.PAD_LEFT + connectedCols * (LINEAGE_LAYOUT.NODE_W + LINEAGE_LAYOUT.COL_GAP) - LINEAGE_LAYOUT.COL_GAP
+    : LINEAGE_LAYOUT.PAD_LEFT + LINEAGE_LAYOUT.NODE_W;
+  const orphanBaseX = connectedWidth + LINEAGE_LAYOUT.DIVIDER_GAP;
+  const timeline = buildLineageTimeline(rendered, minT);
+  const svgWidth = showOrphans && orphanCols
+    ? orphanBaseX + orphanCols * (LINEAGE_LAYOUT.NODE_W + LINEAGE_LAYOUT.COL_GAP) - LINEAGE_LAYOUT.COL_GAP + LINEAGE_LAYOUT.PAD_RIGHT
+    : connectedWidth + LINEAGE_LAYOUT.PAD_RIGHT;
+
+  return {
+    visible,
+    rendered,
+    connected: graph.connected,
+    orphans: graph.orphans,
+    graph,
+    minT,
+    maxEnd,
+    connectedWidth,
+    showOrphans,
+    svgWidth,
+    svgHeight: timeline.maxY + LINEAGE_LAYOUT.PAD_BOTTOM,
+    timeline,
+    nodes: buildLineageNodeBoxes(rendered, graph.connected, graph.orphans, timeline.nodeMap, orphanBaseX),
+  };
+}
+
+function showLineageEmpty(subtitle) {
+  const svg = lineageEl('ln-svg');
+  const detail = lineageEl('ln-detail');
+  svg.setAttribute('width', 640);
+  svg.setAttribute('height', 240);
+  svg.innerHTML = '';
+  detail.classList.remove('open');
+  detail.innerHTML = '';
+  lineageEl('ln-sub').textContent = subtitle;
+}
+
+function getVisibleLineageFlows() {
+  return DATA.flows.filter(flow => {
+    if (LINEAGE_STATE.client && String(flow.client_id) !== String(LINEAGE_STATE.client)) return false;
+    if (LINEAGE_STATE.kind && flow.kind !== LINEAGE_STATE.kind) return false;
+    return true;
+  });
+}
+
+function projectLineageGraph(flows) {
+  const ids = new Set(flows.map(flow => flow.flow_id));
+  const depMap = {};
+  const childMap = {};
+  const edgeTypeMap = {};
+  const connected = [];
+  const orphans = [];
+
+  flows.forEach(flow => {
+    const deps = (DATA.lineage.depMap[flow.flow_id] || []).filter(id => ids.has(id));
+    depMap[flow.flow_id] = deps;
+    childMap[flow.flow_id] = (DATA.lineage.childMap[flow.flow_id] || []).filter(id => ids.has(id));
+    edgeTypeMap[flow.flow_id] = Object.fromEntries(
+      deps.map(depId => [depId, DATA.lineage.edgeTypeMap?.[flow.flow_id]?.[depId] || 'explicit'])
+    );
+    (deps.length || childMap[flow.flow_id].length ? connected : orphans).push(flow);
+  });
+
+  return { depMap, childMap, edgeTypeMap, connected, orphans };
+}
+
+function maxLineageColumn(flows) {
+  return flows.length ? Math.max(...flows.map(flow => (flow._col || 0) + 1)) : 0;
+}
+
+function assignLineageColumns(flows, edgeTypeMap) {
+  const colEnds = [];
+  const byId = new Map(flows.map(flow => [flow.flow_id, flow]));
+  flows
+    .sort((a, b) => (a.start_ms ?? 0) - (b.start_ms ?? 0) || a.flow_id - b.flow_id)
+    .forEach(flow => {
+      const start = flow.start_ms ?? 0;
+      const end = lineageFlowEnd(flow);
+      const seqParentId = (flow.deps || []).find(depId => edgeTypeMap?.[flow.flow_id]?.[depId] === 'sequence');
+      const seqParent = seqParentId != null ? byId.get(seqParentId) : null;
+      let col = -1;
+      if (seqParent && seqParent._col != null) {
+        col = seqParent._col;
+      }
+      if (col === -1) col = colEnds.findIndex(lastEnd => lastEnd <= start - LINEAGE_LAYOUT.BREATHING_MS);
+      if (col === -1) col = colEnds.length;
+      flow._col = col;
+      colEnds[col] = seqParent && seqParent._col === col ? Math.max(colEnds[col] ?? -Infinity, end) : end;
+    });
+}
+
+function buildLineageTimeline(flows, minT) {
+  const placed = placeLineageFlows(flows, minT);
+  const merged = buildLineageIntervals(flows, minT);
+  const compressions = [];
+  const separators = [];
+  let shift = 0;
+
+  for (let i = 1; i < placed.length; i++) {
+    const prev = placed[i - 1];
+    const next = placed[i];
+    const prevBottom = prev.rawY - shift + prev.height;
+    const nextTop = next.rawY - shift;
+    const gapPx = nextTop - prevBottom;
+    const gapMs = next.startRel - prev.endRel;
+    const targetGap = LINEAGE_LAYOUT.GAP_COLLAPSED_PX + LINEAGE_LAYOUT.SEPARATOR_CLEARANCE_PX * 2;
+    if (gapMs <= LINEAGE_LAYOUT.GAP_THRESHOLD_MS || gapPx <= targetGap) continue;
+    const amount = gapPx - targetGap;
+    separators.push({
+      y: prevBottom + LINEAGE_LAYOUT.SEPARATOR_CLEARANCE_PX,
+      height: LINEAGE_LAYOUT.GAP_COLLAPSED_PX,
+      gapMs,
+    });
+    shift += amount;
+    compressions.push({ fromRawY: next.rawY, amount });
+  }
+
+  const shiftFor = rawY => compressions.reduce((sum, item) => sum + (rawY >= item.fromRawY ? item.amount : 0), 0);
+  const nodeMap = {};
+  let maxY = LINEAGE_LAYOUT.PAD_TOP;
+  placed.forEach(item => {
+    const y = item.rawY - shiftFor(item.rawY);
+    nodeMap[item.flowId] = { y, height: item.height };
+    maxY = Math.max(maxY, y + item.height);
+  });
+
+  return {
+    merged,
+    separators,
+    nodeMap,
+    maxY,
+    map: tRel => timeToY(tRel) - shiftFor(timeToY(tRel)),
+  };
+}
+
+function placeLineageFlows(flows, minT) {
+  const ordered = [];
+  let lastBottom = LINEAGE_LAYOUT.PAD_TOP - LINEAGE_LAYOUT.MIN_FLOW_STEP_PX;
+  flows
+    .slice()
+    .sort((a, b) => (a.start_ms ?? minT) - (b.start_ms ?? minT) || a.flow_id - b.flow_id)
+    .forEach(flow => {
+      const startRel = (flow.start_ms ?? minT) - minT;
+      const height = lineageNodeHeight(flow);
+      const rawY = Math.max(timeToY(startRel), lastBottom + LINEAGE_LAYOUT.MIN_FLOW_STEP_PX);
+      ordered.push({ flowId: flow.flow_id, startRel, endRel: lineageFlowEnd(flow) - minT, rawY, height });
+      lastBottom = rawY + height;
+    });
+  return ordered;
+}
+
+function buildLineageIntervals(flows, minT) {
+  const intervals = flows
+    .map(flow => ({ start: (flow.start_ms ?? minT) - minT, end: lineageFlowEnd(flow) - minT }))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  return intervals.reduce((merged, interval) => {
+    const last = merged[merged.length - 1];
+    if (!last || interval.start > last.end) merged.push({ ...interval });
+    else last.end = Math.max(last.end, interval.end);
+    return merged;
+  }, []);
+}
+
+function buildLineageNodeBoxes(rendered, connected, orphans, nodeMap, orphanBaseX) {
+  const connectedSet = new Set(connected.map(flow => flow.flow_id));
+  const orphanSet = new Set(orphans.map(flow => flow.flow_id));
+  return Object.fromEntries(rendered.map(flow => {
+    const x = connectedSet.has(flow.flow_id)
+      ? connectedX(flow._col || 0)
+      : orphanBaseX + (flow._col || 0) * (LINEAGE_LAYOUT.NODE_W + LINEAGE_LAYOUT.COL_GAP);
+    return [flow.flow_id, {
+      x,
+      y: nodeMap[flow.flow_id].y,
+      width: LINEAGE_LAYOUT.NODE_W,
+      height: nodeMap[flow.flow_id].height,
+      isOrphan: orphanSet.has(flow.flow_id),
+    }];
+  }));
+}
+
+function connectedX(col) {
+  return LINEAGE_LAYOUT.PAD_LEFT + col * (LINEAGE_LAYOUT.NODE_W + LINEAGE_LAYOUT.COL_GAP);
+}
+
+function timeToY(tMs) {
+  return LINEAGE_LAYOUT.PAD_TOP + tMs * LINEAGE_STATE.timeScale;
+}
+
+function lineageFlowDuration(flow) {
+  return flow.duration_ms != null ? flow.duration_ms : 0.2;
+}
+
+function lineageFlowEnd(flow) {
+  return (flow.start_ms ?? 0) + lineageFlowDuration(flow);
+}
+
+function lineageNodeHeight(flow) {
+  if (flow.duration_ms == null) return 28;
+  return Math.max(28, flow.duration_ms * LINEAGE_STATE.timeScale - 4);
+}
+
+function buildLineageSvg(layout) {
+  const activeSet = getLineageActiveSet(layout.graph.depMap, layout.graph.childMap, LINEAGE_STATE.selectedId);
+  const tickStep = pickTickInterval((layout.maxEnd - layout.minT) || 1, layout.svgHeight);
+  return [
+    `<defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"></path>
+    </marker>
+  </defs>`,
+    buildLineageGrid(layout, tickStep),
+    buildLineageSeparators(layout),
+    layout.showOrphans ? buildLineageDivider(layout) : '',
+    buildLineageEdges(layout, activeSet),
+    buildLineageNodes(layout),
+  ].join('');
+}
+
+function buildLineageGrid(layout, tickStep) {
+  const parts = [];
+  layout.timeline.merged.forEach(interval => {
+    const first = Math.ceil(interval.start / tickStep) * tickStep;
+    for (let t = first; t <= interval.end + tickStep / 2; t += tickStep) {
+      const y = layout.timeline.map(t);
+      if (y > layout.svgHeight - LINEAGE_LAYOUT.PAD_BOTTOM + 1) continue;
+      parts.push(`<line x1="${LINEAGE_LAYOUT.PAD_LEFT}" y1="${y}" x2="${layout.svgWidth - LINEAGE_LAYOUT.PAD_RIGHT}" y2="${y}" stroke="#2a2a2a" stroke-width="0.5"></line>`);
+      parts.push(`<text x="${LINEAGE_LAYOUT.PAD_LEFT - 6}" y="${y + 3}" text-anchor="end" font-family="var(--mono)" font-size="9" fill="#666">${escapeHtml(fmtLineageMs(t))}</text>`);
+    }
+  });
+  return parts.join('');
+}
+
+function buildLineageSeparators(layout) {
+  const x = LINEAGE_LAYOUT.PAD_LEFT;
+  const w = layout.svgWidth - LINEAGE_LAYOUT.PAD_LEFT - LINEAGE_LAYOUT.PAD_RIGHT;
+  return layout.timeline.separators.map(separator => {
+    const midY = separator.y + separator.height / 2;
+    return `
+      <rect x="${x}" y="${separator.y}" width="${w}" height="${separator.height}" fill="rgba(22,22,22,0.78)"></rect>
+      <line x1="${x}" y1="${separator.y}" x2="${x + w}" y2="${separator.y}" stroke="#333" stroke-width="0.5" stroke-dasharray="5 4"></line>
+      <line x1="${x}" y1="${separator.y + separator.height}" x2="${x + w}" y2="${separator.y + separator.height}" stroke="#333" stroke-width="0.5" stroke-dasharray="5 4"></line>
+      <text x="${x + w / 2}" y="${midY + 3}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="#666">+${escapeHtml(fmtLineageMs(separator.gapMs))}</text>`;
+  }).join('');
+}
+
+function buildLineageDivider(layout) {
+  const x = layout.connectedWidth + LINEAGE_LAYOUT.DIVIDER_GAP / 2;
+  return `
+    <line x1="${x}" y1="${LINEAGE_LAYOUT.PAD_TOP - 10}" x2="${x}" y2="${layout.svgHeight - LINEAGE_LAYOUT.PAD_BOTTOM}" stroke="#333" stroke-width="0.5" stroke-dasharray="5 4"></line>
+    <text x="${x}" y="18" text-anchor="middle" font-family="var(--sans)" font-size="10" letter-spacing="0.08em" fill="#eb7">INDEPENDENT</text>`;
+}
+
+function buildLineageEdges(layout, activeSet) {
+  const parts = [];
+  layout.rendered.forEach(flow => {
+    const childBox = layout.nodes[flow.flow_id];
+    (layout.graph.depMap[flow.flow_id] || []).forEach(depId => {
+      const parentBox = layout.nodes[depId];
+      if (!parentBox || !childBox) return;
+      const edgeType = layout.graph.edgeTypeMap?.[flow.flow_id]?.[depId] || 'explicit';
+      const x1 = parentBox.x + parentBox.width / 2;
+      const y1 = parentBox.y + parentBox.height;
+      const x2 = edgeType === 'sequence' ? x1 : childBox.x + childBox.width / 2;
+      const y2 = childBox.y;
+      const mid = (y1 + y2) / 2;
+      const highlighted = activeSet && activeSet.has(depId) && activeSet.has(flow.flow_id);
+      const childKind = kindColorMeta(flow.kind);
+      const path = edgeType === 'sequence'
+        ? `M ${x1} ${y1} L ${x2} ${y2}`
+        : `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`;
+      parts.push(`<path d="${path}" fill="none" stroke="${highlighted ? childKind.stroke : '#333'}" stroke-width="${highlighted ? 1.5 : 0.7}" opacity="${highlighted ? 1 : 0.6}" marker-end="url(#arrow)"></path>`);
+    });
+  });
+  return parts.join('');
+}
+
+function buildLineageNodes(layout) {
+  return layout.rendered.map(flow => {
+    const box = layout.nodes[flow.flow_id];
+    const color = kindColorMeta(flow.kind);
+    const selected = LINEAGE_STATE.selectedId === flow.flow_id;
+    const label = truncateText(flow.packet_label || `flow/${flow.flow_id}`, 18);
+    const labelY = box.y + (box.height > 36 ? 14 : Math.max(16, Math.round(box.height / 2) + 4));
+    const outcome = lineageOutcomeColor(flow.outcome);
+    const stroke = selected ? color.stroke : box.isOrphan ? color.strokeSoft : color.strokeMid;
+    const strokeWidth = selected ? 2 : 0.8;
+    const dash = selected ? '' : box.isOrphan ? ' stroke-dasharray="4 3"' : '';
+    const title = escapeHtml(`Flow ${flow.flow_id}: ${flow.packet_label}\nStart ${fmtLineageMs(flow.start_ms - layout.minT)}\nDuration ${flow.duration_ms != null ? fmtLineageMs(flow.duration_ms) : 'incomplete'}\nOutcome ${flow.outcome || 'incomplete'}`);
+    return `<g opacity="1" style="cursor:pointer" onclick="selectLineageNode(${flow.flow_id})">
+      <title>${title}</title>
+      <rect x="${box.x}" y="${box.y}" width="${box.width}" height="${box.height}" rx="5" fill="${box.isOrphan ? color.fillOrphan : color.fill}" stroke="${stroke}" stroke-width="${strokeWidth}"${dash}></rect>
+      ${flow.duration_ms > 0 ? `<rect x="${box.x + box.width - 3}" y="${box.y}" width="3" height="${box.height}" fill="${color.base}" opacity="0.2"></rect>` : ''}
+      ${flow.duration_ms == null ? `<line x1="${box.x + 6}" y1="${box.y + box.height - 1}" x2="${box.x + box.width - 6}" y2="${box.y + box.height - 1}" stroke="${stroke}" stroke-width="1" stroke-dasharray="4 3"></line>` : ''}
+      <text x="${box.x + 10}" y="${labelY}" font-family="var(--mono)" font-size="11" fill="${stroke}">${escapeHtml(label)}</text>
+      <circle cx="${box.x + box.width - 11}" cy="${box.y + 11}" r="5" fill="${outcome}"></circle>
+    </g>`;
+  }).join('');
+}
+
+function pickTickInterval(rangeMs, svgHeight) {
+  const targetTicks = Math.max(8, Math.min(10, Math.round((svgHeight - 80) / 80) || 8));
+  const raw = rangeMs / targetTicks;
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+  return steps.find(step => step >= raw) || 1000;
+}
+
+function getLineageActiveSet(depMap, childMap, selectedId) {
+  if (selectedId == null) return null;
+  const active = new Set([selectedId]);
+  walkLineage(selectedId, depMap, active);
+  walkLineage(selectedId, childMap, active);
+  return active;
+}
+
+function walkLineage(startId, graph, seen) {
+  const next = graph[startId] || [];
+  next.forEach(id => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    walkLineage(id, graph, seen);
+  });
+}
+
+function selectLineageNode(id) {
+  LINEAGE_STATE.selectedId = LINEAGE_STATE.selectedId === id ? null : id;
+  renderLineage();
+  if (LINEAGE_STATE.selectedId != null) centerLineageNode(LINEAGE_STATE.selectedId);
+}
+
+function closeLineageDetail() {
+  LINEAGE_STATE.selectedId = null;
+  renderLineage();
+}
+
+function centerLineageNode(id) {
+  const layout = LINEAGE_STATE.lastLayout;
+  const scroll = document.getElementById('ln-scroll');
+  const box = layout?.nodes?.[id];
+  if (!scroll || !box) return;
+  const targetTop = Math.max(0, box.y + box.height / 2 - scroll.clientHeight / 2);
+  scroll.scrollTop = targetTop;
+}
+
+function renderLineageDetail(flowId, graph) {
+  const flow = DATA.flowMap[flowId];
+  const panel = document.getElementById('ln-detail');
+  if (!flow) {
+    panel.classList.remove('open');
+    panel.innerHTML = '';
+    return;
+  }
+  panel.classList.add('open');
+  const deps = (graph.depMap[flowId] || []).map(id => DATA.flowMap[id]).filter(Boolean);
+  const children = (graph.childMap[flowId] || []).map(id => DATA.flowMap[id]).filter(Boolean);
+  panel.innerHTML = `
+    <div class="dp-header">
+      <div class="dp-title">Flow ${flow.flow_id}</div>
+      <button class="dp-close" onclick="closeLineageDetail()">✕</button>
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Context</div>
+      ${kv('Label', flow.packet_label)}
+      ${kv('Kind', flow.kind)}
+      ${kv('Client', flow.client_id)}
+      ${kv('Message ID', flow.message_id || '—')}
+      ${kv('Priority', flow.priority)}
+      ${kv('Order', flow.order)}
+      ${kv('Delivery', flow.delivery)}
+      ${kv('Target', flow.target_label)}
+      ${kv('Bytes', flow.payload_bytes)}
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Timing</div>
+      ${kv('Start', (flow.start_ms || 0).toFixed(3) + 'ms')}
+      ${kv('End', flow.end_ms != null ? flow.end_ms.toFixed(3) + 'ms' : '—')}
+      ${kv('Duration', flow.duration_ms != null ? flow.duration_ms.toFixed(3) + 'ms' : '—')}
+      ${kv('Outcome', flow.outcome || '—')}
+      ${kv('Depends On', deps.length)}
+      ${kv('Unblocks', children.length)}
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Depends On</div>
+      ${deps.length ? deps.map(renderChainRow).join('') : '<div class="empty-state">No upstream flows</div>'}
+    </div>
+    <div class="dp-section">
+      <div class="dp-section-title">Unblocks</div>
+      ${children.length ? children.map(renderChainRow).join('') : '<div class="empty-state">No downstream flows</div>'}
+    </div>`;
+}
+
+function renderChainRow(flow) {
+  return `<div class="chain-row" onclick="selectLineageNode(${flow.flow_id})">
+    <span class="chain-row-id">f${flow.flow_id}</span>
+    <span class="chain-row-label">${escapeHtml(truncateText(flow.packet_label || 'flow', 28))}</span>
+  </div>`;
+}
+
+function kindColorMeta(kind) {
+  if (kind === 'resource') {
+    return {
+      base: '#a88ef0',
+      stroke: '#a88ef0',
+      strokeMid: 'rgba(168,142,240,0.6)',
+      strokeSoft: 'rgba(168,142,240,0.4)',
+      fill: 'rgba(168,142,240,0.08)',
+      fillOrphan: 'rgba(168,142,240,0.05)',
+    };
+  }
+  if (kind === 'datagram') {
+    return {
+      base: '#eb7',
+      stroke: '#eb7',
+      strokeMid: 'rgba(238,187,119,0.6)',
+      strokeSoft: 'rgba(238,187,119,0.4)',
+      fill: 'rgba(238,187,119,0.08)',
+      fillOrphan: 'rgba(238,187,119,0.05)',
+    };
+  }
+  return {
+    base: '#4af',
+    stroke: '#2d88cc',
+    strokeMid: 'rgba(45,136,204,0.6)',
+    strokeSoft: 'rgba(45,136,204,0.4)',
+    fill: 'rgba(68,170,255,0.08)',
+    fillOrphan: 'rgba(68,170,255,0.05)',
+  };
+}
+
+function lineageOutcomeColor(outcome) {
+  if (!outcome) return '#eb7';
+  if (outcome.includes('Dropped') || outcome.includes('Abort')) return '#e55';
+  if (outcome.includes('Delivered') || outcome.includes('Processed')) return '#3c9';
+  return '#eb7';
+}
+
+function truncateText(text, maxLen) {
+  const str = String(text ?? '');
+  return str.length > maxLen ? str.slice(0, Math.max(0, maxLen - 1)) + '…' : str;
+}
+
+function fmtLineageMs(value) {
+  return `${Number(value || 0).toFixed(value >= 10 ? 1 : 2)}ms`;
+}
+
+function escapeHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+document.getElementById('ln-filter-client').addEventListener('change', e => {
+  LINEAGE_STATE.client = e.target.value;
+  renderLineage();
+});
+document.getElementById('ln-filter-kind').addEventListener('change', e => {
+  LINEAGE_STATE.kind = e.target.value;
+  renderLineage();
+});
+document.getElementById('ln-orphan-toggle').addEventListener('click', () => {
+  LINEAGE_STATE.showOrphans = !LINEAGE_STATE.showOrphans;
+  renderLineage();
+});
+document.getElementById('ln-zoom').addEventListener('input', e => {
+  if (LINEAGE_STATE.zoomTimer) clearTimeout(LINEAGE_STATE.zoomTimer);
+  const value = Number(e.target.value) || 40;
+  LINEAGE_STATE.zoomTimer = setTimeout(() => {
+    LINEAGE_STATE.timeScale = value;
+    renderLineage();
+  }, 16);
+});
+document.getElementById('ln-reset').addEventListener('click', () => {
+  Object.assign(LINEAGE_STATE, {
+    selectedId: null,
+    client: '',
+    kind: '',
+    showOrphans: true,
+    timeScale: 40,
+  });
+  document.getElementById('ln-filter-client').value = '';
+  document.getElementById('ln-filter-kind').value = '';
+  document.getElementById('ln-zoom').value = '40';
+  renderLineage();
+});
+
+window.selectLineageNode = selectLineageNode;
+window.closeLineageDetail = closeLineageDetail;
 
 // ============================================================
 // BOTTLENECK
