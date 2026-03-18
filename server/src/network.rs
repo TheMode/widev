@@ -1820,6 +1820,11 @@ impl Session {
                 };
 
                 let send_fin = chunk.fin;
+                let remaining_before = chunk.data.len().saturating_sub(chunk.offset);
+                let available_capacity_before = self.conn.stream_capacity(stream_id).ok();
+                let flow_control_blocked = available_capacity_before
+                    .map_or(false, |capacity| capacity < remaining_before);
+
                 match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], send_fin) {
                     Ok(written) => {
                         let queued_before = self.queued_stream_bytes;
@@ -1834,6 +1839,18 @@ impl Session {
                             queued_before,
                             self.queued_stream_bytes,
                         );
+                        if flow_control_blocked {
+                            let remaining_after =
+                                chunk.data.len().saturating_sub(chunk.offset);
+                            let available_capacity_after =
+                                self.conn.stream_capacity(stream_id).ok();
+                            self.tracer.on_flow_control_backpressure(
+                                &chunk.trace,
+                                stream_id,
+                                remaining_after,
+                                available_capacity_after,
+                            );
+                        }
                         if chunk.offset < chunk.data.len() {
                             self.tracer.on_stream_backpressure(
                                 &chunk.trace,
@@ -1885,6 +1902,18 @@ impl Session {
                         break;
                     },
                     Err(quiche::Error::Done) => {
+                        if flow_control_blocked {
+                            let remaining_after =
+                                chunk.data.len().saturating_sub(chunk.offset);
+                            let available_capacity_after =
+                                self.conn.stream_capacity(stream_id).ok();
+                            self.tracer.on_flow_control_backpressure(
+                                &chunk.trace,
+                                stream_id,
+                                remaining_after,
+                                available_capacity_after,
+                            );
+                        }
                         self.tracer.on_stream_backpressure(
                             &chunk.trace,
                             stream_id,

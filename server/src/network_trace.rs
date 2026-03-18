@@ -106,6 +106,14 @@ pub enum TraceDirection {
     Tx,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum BackpressureReason {
+    FlowControlWindow,
+    Other,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PacketComponent {
     pub index: usize,
@@ -238,6 +246,16 @@ pub enum TraceEvent {
         remaining: usize,
         backpressure_reason: Option<String>,
     },
+    StreamBackpressure {
+        timestamp_ms: f64,
+        client_id: ClientId,
+        flow_id: u64,
+        stream_id: u64,
+        remaining: usize,
+        available_capacity: Option<usize>,
+        blocked_bytes: usize,
+        reason: BackpressureReason,
+    },
     DatagramAttempt {
         timestamp_ms: f64,
         client_id: ClientId,
@@ -296,6 +314,7 @@ impl TraceEvent {
             | Self::TransportSelected { client_id, .. }
             | Self::StreamQueued { client_id, .. }
             | Self::StreamWrite { client_id, .. }
+            | Self::StreamBackpressure { client_id, .. }
             | Self::DatagramAttempt { client_id, .. }
             | Self::DatagramResult { client_id, .. }
             | Self::QuicEgress { client_id, .. }
@@ -317,6 +336,7 @@ impl TraceEvent {
             | Self::TransportSelected { timestamp_ms, .. }
             | Self::StreamQueued { timestamp_ms, .. }
             | Self::StreamWrite { timestamp_ms, .. }
+            | Self::StreamBackpressure { timestamp_ms, .. }
             | Self::DatagramAttempt { timestamp_ms, .. }
             | Self::DatagramResult { timestamp_ms, .. }
             | Self::QuicEgress { timestamp_ms, .. }
@@ -514,6 +534,27 @@ impl TraceEmitter {
             queued_after,
             remaining: total.saturating_sub(offset),
             backpressure_reason,
+        });
+    }
+
+    fn emit_stream_backpressure(
+        &self,
+        trace: &TraceContext,
+        stream_id: u64,
+        remaining: usize,
+        available_capacity: Option<usize>,
+        blocked_bytes: usize,
+        reason: BackpressureReason,
+    ) {
+        self.emit(TraceEvent::StreamBackpressure {
+            timestamp_ms: self.now_ms(),
+            client_id: self.client_id,
+            flow_id: trace.flow_id,
+            stream_id,
+            remaining,
+            available_capacity,
+            blocked_bytes,
+            reason,
         });
     }
 
@@ -1037,6 +1078,26 @@ impl SessionTracer {
         );
     }
 
+    pub fn on_flow_control_backpressure(
+        &mut self,
+        trace: &DispatchTraceMeta,
+        stream_id: u64,
+        remaining: usize,
+        available_capacity: Option<usize>,
+    ) {
+        if !self.tracer.enabled() {
+            return;
+        }
+        self.emitter.emit_stream_backpressure(
+            trace,
+            stream_id,
+            remaining,
+            available_capacity,
+            remaining.saturating_sub(available_capacity.unwrap_or(0)),
+            BackpressureReason::FlowControlWindow,
+        );
+    }
+
     pub fn on_quic_egress(&mut self, bytes: usize, destination: SocketAddr, pacing_delay_ms: f64) {
         if !self.tracer.enabled() {
             return;
@@ -1424,6 +1485,7 @@ fn event_flow_ids(event: &TraceEvent) -> Vec<u64> {
         | TraceEvent::TransportSelected { flow_id, .. }
         | TraceEvent::StreamQueued { flow_id, .. }
         | TraceEvent::StreamWrite { flow_id, .. }
+        | TraceEvent::StreamBackpressure { flow_id, .. }
         | TraceEvent::DatagramAttempt { flow_id, .. }
         | TraceEvent::DatagramResult { flow_id, .. } => vec![*flow_id],
         TraceEvent::SchedulerEvent { flow_id: Some(flow_id), .. }
@@ -1645,6 +1707,7 @@ impl TraceRenderer {
             | TraceEvent::TransportSelected { .. }
             | TraceEvent::StreamQueued { .. }
             | TraceEvent::StreamWrite { .. }
+            | TraceEvent::StreamBackpressure { .. }
             | TraceEvent::DatagramAttempt { .. }
             | TraceEvent::DatagramResult { .. }
             | TraceEvent::DeliveryEvent { .. } => Vec::new(),
@@ -1859,6 +1922,23 @@ impl TraceRenderer {
                 }
                 Some(line)
             },
+            TraceEvent::StreamBackpressure {
+                stream_id,
+                remaining,
+                available_capacity,
+                blocked_bytes,
+                reason,
+                ..
+            } => Some(format!(
+                "stream backpressure stream={} reason={} remaining={} available={} blocked={}",
+                stream_id,
+                describe_backpressure_reason(*reason),
+                remaining,
+                available_capacity
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                blocked_bytes
+            )),
             TraceEvent::DatagramAttempt { payload_bytes, writable_len, .. } => Some(format!(
                 "datagram attempt bytes={} writable={}",
                 payload_bytes,
@@ -2073,6 +2153,13 @@ fn describe_retry_reason(reason: RetryReason) -> &'static str {
     }
 }
 
+fn describe_backpressure_reason(reason: BackpressureReason) -> &'static str {
+    match reason {
+        BackpressureReason::FlowControlWindow => "flow_control_window",
+        BackpressureReason::Other => "other",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,5 +2309,32 @@ mod tests {
             fs::read_to_string(log_dir.join("clients").join("client_13.events.ndjson")).unwrap();
         assert!(client_events.contains("\"retry_count\":0"));
         assert!(client_events.contains("\"retry_reason\":null"));
+    }
+
+    #[test]
+    fn stream_backpressure_event_records_flow_control_window() {
+        let log_dir = temp_log_dir();
+        let tracer = make_tracer(log_dir.clone());
+        let mut session = SessionTracer::new(tracer, 14);
+        let envelope = PacketEnvelope::single(
+            PacketTarget::Client(14),
+            crate::packets::S2CPacket::Ping { nonce: 1 },
+        );
+
+        let trace = session.register_envelope(&envelope, 48);
+        session.on_flow_control_backpressure(&trace, 9, 128, Some(0));
+        session.on_flow_outcome(trace.flow_id, DeliveryOutcome::TransportDelivered);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let client_events =
+            fs::read_to_string(log_dir.join("clients").join("client_14.events.ndjson")).unwrap();
+        let client_timeline =
+            fs::read_to_string(log_dir.join("clients").join("client_14.timeline.log")).unwrap();
+
+        assert!(client_events.contains("\"stream_backpressure\""));
+        assert!(client_events.contains("\"flow_control_window\""));
+        assert!(client_events.contains("\"blocked_bytes\":128"));
+        assert!(client_timeline.contains("stream backpressure"));
+        assert!(client_timeline.contains("flow_control_window"));
     }
 }

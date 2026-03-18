@@ -1451,6 +1451,7 @@ function showFlowDetail(flow, panelId) {
   panel.classList.add('open');
 
   const ctx = flow;
+  const backpressureEvents = (flow.events || []).filter(ev => ev.event === 'stream_backpressure');
   const evRows = (flow.events || []).map(ev => {
     const t = ((ev.timestamp_ms||0) - flow.start_ms).toFixed(3);
     return `<div class="event-row">
@@ -1489,6 +1490,7 @@ function showFlowDetail(flow, panelId) {
       ${kv('Outcome', flow.outcome || '—')}
       ${kv('Retries', flow.retry_count ?? 0)}
       ${kv('Retry Reason', flow.retry_reason || '—')}
+      ${kv('Backpressure Events', backpressureEvents.length)}
     </div>
     ${ctx.components?.length ? `<div class="dp-section"><div class="dp-section-title">Components (${ctx.components.length})</div>${comps}</div>` : ''}
     <div class="dp-section">
@@ -1507,7 +1509,11 @@ function eventSummary(ev) {
   if (ev.event === 'transport_selected') return `route=${ev.route} eligible=${ev.eligible}`;
   if (ev.event === 'datagram_attempt') return `bytes=${ev.payload_bytes}`;
   if (ev.event === 'datagram_result') return `${ev.status} ${ev.detail||''}`;
-  if (ev.event === 'stream_write') return `wrote=${ev.written}/${ev.total} fin=${ev.fin}`;
+  if (ev.event === 'stream_write') return `wrote=${ev.written}/${ev.total} fin=${ev.fin}${ev.backpressure_reason ? ` backpressure=${ev.backpressure_reason}` : ''}`;
+  if (ev.event === 'stream_backpressure') {
+    const cap = ev.available_capacity ?? 'none';
+    return `flow_control_window remaining=${ev.remaining} available=${cap} blocked=${ev.blocked_bytes}`;
+  }
   if (ev.event === 'quic_egress') return `${ev.bytes}B → ${ev.destination}`;
   return JSON.stringify(ev).slice(0,80);
 }
@@ -1562,7 +1568,8 @@ function renderTimeline() {
     const width = Math.max(0.1, (dur / range * 100)).toFixed(4);
     const cls = f.kind === 'resource' ? 'resource' : f.priority === 'Droppable' ? 'droppable' : 'normal';
     const label = f.packet_label.length > 22 ? f.packet_label.slice(0,22)+'…' : f.packet_label;
-    return `<div class="flow-bar-row" title="Flow ${f.flow_id}: ${f.packet_label}&#10;Start: ${f.start_ms.toFixed(3)}ms&#10;Duration: ${f.duration_ms!=null?f.duration_ms.toFixed(3)+'ms':'incomplete'}&#10;Outcome: ${f.outcome||'incomplete'}&#10;Retries: ${f.retry_count ?? 0}${f.retry_reason ? `&#10;Reason: ${f.retry_reason}` : ''}">
+    const backpressureCount = (f.events || []).filter(ev => ev.event === 'stream_backpressure').length;
+    return `<div class="flow-bar-row" title="Flow ${f.flow_id}: ${f.packet_label}&#10;Start: ${f.start_ms.toFixed(3)}ms&#10;Duration: ${f.duration_ms!=null?f.duration_ms.toFixed(3)+'ms':'incomplete'}&#10;Outcome: ${f.outcome||'incomplete'}&#10;Retries: ${f.retry_count ?? 0}${f.retry_reason ? `&#10;Reason: ${f.retry_reason}` : ''}${backpressureCount ? `&#10;Backpressure events: ${backpressureCount}` : ''}">
       <div class="flow-bar-label">f${f.flow_id} ${label}</div>
       <div class="flow-bar-track" data-fid="${f.flow_id}">
         <div class="flow-bar ${cls}" style="left:${left}%;width:${width}%"></div>
@@ -1923,6 +1930,7 @@ function eventTypeCls(e) {
     flow_registered:'blue', delivery_event:'green', scheduler_event:'purple',
     quic_egress:'accent', rx_event:'yellow', session_start:'gray',
     datagram_attempt:'yellow', datagram_result:'yellow', stream_write:'blue',
+    stream_backpressure:'yellow',
     transport_selected:'gray', dependency_declared:'purple',
   };
   return map[e] || 'gray';
