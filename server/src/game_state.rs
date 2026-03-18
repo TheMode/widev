@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use crate::packets::{MessageId, PacketControl, PacketEnvelope, PacketMessage, PacketResource};
 
@@ -20,10 +19,6 @@ impl GameState {
 
     pub fn ticks_per_second(&self) -> u16 {
         self.ticks_per_second
-    }
-
-    pub fn tick_interval(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / self.ticks_per_second as f64)
     }
 
     pub fn send(&mut self, envelope: PacketEnvelope) {

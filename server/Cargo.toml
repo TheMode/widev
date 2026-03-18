@@ -21,6 +21,7 @@ quinn-udp = { version = "0.5.14", features = ["fast-apple-datapath"] }
 uuid = { version = "1.22.0", features = ["v7"] }
 thiserror = "2.0.18"
 png = "0.17.16"
+ctrlc = "3.4.7"
 
 [build-dependencies]
 anyhow = { workspace = true }

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    DeliveryPolicy, InputType, MessageId, PacketBundle, PacketEnvelope, PacketResource,
-    PacketTarget, PacketControl, S2CPacket,
+    DeliveryPolicy, InputType, MessageId, PacketBundle, PacketControl, PacketEnvelope,
+    PacketResource, PacketTarget, S2CPacket,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -286,7 +286,8 @@ impl PongGame {
 
     fn move_paddle(paddle: &mut Paddle, dt_seconds: f32) {
         let dy = (paddle.input.down as i8 - paddle.input.up as i8) as f32;
-        paddle.y = (paddle.y + dy * PADDLE_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT - PADDLE_HEIGHT);
+        paddle.y =
+            (paddle.y + dy * PADDLE_SPEED * dt_seconds).clamp(0.0, GAME_HEIGHT - PADDLE_HEIGHT);
     }
 
     fn move_ball(ball: &mut Ball, dt_seconds: f32) {
@@ -368,10 +369,7 @@ impl PongGame {
     }
 
     fn collect_finished_matches(&self) -> Vec<u64> {
-        self.matches
-            .iter()
-            .filter_map(|(&match_id, m)| m.winner.map(|_| match_id))
-            .collect()
+        self.matches.iter().filter_map(|(&match_id, m)| m.winner.map(|_| match_id)).collect()
     }
 
     fn resolve_finished_match(&mut self, state: &mut GameState, match_id: u64) {

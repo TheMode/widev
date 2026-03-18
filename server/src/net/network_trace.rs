@@ -686,12 +686,7 @@ impl TraceProjector {
         }
         self.active_flows.insert(
             context.flow_id,
-            ActiveFlow {
-                context,
-                await_client_receipt,
-                retry_count: 0,
-                retry_reason: None,
-            },
+            ActiveFlow { context, await_client_receipt, retry_count: 0, retry_reason: None },
         );
     }
 
@@ -848,11 +843,7 @@ impl SessionTracer {
                         Some(false),
                     );
                 },
-                SchedulerTraceEvent::RequeuedCongestion {
-                    trace,
-                    queued_messages,
-                    reason,
-                } => {
+                SchedulerTraceEvent::RequeuedCongestion { trace, queued_messages, reason } => {
                     self.emitter.emit_scheduler_event(
                         Some(trace.flow_id),
                         "requeued_congestion",

@@ -706,19 +706,17 @@ impl TraceRenderer {
                 retry_reason,
                 detail,
                 ..
-            } => {
-                Some(format!(
-                    "delivery outcome={} terminal={} retry_count={}{} msg={}{}",
-                    outcome,
-                    terminal,
-                    retry_count,
-                    retry_reason
-                        .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
-                        .unwrap_or_default(),
-                    message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
-                    detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()
-                ))
-            },
+            } => Some(format!(
+                "delivery outcome={} terminal={} retry_count={}{} msg={}{}",
+                outcome,
+                terminal,
+                retry_count,
+                retry_reason
+                    .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
+                    .unwrap_or_default(),
+                message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
+                detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()
+            )),
             TraceEvent::SessionStart { .. }
             | TraceEvent::SessionSnapshot { .. }
             | TraceEvent::RxEvent { .. } => {

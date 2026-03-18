@@ -209,6 +209,25 @@ impl NetworkRuntime {
         out
     }
 
+    pub fn wait_for_events(&self, timeout: Duration) -> Vec<NetworkEvent> {
+        if timeout.is_zero() {
+            return self.drain_events();
+        }
+
+        let mut out = Vec::new();
+        match self.event_rx.recv_timeout(timeout) {
+            Ok(event) => out.push(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => return out,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return out,
+        }
+
+        while let Ok(event) = self.event_rx.try_recv() {
+            out.push(event);
+        }
+
+        out
+    }
+
     pub fn dispatch_messages(&self, mut messages: Vec<PacketMessage>) {
         messages.retain(validate_message_for_dispatch);
         if messages.is_empty() {
@@ -1822,8 +1841,8 @@ impl Session {
                 let send_fin = chunk.fin;
                 let remaining_before = chunk.data.len().saturating_sub(chunk.offset);
                 let available_capacity_before = self.conn.stream_capacity(stream_id).ok();
-                let flow_control_blocked = available_capacity_before
-                    .map_or(false, |capacity| capacity < remaining_before);
+                let flow_control_blocked =
+                    available_capacity_before.map_or(false, |capacity| capacity < remaining_before);
 
                 match self.conn.stream_send(stream_id, &chunk.data[chunk.offset..], send_fin) {
                     Ok(written) => {
@@ -1840,8 +1859,7 @@ impl Session {
                             self.queued_stream_bytes,
                         );
                         if flow_control_blocked {
-                            let remaining_after =
-                                chunk.data.len().saturating_sub(chunk.offset);
+                            let remaining_after = chunk.data.len().saturating_sub(chunk.offset);
                             let available_capacity_after =
                                 self.conn.stream_capacity(stream_id).ok();
                             self.tracer.on_flow_control_backpressure(
@@ -1903,8 +1921,7 @@ impl Session {
                     },
                     Err(quiche::Error::Done) => {
                         if flow_control_blocked {
-                            let remaining_after =
-                                chunk.data.len().saturating_sub(chunk.offset);
+                            let remaining_after = chunk.data.len().saturating_sub(chunk.offset);
                             let available_capacity_after =
                                 self.conn.stream_capacity(stream_id).ok();
                             self.tracer.on_flow_control_backpressure(
