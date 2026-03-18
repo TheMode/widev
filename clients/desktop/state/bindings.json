@@ -1,11 +1,16 @@
 {
+  "global": {
+    "bindings": {
+      "move_down": "keyboard/*/key/KeyS",
+      "move_right": "keyboard/*/key/KeyD",
+      "move_left": "keyboard/*/key/KeyA",
+      "move_up": "keyboard/*/key/KeyW"
+    }
+  },
   "servers": {
     "fd90b14e4724da347dac29665806aeb5edd243087dc197d7391a49b3591121ec": {
       "bindings": {
-        "move_down": "keyboard/*/key/KeyS",
-        "move_right": "keyboard/*/key/KeyD",
-        "move_left": "keyboard/*/key/KeyA",
-        "move_up": "keyboard/*/key/KeyW"
+        "move_up": "keyboard/*/key/ArrowUp"
       }
     }
   }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,11 +7,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedData {
-    servers: HashMap<String, PersistedServer>,
+    #[serde(default)]
+    global: PersistedSettings,
+    #[serde(default)]
+    servers: HashMap<String, PersistedSettings>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistedServer {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedSettings {
+    #[serde(default)]
     bindings: HashMap<String, String>,
 }
 
@@ -48,11 +52,27 @@ impl BindingStore {
     }
 
     pub(super) fn get_binding_path(&self, cert_fp: &str, identifier: &str) -> Option<String> {
-        self.data.servers.get(cert_fp)?.bindings.get(identifier).cloned()
+        self.data
+            .servers
+            .get(cert_fp)
+            .and_then(|server| server.bindings.get(identifier))
+            .or_else(|| self.data.global.bindings.get(identifier))
+            .cloned()
     }
 
     pub(super) fn binding_count(&self, cert_fp: &str) -> usize {
-        self.data.servers.get(cert_fp).map(|server| server.bindings.len()).unwrap_or(0)
+        self.data
+            .servers
+            .get(cert_fp)
+            .map(|server| {
+                server
+                    .bindings
+                    .keys()
+                    .chain(self.data.global.bindings.keys())
+                    .collect::<HashSet<_>>()
+                    .len()
+            })
+            .unwrap_or_else(|| self.data.global.bindings.len())
     }
 
     pub(super) fn set_binding_path(&mut self, cert_fp: &str, identifier: &str, input_path: String) {
