@@ -898,23 +898,58 @@ function drawHistogram(ctx, data, color='#4af', opts={}) {
     const i = Math.min(bins - 1, Math.floor((v - minV) / binW));
     counts[i] += 1;
   });
-  const labels = counts.map((_, i) => `${fmtNum(minV + i * binW)}-${fmtNum(minV + (i + 1) * binW)}`);
+  const points = counts.map((count, i) => ({
+    x: minV + (i + 0.5) * binW,
+    y: count,
+  }));
 
   return renderChart(canvas.id, {
     type: 'bar',
     data: {
-      labels,
       datasets: [{
         label: opts.label || 'Frequency',
-        data: counts,
-        backgroundColor: `${color}cc`,
+        data: points,
+        backgroundColor: color,
         borderWidth: 0,
       }],
     },
-    options: chartCategoryOptions({
-      showLegend: false,
-      yLabel: opts.yLabel || 'Count',
-    }),
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      normalized: true,
+      parsing: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#141414',
+          titleColor: '#e8e8e8',
+          bodyColor: '#cfcfcf',
+          borderColor: '#2a2a2a',
+          borderWidth: 1,
+        },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          grid: { color: '#2a2a2a' },
+          ticks: {
+            color: '#666',
+            font: { family: 'IBM Plex Mono', size: 9 },
+            callback: value => fmtNum(value),
+          },
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: '#2a2a2a' },
+          ticks: {
+            color: '#666',
+            font: { family: 'IBM Plex Mono', size: 9 },
+            callback: value => fmtNum(value),
+          },
+          title: opts.yLabel ? { display: true, text: opts.yLabel || 'Count', color: '#666' } : undefined,
+        },
+      },
+    },
   });
 }
 
@@ -1048,7 +1083,7 @@ function chartBaseOptions({
         ticks: {
           color: '#666',
           font: { family: 'IBM Plex Mono', size: 9 },
-          callback: value => fmtNum(value),
+          callback: value => (typeof value === 'number' ? fmtNum(value) : String(value)),
         },
         title: xLabel ? { display: true, text: xLabel, color: '#666' } : undefined,
       },
@@ -1198,6 +1233,7 @@ function drawMultiScatterChart(ctx, series, opts = {}) {
 
 function fmtNum(n) {
   if (n === undefined || n === null) return '—';
+  if (typeof n !== 'number' || !Number.isFinite(n)) return String(n);
   if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(1)+'M';
   if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(1)+'K';
   if (Math.abs(n) >= 100) return Math.round(n);
@@ -1841,7 +1877,7 @@ document.getElementById('el-next').addEventListener('click', () => { elPage++; r
 // ============================================================
 function renderScheduler() {
   const snaps = DATA.snapshots;
-  const inflights = snaps.map(s => s.inflight_messages || 0);
+  const inflights = snaps.map(s => s.inflight_messages ?? s.active_streams ?? 0);
   const queues = snaps.map(s => s.queued_stream_bytes || 0);
   const maxInflight = Math.max(...inflights, 0);
   const avgInflight = inflights.length ? inflights.reduce((a,b)=>a+b,0)/inflights.length : 0;
@@ -1885,7 +1921,7 @@ function renderScheduler() {
     if (ifCtx && snaps.length) {
       const series = buildGroupedSeries(
         snaps,
-        s => (s.inflight_messages != null ? s.inflight_messages : null),
+        s => (s.inflight_messages != null ? s.inflight_messages : (s.active_streams != null ? s.active_streams : null)),
         { labelFn: clientId => `Client ${clientId}` }
       );
       if (series.length) drawMultiLineChart(ifCtx, series, { yLabel: 'messages' });
