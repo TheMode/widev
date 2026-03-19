@@ -220,7 +220,7 @@ fn placeholder_context(flow_id: u64, client_id: ClientId) -> TraceContext {
         target_label: "unknown".to_string(),
         priority: "unknown".to_string(),
         order: "unknown".to_string(),
-        delivery: "unknown",
+        delivery: "unknown".to_string(),
         dependency_label: None,
         sequence_id: None,
         components: Vec::new(),
@@ -540,7 +540,7 @@ impl TraceRenderer {
                 outcome,
                 retry_count,
                 retry_reason
-                    .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
+                    .map(|reason| format!(" retry_reason={}", reason.describe()))
                     .unwrap_or_default(),
                 detail.map(|value| format!(" ({value})")).unwrap_or_default()
             ));
@@ -668,7 +668,7 @@ impl TraceRenderer {
             } => Some(format!(
                 "stream backpressure stream={} reason={} remaining={} available={} blocked={}",
                 stream_id,
-                describe_backpressure_reason(*reason),
+                reason.describe(),
                 remaining,
                 available_capacity
                     .map(|value| value.to_string())
@@ -712,7 +712,7 @@ impl TraceRenderer {
                 terminal,
                 retry_count,
                 retry_reason
-                    .map(|reason| format!(" retry_reason={}", describe_retry_reason(reason)))
+                    .map(|reason| format!(" retry_reason={}", reason.describe()))
                     .unwrap_or_default(),
                 message_id.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
                 detail.as_ref().map(|value| format!(" detail={value}")).unwrap_or_default()

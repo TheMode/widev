@@ -133,7 +133,7 @@ pub struct TraceContext {
     pub target_label: String,
     pub priority: String,
     pub order: String,
-    pub delivery: &'static str,
+    pub delivery: String,
     pub dependency_label: Option<String>,
     pub sequence_id: Option<String>,
     pub components: Vec<PacketComponent>,
@@ -767,9 +767,9 @@ impl SessionTracer {
             message_id: envelope.id,
             payload_bytes: framed_len,
             target_label: describe_target(envelope.meta.target),
-            priority: envelope.meta.priority.describe_long(),
-            order: envelope.meta.order.describe_long(),
-            delivery: envelope.meta.delivery.describe_short(),
+            priority: envelope.meta.priority.describe(),
+            order: envelope.meta.order.describe(),
+            delivery: envelope.meta.delivery.describe(),
             dependency_label: dependency_message_label(envelope.meta.order),
             sequence_id: sequence_label(envelope.meta.order),
             components,
@@ -797,9 +797,9 @@ impl SessionTracer {
             message_id: Some(resource.id),
             payload_bytes: framed_len,
             target_label: describe_target(resource.meta.target),
-            priority: resource.meta.priority.describe_long(),
-            order: resource.meta.order.describe_long(),
-            delivery: resource.meta.delivery.describe_short(),
+            priority: resource.meta.priority.describe(),
+            order: resource.meta.order.describe(),
+            delivery: resource.meta.delivery.describe(),
             dependency_label: dependency_message_label(resource.meta.order),
             sequence_id: sequence_label(resource.meta.order),
             components: vec![PacketComponent {
@@ -851,7 +851,7 @@ impl SessionTracer {
                         Some(queued_messages),
                         None,
                         Some(trace.order.clone()),
-                        Some(describe_retry_reason(reason).to_string()),
+                        Some(reason.describe()),
                         None,
                     );
                 },
@@ -972,7 +972,7 @@ impl SessionTracer {
                 trace,
                 outcome,
                 detail.clone(),
-                terminal.map(describe_delivery_outcome),
+                terminal.map(|o| o.describe()),
             );
         }
 
@@ -1127,7 +1127,7 @@ impl SessionTracer {
 
     pub fn on_transport_outcome(&mut self, message_id: MessageId, outcome: DeliveryOutcome) {
         let flow_id = self.projector.find_flow_id_by_message_id(message_id);
-        let outcome_label = describe_delivery_outcome(outcome);
+        let outcome_label = outcome.describe();
         if self.tracer.enabled() {
             self.emitter.emit_delivery(
                 flow_id,
@@ -1278,7 +1278,7 @@ impl SessionTracer {
             self.emitter.emit_delivery(
                 Some(flow_id),
                 flow.context.message_id,
-                describe_delivery_outcome(outcome),
+                outcome.describe(),
                 true,
                 flow.retry_count,
                 flow.retry_reason,
@@ -1345,6 +1345,14 @@ fn determine_flow_kind(priority: PacketPriority, order: PacketOrder, has_id: boo
     }
 }
 
+fn describe_target(target: PacketTarget) -> String {
+    match target {
+        PacketTarget::Client(client_id) => format!("Client({client_id})"),
+        PacketTarget::Broadcast => "Broadcast".to_string(),
+        PacketTarget::BroadcastExcept(client_id) => format!("BroadcastExcept({client_id})"),
+    }
+}
+
 fn dependency_message_label(order: PacketOrder) -> Option<String> {
     match order {
         PacketOrder::Dependency(message_id) => Some(message_id.to_string()),
@@ -1389,16 +1397,12 @@ fn variant_name<T: fmt::Debug>(value: &T) -> String {
     rendered.split([' ', '{', '(']).next().unwrap_or("Unknown").to_string()
 }
 
-trait DescribeShort {
-    fn describe_short(&self) -> &'static str;
+trait Describe {
+    fn describe(&self) -> String;
 }
 
-trait DescribeLong {
-    fn describe_long(&self) -> String;
-}
-
-impl DescribeLong for PacketPriority {
-    fn describe_long(&self) -> String {
+impl Describe for PacketPriority {
+    fn describe(&self) -> String {
         match self {
             Self::Normal => "Normal".to_string(),
             Self::Droppable => "Droppable".to_string(),
@@ -1412,8 +1416,8 @@ impl DescribeLong for PacketPriority {
     }
 }
 
-impl DescribeLong for PacketOrder {
-    fn describe_long(&self) -> String {
+impl Describe for PacketOrder {
+    fn describe(&self) -> String {
         match self {
             Self::Independent => "Independent".to_string(),
             Self::Dependency(message_id) => format!("Dependency({message_id})"),
@@ -1423,44 +1427,42 @@ impl DescribeLong for PacketOrder {
     }
 }
 
-impl DescribeShort for DeliveryPolicy {
-    fn describe_short(&self) -> &'static str {
+impl Describe for DeliveryPolicy {
+    fn describe(&self) -> String {
         match self {
-            Self::FireAndForget => "FireAndForget",
-            Self::ObserveTransport => "ObserveTransport",
-            Self::RequireClientReceipt => "RequireClientReceipt",
+            Self::FireAndForget => "FireAndForget".to_string(),
+            Self::ObserveTransport => "ObserveTransport".to_string(),
+            Self::RequireClientReceipt => "RequireClientReceipt".to_string(),
         }
     }
 }
 
-fn describe_target(target: PacketTarget) -> String {
-    match target {
-        PacketTarget::Client(client_id) => format!("Client({client_id})"),
-        PacketTarget::Broadcast => "Broadcast".to_string(),
-        PacketTarget::BroadcastExcept(client_id) => format!("BroadcastExcept({client_id})"),
+impl Describe for DeliveryOutcome {
+    fn describe(&self) -> String {
+        match self {
+            Self::TransportDelivered => "TransportDelivered".to_string(),
+            Self::TransportDropped { reason } => format!("TransportDropped({reason:?})"),
+            Self::ClientProcessed => "ClientProcessed".to_string(),
+        }
     }
 }
 
-fn describe_delivery_outcome(outcome: DeliveryOutcome) -> String {
-    match outcome {
-        DeliveryOutcome::TransportDelivered => "TransportDelivered".to_string(),
-        DeliveryOutcome::TransportDropped { reason } => format!("TransportDropped({reason:?})"),
-        DeliveryOutcome::ClientProcessed => "ClientProcessed".to_string(),
+impl Describe for RetryReason {
+    fn describe(&self) -> String {
+        match self {
+            Self::Congestion => "congestion".to_string(),
+            Self::Timeout => "timeout".to_string(),
+            Self::Nack => "nack".to_string(),
+            Self::Other => "other".to_string(),
+        }
     }
 }
 
-fn describe_retry_reason(reason: RetryReason) -> &'static str {
-    match reason {
-        RetryReason::Congestion => "congestion",
-        RetryReason::Timeout => "timeout",
-        RetryReason::Nack => "nack",
-        RetryReason::Other => "other",
-    }
-}
-
-fn describe_backpressure_reason(reason: BackpressureReason) -> &'static str {
-    match reason {
-        BackpressureReason::FlowControlWindow => "flow_control_window",
-        BackpressureReason::Other => "other",
+impl Describe for BackpressureReason {
+    fn describe(&self) -> String {
+        match self {
+            Self::FlowControlWindow => "flow_control_window".to_string(),
+            Self::Other => "other".to_string(),
+        }
     }
 }
