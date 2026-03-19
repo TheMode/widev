@@ -478,7 +478,13 @@ impl Game for PongGame {
             },
             NetworkEvent::ClientPacket { client_id, packet } => match packet {
                 crate::packets::C2SPacket::InputValue { binding_id, value } => {
-                    let pressed = value >= 0.5;
+                    let crate::packets::InputPayload::Toggle { pressed } = value else {
+                        log::warn!(
+                            "client {client_id} sent unexpected input payload for binding {binding_id}: {:?}",
+                            value
+                        );
+                        return;
+                    };
                     for m in self.matches.values_mut() {
                         let paddle = if m.player1 == client_id {
                             Some((&mut m.paddle1, true))

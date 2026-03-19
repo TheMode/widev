@@ -27,6 +27,30 @@
       "variants": ["Toggle", "Axis1D", "Joystick2D"]
     },
     {
+      "name": "InputPayload",
+      "variants": [
+        {
+          "name": "Toggle",
+          "fields": [
+            { "name": "pressed", "type": "bool" }
+          ]
+        },
+        {
+          "name": "Axis1D",
+          "fields": [
+            { "name": "value", "type": "f32" }
+          ]
+        },
+        {
+          "name": "Joystick2D",
+          "fields": [
+            { "name": "x", "type": "f32" },
+            { "name": "y", "type": "f32" }
+          ]
+        }
+      ]
+    },
+    {
       "name": "PredictionKind",
       "variants": ["Interpolation", "Extrapolation"]
     }
@@ -78,7 +102,7 @@
       "description": "Current input value for a declared binding identifier.",
       "fields": [
         { "name": "binding_id", "type": "u16" },
-        { "name": "value", "type": "f32" }
+        { "name": "value", "type": "InputPayload" }
       ]
     },
     {

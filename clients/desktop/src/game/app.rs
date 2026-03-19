@@ -632,8 +632,8 @@ impl RenderingState {
         for line in prompt.log_sections() {
             log::info!("  {line}");
         }
-        if let Some(suggestion) = prompt.suggestion {
-            log::info!("  captured: {}", suggestion.with_device_scope(prompt.any_device_scope));
+        if let Some(suggestion) = &prompt.suggestion {
+            log::info!("  captured: {suggestion}");
         }
         self.last_prompt_signature = Some(signature);
     }

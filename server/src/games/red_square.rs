@@ -202,7 +202,13 @@ impl Game for RedSquareGame {
                     log::info!("client {client_id} binding {binding_id} acknowledged");
                 },
                 crate::packets::C2SPacket::InputValue { binding_id, value } => {
-                    let pressed = value >= 0.5;
+                    let crate::packets::InputPayload::Toggle { pressed } = value else {
+                        log::warn!(
+                            "client {client_id} sent unexpected input payload for binding {binding_id}: {:?}",
+                            value
+                        );
+                        return;
+                    };
                     let player =
                         self.players.entry(client_id).or_insert(Self::new_player(client_id));
                     let input = &mut player.input;

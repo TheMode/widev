@@ -31,7 +31,18 @@ pub struct TypedefDef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnumDef {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariantDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EnumVariantDef {
+    Unit(String),
+    Struct {
+        name: String,
+        #[serde(default)]
+        fields: Vec<FieldDef>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,7 +141,7 @@ impl CodegenBackend for RustBackend {
 }
 
 fn write_bitmask(out: &mut String, bitmask_def: &BitmaskDef) {
-    writeln!(out, "{SCHEMA_DERIVE}").expect("writing to String should not fail");
+    writeln!(out, "{BITMASK_DERIVE}").expect("writing to String should not fail");
     writeln!(out, "#[repr(transparent)]").expect("writing to String should not fail");
     writeln!(out, "pub struct {}(pub {});", bitmask_def.name, bitmask_def.ty)
         .expect("writing to String should not fail");
@@ -172,10 +183,32 @@ fn write_bitmask(out: &mut String, bitmask_def: &BitmaskDef) {
 }
 
 fn write_plain_enum(out: &mut String, enum_def: &EnumDef) {
-    writeln!(out, "{SCHEMA_DERIVE}").expect("writing to String should not fail");
+    let derive =
+        if enum_def.variants.iter().all(|variant| matches!(variant, EnumVariantDef::Unit(_))) {
+            PLAIN_ENUM_DERIVE
+        } else {
+            DATA_ENUM_DERIVE
+        };
+    writeln!(out, "{derive}").expect("writing to String should not fail");
     writeln!(out, "pub enum {} {{", enum_def.name).expect("writing to String should not fail");
     for variant in &enum_def.variants {
-        writeln!(out, "    {},", variant).expect("writing to String should not fail");
+        match variant {
+            EnumVariantDef::Unit(name) => {
+                writeln!(out, "    {},", name).expect("writing to String should not fail");
+            },
+            EnumVariantDef::Struct { name, fields } => {
+                if fields.is_empty() {
+                    writeln!(out, "    {},", name).expect("writing to String should not fail");
+                    continue;
+                }
+                writeln!(out, "    {} {{", name).expect("writing to String should not fail");
+                for field in fields {
+                    writeln!(out, "        {}: {},", field.name, field.ty)
+                        .expect("writing to String should not fail");
+                }
+                writeln!(out, "    }},").expect("writing to String should not fail");
+            },
+        }
     }
     writeln!(out, "}}").expect("writing to String should not fail");
     writeln!(out).expect("writing to String should not fail");
@@ -421,7 +454,11 @@ pub mod decode {
     .expect("writing to String should not fail");
 }
 
-const SCHEMA_DERIVE: &str = r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
+const BITMASK_DERIVE: &str = r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
+
+const PLAIN_ENUM_DERIVE: &str = r#"#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
+
+const DATA_ENUM_DERIVE: &str = r#"#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
 
 const PACKET_DERIVE: &str = r#"#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, wincode::SchemaWrite, wincode::SchemaRead)]"#;
 
@@ -434,4 +471,37 @@ fn to_upper_snake(value: &str) -> String {
         out.push(ch.to_ascii_uppercase());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodegenBackend, EnumDef, EnumVariantDef, FieldDef, RustBackend, Schema};
+
+    #[test]
+    fn generates_struct_enum_variants() {
+        let schema = Schema {
+            typedefs: Vec::new(),
+            enums: vec![EnumDef {
+                name: "InputPayload".to_string(),
+                variants: vec![
+                    EnumVariantDef::Unit("Toggle".to_string()),
+                    EnumVariantDef::Struct {
+                        name: "Axis1D".to_string(),
+                        fields: vec![FieldDef { name: "value".to_string(), ty: "f32".to_string() }],
+                    },
+                ],
+            }],
+            bitmasks: Vec::new(),
+            common: Vec::new(),
+            c2s: Vec::new(),
+            s2c: Vec::new(),
+        };
+
+        let generated = RustBackend.generate(&schema).expect("codegen should succeed");
+
+        assert!(generated.contains("pub enum InputPayload"));
+        assert!(generated.contains("Toggle,"));
+        assert!(generated.contains("Axis1D {"));
+        assert!(generated.contains("value: f32,"));
+    }
 }

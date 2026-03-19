@@ -399,7 +399,7 @@ impl ClientGame {
                     self.bindings.confirm_binding(self.server_cert_fingerprint.as_deref())?
                 {
                     self.send_binding_ack(confirmed.binding_id)?;
-                    log::info!("assigned '{}' -> {}", confirmed.identifier, confirmed.input);
+                    log::info!("assigned '{}' -> {}", confirmed.identifier, confirmed.binding);
                 }
             },
             other => self.bindings.apply_ui_action(other),
@@ -409,7 +409,7 @@ impl ClientGame {
 
     pub(in crate::game) fn send_bound_inputs<F>(&mut self, read_value: F) -> Result<()>
     where
-        F: FnMut(&bindings::InputPath) -> f32,
+        F: FnMut(&bindings::RawSource) -> protocol::InputPayload,
     {
         if !self.net.is_established() {
             return Ok(());
@@ -585,9 +585,9 @@ impl ClientGame {
             identifier,
             input_type,
         ) {
-            DeclareBindingOutcome::Restored { binding_id, input, identifier } => {
+            DeclareBindingOutcome::Restored { binding_id, binding, identifier } => {
                 self.send_binding_ack(binding_id)?;
-                log::debug!("restored '{}' -> {}", identifier, input);
+                log::debug!("restored '{}' -> {}", identifier, binding);
             },
             DeclareBindingOutcome::Pending => {},
         }

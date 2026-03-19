@@ -1,38 +1,66 @@
 use std::fmt;
 
-use strum::{Display, EnumIter, IntoEnumIterator, IntoStaticStr};
+use serde::{Deserialize, Serialize};
+use strum::{Display, EnumIter, IntoStaticStr};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum DeviceSelector {
-    Any,
-    Exact(String),
+use super::protocol;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceType {
+    Keyboard,
+    Mouse,
+    Gamepad,
 }
 
-impl DeviceSelector {
-    pub(crate) fn matches(&self, device_id: &str) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Exact(expected) => expected == device_id,
-        }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct DeviceFilter {
+    #[serde(rename = "type")]
+    pub(crate) device_type: DeviceType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
+}
+
+impl DeviceFilter {
+    pub(crate) fn any(device_type: DeviceType) -> Self {
+        Self { device_type, id: None }
     }
 
-    fn as_path(&self) -> &str {
-        match self {
-            Self::Any => "*",
-            Self::Exact(id) => id,
-        }
+    pub(crate) fn exact(device_type: DeviceType, id: String) -> Self {
+        Self { device_type, id: Some(id) }
     }
 
-    fn parse(raw: &str) -> Self {
-        if raw == "*" {
-            Self::Any
+    pub(crate) fn matches(&self, device_type: DeviceType, device_id: &str) -> bool {
+        self.device_type == device_type
+            && self.id.as_deref().map(|expected| expected == device_id).unwrap_or(true)
+    }
+
+    pub(crate) fn with_scope(&self, any_device: bool) -> Self {
+        if any_device {
+            Self::any(self.device_type)
         } else {
-            Self::Exact(raw.to_string())
+            self.clone()
         }
+    }
+
+    fn scope_label(&self) -> &str {
+        self.id.as_deref().unwrap_or("*")
     }
 }
 
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumIter,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    PartialEq,
+)]
 pub(crate) enum MouseAxis {
     MotionX,
     MotionY,
@@ -40,7 +68,19 @@ pub(crate) enum MouseAxis {
     WheelY,
 }
 
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumIter,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    PartialEq,
+)]
 pub(crate) enum GamepadButton {
     South,
     East,
@@ -63,7 +103,19 @@ pub(crate) enum GamepadButton {
     DPadRight,
 }
 
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumIter,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    PartialEq,
+)]
 pub(crate) enum GamepadAxis {
     LeftStickX,
     LeftStickY,
@@ -75,7 +127,19 @@ pub(crate) enum GamepadAxis {
     DPadY,
 }
 
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, Hash, IntoStaticStr, PartialEq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumIter,
+    Eq,
+    Hash,
+    IntoStaticStr,
+    PartialEq,
+)]
 pub(crate) enum KeyboardKey {
     Digit0,
     Digit1,
@@ -185,7 +249,7 @@ pub(crate) enum KeyboardKey {
     Quote,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub(crate) enum MouseButtonKind {
     Left,
     Right,
@@ -195,177 +259,148 @@ pub(crate) enum MouseButtonKind {
     Other(u16),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum BindingDeclaration {
-    KeyboardKey {
-        device: DeviceSelector,
-        key: KeyboardKey,
-    },
-    MouseButton {
-        device: DeviceSelector,
-        button: MouseButtonKind,
-    },
-    MouseAxis {
-        device: DeviceSelector,
-        axis: MouseAxis,
-    },
-    GamepadButton {
-        device: DeviceSelector,
-        button: GamepadButton,
-    },
-    GamepadAxis {
-        device: DeviceSelector,
-        axis: GamepadAxis,
-    },
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Display, PartialEq, Eq, Hash)]
+pub(crate) enum GamepadStick {
+    Left,
+    Right,
+    DPad,
 }
 
-pub(crate) type InputPath = BindingDeclaration;
-
-impl BindingDeclaration {
-    pub(crate) fn with_device_scope(&self, any_device: bool) -> Self {
-        let selector = if any_device {
-            DeviceSelector::Any
-        } else {
-            match self.device_selector() {
-                DeviceSelector::Any => DeviceSelector::Any,
-                DeviceSelector::Exact(id) => DeviceSelector::Exact(id.to_string()),
-            }
-        };
-
+impl GamepadStick {
+    pub(crate) fn axes(self) -> (GamepadAxis, GamepadAxis) {
         match self {
-            Self::KeyboardKey { key, .. } => Self::KeyboardKey { device: selector, key: *key },
-            Self::MouseButton { button, .. } => {
-                Self::MouseButton { device: selector, button: *button }
-            },
-            Self::MouseAxis { axis, .. } => Self::MouseAxis { device: selector, axis: *axis },
-            Self::GamepadButton { button, .. } => {
-                Self::GamepadButton { device: selector, button: *button }
-            },
-            Self::GamepadAxis { axis, .. } => Self::GamepadAxis { device: selector, axis: *axis },
+            Self::Left => (GamepadAxis::LeftStickX, GamepadAxis::LeftStickY),
+            Self::Right => (GamepadAxis::RightStickX, GamepadAxis::RightStickY),
+            Self::DPad => (GamepadAxis::DPadX, GamepadAxis::DPadY),
         }
     }
 
-    fn device_selector(&self) -> &DeviceSelector {
-        match self {
-            Self::KeyboardKey { device, .. }
-            | Self::MouseButton { device, .. }
-            | Self::MouseAxis { device, .. }
-            | Self::GamepadButton { device, .. }
-            | Self::GamepadAxis { device, .. } => device,
+    pub(crate) fn from_axis(axis: GamepadAxis) -> Option<Self> {
+        match axis {
+            GamepadAxis::LeftStickX | GamepadAxis::LeftStickY => Some(Self::Left),
+            GamepadAxis::RightStickX | GamepadAxis::RightStickY => Some(Self::Right),
+            GamepadAxis::DPadX | GamepadAxis::DPadY => Some(Self::DPad),
+            GamepadAxis::LeftZ | GamepadAxis::RightZ => None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ActionBinding {
+    #[serde(rename = "type")]
+    pub(crate) action_type: protocol::InputType,
+    pub(crate) sources: Vec<RawSource>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct RawSource {
+    pub(crate) device: DeviceFilter,
+    pub(crate) input: InputDescriptor,
+}
+
+impl RawSource {
+    pub(crate) fn with_device_scope(&self, any_device: bool) -> Self {
+        Self { device: self.device.with_scope(any_device), input: self.input.clone() }
     }
 
     pub(crate) fn is_toggle_compatible(&self) -> bool {
         matches!(
-            self,
-            Self::KeyboardKey { .. } | Self::MouseButton { .. } | Self::GamepadButton { .. }
+            self.input,
+            InputDescriptor::Key { .. }
+                | InputDescriptor::MouseButton { .. }
+                | InputDescriptor::GamepadButton { .. }
         )
     }
 
     pub(crate) fn is_axis_1d_compatible(&self) -> bool {
-        matches!(self, Self::MouseAxis { .. } | Self::GamepadAxis { .. })
+        matches!(
+            self.input,
+            InputDescriptor::MouseAxis { .. } | InputDescriptor::GamepadAxis { .. }
+        )
+    }
+
+    pub(crate) fn is_joystick_2d_compatible(&self) -> bool {
+        matches!(self.input, InputDescriptor::VirtualStick { .. } | InputDescriptor::Stick { .. })
     }
 }
 
-impl fmt::Display for BindingDeclaration {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum InputDescriptor {
+    Key {
+        code: KeyboardKey,
+    },
+    MouseButton {
+        button: MouseButtonKind,
+    },
+    MouseAxis {
+        axis: MouseAxis,
+    },
+    GamepadButton {
+        button: GamepadButton,
+    },
+    GamepadAxis {
+        axis: GamepadAxis,
+    },
+    VirtualStick {
+        positive_x: KeyboardKey,
+        negative_x: KeyboardKey,
+        positive_y: KeyboardKey,
+        negative_y: KeyboardKey,
+    },
+    Stick {
+        stick: GamepadStick,
+    },
+}
+
+impl fmt::Display for ActionBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::KeyboardKey { device, key } => {
-                write!(f, "keyboard/{}/key/{key}", device.as_path())
+        let mut sources = self.sources.iter();
+        if let Some(first) = sources.next() {
+            write!(f, "{first}")?;
+            for source in sources {
+                write!(f, " | {source}")?;
+            }
+        } else {
+            write!(f, "<no sources>")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for RawSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.input {
+            InputDescriptor::Key { code } => {
+                write!(f, "keyboard/{}/key/{code}", self.device.scope_label())
             },
-            Self::MouseButton { device, button } => {
-                write!(f, "mouse/{}/button/{button}", device.as_path())
+            InputDescriptor::MouseButton { button } => {
+                write!(f, "mouse/{}/button/{button}", self.device.scope_label())
             },
-            Self::MouseAxis { device, axis } => {
-                write!(f, "mouse/{}/axis/{axis}", device.as_path())
+            InputDescriptor::MouseAxis { axis } => {
+                write!(f, "mouse/{}/axis/{axis}", self.device.scope_label())
             },
-            Self::GamepadButton { device, button } => {
-                write!(f, "gamepad/{}/button/{button}", device.as_path())
+            InputDescriptor::GamepadButton { button } => {
+                write!(f, "gamepad/{}/button/{button}", self.device.scope_label())
             },
-            Self::GamepadAxis { device, axis } => {
-                write!(f, "gamepad/{}/axis/{axis}", device.as_path())
+            InputDescriptor::GamepadAxis { axis } => {
+                write!(f, "gamepad/{}/axis/{axis}", self.device.scope_label())
+            },
+            InputDescriptor::VirtualStick {
+                positive_x,
+                negative_x,
+                positive_y,
+                negative_y,
+            } => write!(
+                f,
+                "keyboard/{}/virtual_stick(+x={positive_x},-x={negative_x},+y={positive_y},-y={negative_y})",
+                self.device.scope_label()
+            ),
+            InputDescriptor::Stick { stick } => {
+                write!(f, "gamepad/{}/stick/{stick}", self.device.scope_label())
             },
         }
     }
-}
-
-pub(crate) fn parse_input_path(path: &str) -> Option<InputPath> {
-    let mut parts = path.split('/');
-    let device_kind = parts.next()?;
-    let device_selector = DeviceSelector::parse(parts.next()?);
-    let control_kind = parts.next()?;
-    let control_name = parts.next()?;
-
-    if parts.next().is_some() {
-        return None;
-    }
-
-    match (device_kind, control_kind) {
-        ("keyboard", "key") => Some(InputPath::KeyboardKey {
-            device: device_selector,
-            key: parse_keyboard_key(control_name)?,
-        }),
-        ("mouse", "button") => Some(InputPath::MouseButton {
-            device: device_selector,
-            button: parse_mouse_button(control_name)?,
-        }),
-        ("mouse", "axis") => Some(InputPath::MouseAxis {
-            device: device_selector,
-            axis: parse_mouse_axis(control_name)?,
-        }),
-        ("gamepad", "button") => Some(InputPath::GamepadButton {
-            device: device_selector,
-            button: parse_gamepad_button(control_name)?,
-        }),
-        ("gamepad", "axis") => Some(InputPath::GamepadAxis {
-            device: device_selector,
-            axis: parse_gamepad_axis(control_name)?,
-        }),
-        _ => None,
-    }
-}
-
-fn parse_keyboard_key(raw: &str) -> Option<KeyboardKey> {
-    KeyboardKey::iter().find(|key| {
-        let key_name: &'static str = (*key).into();
-        key_name == raw
-    })
-}
-
-fn parse_mouse_button(raw: &str) -> Option<MouseButtonKind> {
-    match raw {
-        "Left" => Some(MouseButtonKind::Left),
-        "Right" => Some(MouseButtonKind::Right),
-        "Middle" => Some(MouseButtonKind::Middle),
-        "Back" => Some(MouseButtonKind::Back),
-        "Forward" => Some(MouseButtonKind::Forward),
-        _ => {
-            let suffix = raw.strip_prefix("Other(")?.strip_suffix(')')?;
-            let value = suffix.parse::<u16>().ok()?;
-            Some(MouseButtonKind::Other(value))
-        },
-    }
-}
-
-fn parse_mouse_axis(raw: &str) -> Option<MouseAxis> {
-    MouseAxis::iter().find(|axis| {
-        let axis_name: &'static str = (*axis).into();
-        axis_name == raw
-    })
-}
-
-fn parse_gamepad_button(raw: &str) -> Option<GamepadButton> {
-    GamepadButton::iter().find(|button| {
-        let name: &'static str = (*button).into();
-        name == raw
-    })
-}
-
-fn parse_gamepad_axis(raw: &str) -> Option<GamepadAxis> {
-    GamepadAxis::iter().find(|axis| {
-        let name: &'static str = (*axis).into();
-        name == raw
-    })
 }
 
 impl fmt::Display for MouseButtonKind {

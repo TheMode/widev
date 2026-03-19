@@ -5,11 +5,14 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, Win
 use winit::keyboard::PhysicalKey;
 
 use super::model::{
-    DeviceSelector, GamepadAxis, GamepadButton, InputPath, KeyboardKey, MouseAxis, MouseButtonKind,
+    DeviceFilter, DeviceType, GamepadAxis, GamepadButton, GamepadStick, InputDescriptor,
+    KeyboardKey, MouseAxis, MouseButtonKind, RawSource,
 };
+use super::protocol;
 use super::UiAction;
 
 const GAMEPAD_AXIS_CAPTURE_THRESHOLD: f32 = 0.35;
+const GAMEPAD_STICK_CAPTURE_THRESHOLD: f32 = 0.45;
 const MOUSE_AXIS_CAPTURE_THRESHOLD: f32 = 0.1;
 
 pub(crate) struct InputCapture {
@@ -20,7 +23,7 @@ pub(crate) struct InputCapture {
     mouse_axes: HashMap<(String, MouseAxis), f32>,
     gamepad_axes: HashMap<(String, GamepadAxis), f32>,
     just_pressed_keys: Vec<KeyboardKey>,
-    just_captured_inputs: Vec<InputPath>,
+    just_captured_sources: Vec<RawSource>,
 }
 
 impl InputCapture {
@@ -40,7 +43,7 @@ impl InputCapture {
             mouse_axes: HashMap::new(),
             gamepad_axes: HashMap::new(),
             just_pressed_keys: Vec::new(),
-            just_captured_inputs: Vec::new(),
+            just_captured_sources: Vec::new(),
         }
     }
 
@@ -62,9 +65,9 @@ impl InputCapture {
                 GilrsEventType::ButtonPressed(button, _) => {
                     if let Some(button) = gamepad_button_from_gilrs(button) {
                         self.pressed_gamepad_buttons.insert((device.clone(), button));
-                        self.just_captured_inputs.push(InputPath::GamepadButton {
-                            device: DeviceSelector::Exact(device),
-                            button,
+                        self.just_captured_sources.push(RawSource {
+                            device: DeviceFilter::exact(DeviceType::Gamepad, device),
+                            input: InputDescriptor::GamepadButton { button },
                         });
                     }
                 },
@@ -77,10 +80,20 @@ impl InputCapture {
                     if let Some(axis) = gamepad_axis_from_gilrs(axis) {
                         self.gamepad_axes.insert((device.clone(), axis), value);
                         if value.abs() >= GAMEPAD_AXIS_CAPTURE_THRESHOLD {
-                            self.just_captured_inputs.push(InputPath::GamepadAxis {
-                                device: DeviceSelector::Exact(device),
-                                axis,
+                            self.just_captured_sources.push(RawSource {
+                                device: DeviceFilter::exact(DeviceType::Gamepad, device.clone()),
+                                input: InputDescriptor::GamepadAxis { axis },
                             });
+                        }
+                        if let Some(stick) = GamepadStick::from_axis(axis) {
+                            let magnitude =
+                                read_gamepad_stick_magnitude(&self.gamepad_axes, &device, stick);
+                            if magnitude >= GAMEPAD_STICK_CAPTURE_THRESHOLD {
+                                self.just_captured_sources.push(RawSource {
+                                    device: DeviceFilter::exact(DeviceType::Gamepad, device),
+                                    input: InputDescriptor::Stick { stick },
+                                });
+                            }
                         }
                     }
                 },
@@ -101,9 +114,9 @@ impl InputCapture {
                         if let Some(key) = keyboard_key_from_winit(code) {
                             if !event.repeat && self.pressed_keys.insert((device.clone(), key)) {
                                 self.just_pressed_keys.push(key);
-                                self.just_captured_inputs.push(InputPath::KeyboardKey {
-                                    device: DeviceSelector::Exact(device),
-                                    key,
+                                self.just_captured_sources.push(RawSource {
+                                    device: DeviceFilter::exact(DeviceType::Keyboard, device),
+                                    input: InputDescriptor::Key { code: key },
                                 });
                             }
                         }
@@ -121,9 +134,9 @@ impl InputCapture {
                     ElementState::Pressed => {
                         if let Some(button) = mouse_button_from_winit(*button) {
                             if self.pressed_mouse_buttons.insert((device.clone(), button)) {
-                                self.just_captured_inputs.push(InputPath::MouseButton {
-                                    device: DeviceSelector::Exact(device),
-                                    button,
+                                self.just_captured_sources.push(RawSource {
+                                    device: DeviceFilter::exact(DeviceType::Mouse, device),
+                                    input: InputDescriptor::MouseButton { button },
                                 });
                             }
                         }
@@ -144,16 +157,16 @@ impl InputCapture {
 
                 if x.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                     self.mouse_axes.insert((device.clone(), MouseAxis::WheelX), x);
-                    self.just_captured_inputs.push(InputPath::MouseAxis {
-                        device: DeviceSelector::Exact(device.clone()),
-                        axis: MouseAxis::WheelX,
+                    self.just_captured_sources.push(RawSource {
+                        device: DeviceFilter::exact(DeviceType::Mouse, device.clone()),
+                        input: InputDescriptor::MouseAxis { axis: MouseAxis::WheelX },
                     });
                 }
                 if y.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                     self.mouse_axes.insert((device.clone(), MouseAxis::WheelY), y);
-                    self.just_captured_inputs.push(InputPath::MouseAxis {
-                        device: DeviceSelector::Exact(device),
-                        axis: MouseAxis::WheelY,
+                    self.just_captured_sources.push(RawSource {
+                        device: DeviceFilter::exact(DeviceType::Mouse, device),
+                        input: InputDescriptor::MouseAxis { axis: MouseAxis::WheelY },
                     });
                 }
             },
@@ -172,27 +185,27 @@ impl InputCapture {
             let dy = delta.1 as f32;
             if dx.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                 self.mouse_axes.insert((device.clone(), MouseAxis::MotionX), dx);
-                self.just_captured_inputs.push(InputPath::MouseAxis {
-                    device: DeviceSelector::Exact(device.clone()),
-                    axis: MouseAxis::MotionX,
+                self.just_captured_sources.push(RawSource {
+                    device: DeviceFilter::exact(DeviceType::Mouse, device.clone()),
+                    input: InputDescriptor::MouseAxis { axis: MouseAxis::MotionX },
                 });
             }
             if dy.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                 self.mouse_axes.insert((device.clone(), MouseAxis::MotionY), dy);
-                self.just_captured_inputs.push(InputPath::MouseAxis {
-                    device: DeviceSelector::Exact(device),
-                    axis: MouseAxis::MotionY,
+                self.just_captured_sources.push(RawSource {
+                    device: DeviceFilter::exact(DeviceType::Mouse, device),
+                    input: InputDescriptor::MouseAxis { axis: MouseAxis::MotionY },
                 });
             }
         }
     }
 
     pub(crate) fn binding_actions(&self) -> Vec<UiAction> {
-        let mut out = Vec::with_capacity(self.just_captured_inputs.len() + 3);
+        let mut out = Vec::with_capacity(self.just_captured_sources.len() + 3);
         out.extend(
-            self.just_captured_inputs
+            self.just_captured_sources
                 .iter()
-                .filter(|input| !is_prompt_control_input(input))
+                .filter(|source| !is_prompt_control_input(source))
                 .cloned()
                 .map(UiAction::Suggest),
         );
@@ -208,65 +221,49 @@ impl InputCapture {
         out
     }
 
-    pub(crate) fn read_binding_value(&self, path: &InputPath) -> f32 {
-        match path {
-            InputPath::KeyboardKey { device, key } => {
-                if self
-                    .pressed_keys
-                    .iter()
-                    .any(|(device_id, pressed)| device.matches(device_id) && pressed == key)
-                {
-                    1.0
-                } else {
-                    0.0
+    pub(crate) fn read_binding_value(&self, source: &RawSource) -> protocol::InputPayload {
+        match &source.input {
+            InputDescriptor::Key { code } => {
+                protocol::InputPayload::Toggle {
+                    pressed: self.read_pressed_key(&source.device, *code),
                 }
             },
-            InputPath::MouseButton { device, button } => {
-                if self
-                    .pressed_mouse_buttons
-                    .iter()
-                    .any(|(device_id, pressed)| device.matches(device_id) && pressed == button)
-                {
-                    1.0
-                } else {
-                    0.0
+            InputDescriptor::MouseButton { button } => {
+                protocol::InputPayload::Toggle {
+                    pressed: self.read_pressed_mouse_button(&source.device, *button),
                 }
             },
-            InputPath::MouseAxis { device, axis } => self
-                .mouse_axes
-                .iter()
-                .filter(|((device_id, current_axis), _)| {
-                    device.matches(device_id) && current_axis == axis
-                })
-                .map(|(_, value)| *value)
-                .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-                .unwrap_or(0.0),
-            InputPath::GamepadButton { device, button } => {
-                if self
-                    .pressed_gamepad_buttons
-                    .iter()
-                    .any(|(device_id, pressed)| device.matches(device_id) && pressed == button)
-                {
-                    1.0
-                } else {
-                    0.0
+            InputDescriptor::MouseAxis { axis } => {
+                protocol::InputPayload::Axis1D { value: self.read_mouse_axis(&source.device, *axis) }
+            },
+            InputDescriptor::GamepadButton { button } => {
+                protocol::InputPayload::Toggle {
+                    pressed: self.read_pressed_gamepad_button(&source.device, *button),
                 }
             },
-            InputPath::GamepadAxis { device, axis } => self
-                .gamepad_axes
-                .iter()
-                .filter(|((device_id, current_axis), _)| {
-                    device.matches(device_id) && current_axis == axis
-                })
-                .map(|(_, value)| *value)
-                .max_by(|a, b| a.abs().total_cmp(&b.abs()))
-                .unwrap_or(0.0),
+            InputDescriptor::GamepadAxis { axis } => {
+                protocol::InputPayload::Axis1D { value: self.read_gamepad_axis(&source.device, *axis) }
+            },
+            InputDescriptor::VirtualStick { positive_x, negative_x, positive_y, negative_y } => {
+                let x =
+                    axis_from_keys(&self.pressed_keys, &source.device, *positive_x, *negative_x);
+                let y =
+                    axis_from_keys(&self.pressed_keys, &source.device, *positive_y, *negative_y);
+                protocol::InputPayload::Joystick2D { x, y }
+            },
+            InputDescriptor::Stick { stick } => {
+                let (x_axis, y_axis) = stick.axes();
+                protocol::InputPayload::Joystick2D {
+                    x: self.read_gamepad_axis(&source.device, x_axis),
+                    y: self.read_gamepad_axis(&source.device, y_axis),
+                }
+            },
         }
     }
 
     pub(crate) fn end_frame(&mut self) {
         self.just_pressed_keys.clear();
-        self.just_captured_inputs.clear();
+        self.just_captured_sources.clear();
         self.mouse_axes.clear();
     }
 
@@ -277,19 +274,84 @@ impl InputCapture {
         self.mouse_axes.clear();
         self.gamepad_axes.clear();
         self.just_pressed_keys.clear();
-        self.just_captured_inputs.clear();
+        self.just_captured_sources.clear();
+    }
+
+    fn read_pressed_key(&self, filter: &DeviceFilter, key: KeyboardKey) -> bool {
+        self.pressed_keys.iter().any(|(device_id, pressed)| {
+            filter.matches(DeviceType::Keyboard, device_id) && pressed == &key
+        })
+    }
+
+    fn read_pressed_mouse_button(&self, filter: &DeviceFilter, button: MouseButtonKind) -> bool {
+        self.pressed_mouse_buttons.iter().any(|(device_id, pressed)| {
+            filter.matches(DeviceType::Mouse, device_id) && pressed == &button
+        })
+    }
+
+    fn read_pressed_gamepad_button(&self, filter: &DeviceFilter, button: GamepadButton) -> bool {
+        self.pressed_gamepad_buttons.iter().any(|(device_id, pressed)| {
+            filter.matches(DeviceType::Gamepad, device_id) && pressed == &button
+        })
+    }
+
+    fn read_mouse_axis(&self, filter: &DeviceFilter, axis: MouseAxis) -> f32 {
+        self.mouse_axes
+            .iter()
+            .filter(|((device_id, current_axis), _)| {
+                filter.matches(DeviceType::Mouse, device_id) && current_axis == &axis
+            })
+            .map(|(_, value)| *value)
+            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
+    }
+
+    fn read_gamepad_axis(&self, filter: &DeviceFilter, axis: GamepadAxis) -> f32 {
+        self.gamepad_axes
+            .iter()
+            .filter(|((device_id, current_axis), _)| {
+                filter.matches(DeviceType::Gamepad, device_id) && current_axis == &axis
+            })
+            .map(|(_, value)| *value)
+            .max_by(|a, b| a.abs().total_cmp(&b.abs()))
+            .unwrap_or(0.0)
     }
 }
 
-fn is_prompt_control_input(input: &InputPath) -> bool {
+fn axis_from_keys(
+    pressed_keys: &HashSet<(String, KeyboardKey)>,
+    filter: &DeviceFilter,
+    positive: KeyboardKey,
+    negative: KeyboardKey,
+) -> f32 {
+    let positive_pressed = pressed_keys.iter().any(|(device_id, key)| {
+        filter.matches(DeviceType::Keyboard, device_id) && key == &positive
+    });
+    let negative_pressed = pressed_keys.iter().any(|(device_id, key)| {
+        filter.matches(DeviceType::Keyboard, device_id) && key == &negative
+    });
+    (positive_pressed as i8 - negative_pressed as i8) as f32
+}
+
+fn read_gamepad_stick_magnitude(
+    gamepad_axes: &HashMap<(String, GamepadAxis), f32>,
+    device_id: &str,
+    stick: GamepadStick,
+) -> f32 {
+    let (x_axis, y_axis) = stick.axes();
+    let x = gamepad_axes.get(&(device_id.to_string(), x_axis)).copied().unwrap_or(0.0);
+    let y = gamepad_axes.get(&(device_id.to_string(), y_axis)).copied().unwrap_or(0.0);
+    x.hypot(y)
+}
+
+fn is_prompt_control_input(source: &RawSource) -> bool {
     matches!(
-        input,
-        InputPath::KeyboardKey {
-            key: KeyboardKey::Enter
+        source.input,
+        InputDescriptor::Key {
+            code: KeyboardKey::Enter
                 | KeyboardKey::Backspace
                 | KeyboardKey::Tab
                 | KeyboardKey::Escape,
-            ..
         }
     )
 }
@@ -418,40 +480,40 @@ fn mouse_button_from_winit(button: MouseButton) -> Option<MouseButtonKind> {
 }
 
 fn gamepad_button_from_gilrs(button: GilrsButton) -> Option<GamepadButton> {
-    match button {
-        GilrsButton::South => Some(GamepadButton::South),
-        GilrsButton::East => Some(GamepadButton::East),
-        GilrsButton::North => Some(GamepadButton::North),
-        GilrsButton::West => Some(GamepadButton::West),
-        GilrsButton::C => Some(GamepadButton::C),
-        GilrsButton::Z => Some(GamepadButton::Z),
-        GilrsButton::LeftTrigger => Some(GamepadButton::LeftTrigger),
-        GilrsButton::LeftTrigger2 => Some(GamepadButton::LeftTrigger2),
-        GilrsButton::RightTrigger => Some(GamepadButton::RightTrigger),
-        GilrsButton::RightTrigger2 => Some(GamepadButton::RightTrigger2),
-        GilrsButton::Select => Some(GamepadButton::Select),
-        GilrsButton::Start => Some(GamepadButton::Start),
-        GilrsButton::Mode => Some(GamepadButton::Mode),
-        GilrsButton::LeftThumb => Some(GamepadButton::LeftThumb),
-        GilrsButton::RightThumb => Some(GamepadButton::RightThumb),
-        GilrsButton::DPadUp => Some(GamepadButton::DPadUp),
-        GilrsButton::DPadDown => Some(GamepadButton::DPadDown),
-        GilrsButton::DPadLeft => Some(GamepadButton::DPadLeft),
-        GilrsButton::DPadRight => Some(GamepadButton::DPadRight),
-        GilrsButton::Unknown => None,
-    }
+    Some(match button {
+        GilrsButton::South => GamepadButton::South,
+        GilrsButton::East => GamepadButton::East,
+        GilrsButton::North => GamepadButton::North,
+        GilrsButton::West => GamepadButton::West,
+        GilrsButton::C => GamepadButton::C,
+        GilrsButton::Z => GamepadButton::Z,
+        GilrsButton::LeftTrigger => GamepadButton::LeftTrigger,
+        GilrsButton::LeftTrigger2 => GamepadButton::LeftTrigger2,
+        GilrsButton::RightTrigger => GamepadButton::RightTrigger,
+        GilrsButton::RightTrigger2 => GamepadButton::RightTrigger2,
+        GilrsButton::Select => GamepadButton::Select,
+        GilrsButton::Start => GamepadButton::Start,
+        GilrsButton::Mode => GamepadButton::Mode,
+        GilrsButton::LeftThumb => GamepadButton::LeftThumb,
+        GilrsButton::RightThumb => GamepadButton::RightThumb,
+        GilrsButton::DPadUp => GamepadButton::DPadUp,
+        GilrsButton::DPadDown => GamepadButton::DPadDown,
+        GilrsButton::DPadLeft => GamepadButton::DPadLeft,
+        GilrsButton::DPadRight => GamepadButton::DPadRight,
+        _ => return None,
+    })
 }
 
 fn gamepad_axis_from_gilrs(axis: GilrsAxis) -> Option<GamepadAxis> {
-    match axis {
-        GilrsAxis::LeftStickX => Some(GamepadAxis::LeftStickX),
-        GilrsAxis::LeftStickY => Some(GamepadAxis::LeftStickY),
-        GilrsAxis::LeftZ => Some(GamepadAxis::LeftZ),
-        GilrsAxis::RightStickX => Some(GamepadAxis::RightStickX),
-        GilrsAxis::RightStickY => Some(GamepadAxis::RightStickY),
-        GilrsAxis::RightZ => Some(GamepadAxis::RightZ),
-        GilrsAxis::DPadX => Some(GamepadAxis::DPadX),
-        GilrsAxis::DPadY => Some(GamepadAxis::DPadY),
-        GilrsAxis::Unknown => None,
-    }
+    Some(match axis {
+        GilrsAxis::LeftStickX => GamepadAxis::LeftStickX,
+        GilrsAxis::LeftStickY => GamepadAxis::LeftStickY,
+        GilrsAxis::LeftZ => GamepadAxis::LeftZ,
+        GilrsAxis::RightStickX => GamepadAxis::RightStickX,
+        GilrsAxis::RightStickY => GamepadAxis::RightStickY,
+        GilrsAxis::RightZ => GamepadAxis::RightZ,
+        GilrsAxis::DPadX => GamepadAxis::DPadX,
+        GilrsAxis::DPadY => GamepadAxis::DPadY,
+        _ => return None,
+    })
 }

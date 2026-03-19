@@ -184,25 +184,25 @@ impl BotFlow for AckAndMoveFlow {
         if let Some(binding_id) = self.up {
             ctx.send(protocol::C2SPacket::InputValue {
                 binding_id,
-                value: if up { 1.0 } else { 0.0 },
+                value: protocol::InputPayload::Toggle { pressed: up },
             });
         }
         if let Some(binding_id) = self.down {
             ctx.send(protocol::C2SPacket::InputValue {
                 binding_id,
-                value: if down { 1.0 } else { 0.0 },
+                value: protocol::InputPayload::Toggle { pressed: down },
             });
         }
         if let Some(binding_id) = self.left {
             ctx.send(protocol::C2SPacket::InputValue {
                 binding_id,
-                value: if left { 1.0 } else { 0.0 },
+                value: protocol::InputPayload::Toggle { pressed: left },
             });
         }
         if let Some(binding_id) = self.right {
             ctx.send(protocol::C2SPacket::InputValue {
                 binding_id,
-                value: if right { 1.0 } else { 0.0 },
+                value: protocol::InputPayload::Toggle { pressed: right },
             });
         }
 

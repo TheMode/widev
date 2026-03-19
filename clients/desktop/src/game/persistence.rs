@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+use super::bindings::ActionBinding;
+
+#[derive(Debug, Serialize, Deserialize)]
 struct PersistedData {
     #[serde(default)]
     global: PersistedSettings,
@@ -13,10 +15,16 @@ struct PersistedData {
     servers: HashMap<String, PersistedSettings>,
 }
 
+impl Default for PersistedData {
+    fn default() -> Self {
+        Self { global: PersistedSettings::default(), servers: HashMap::new() }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedSettings {
     #[serde(default)]
-    bindings: HashMap<String, String>,
+    bindings: HashMap<String, ActionBinding>,
 }
 
 pub(super) struct BindingStore {
@@ -38,12 +46,7 @@ impl BindingStore {
             Ok(data) => data,
             Err(err) => {
                 log::warn!("failed to parse {}, resetting binding cache: {err}", path.display());
-                if let Err(remove_err) = fs::remove_file(&path) {
-                    log::warn!(
-                        "failed to delete corrupt bindings file {}: {remove_err}",
-                        path.display()
-                    );
-                }
+                reset_corrupt_store_file(&path);
                 PersistedData::default()
             },
         };
@@ -51,7 +54,7 @@ impl BindingStore {
         Ok(Self { path, data })
     }
 
-    pub(super) fn get_binding_path(&self, cert_fp: &str, identifier: &str) -> Option<String> {
+    pub(super) fn get_binding(&self, cert_fp: &str, identifier: &str) -> Option<ActionBinding> {
         self.data
             .servers
             .get(cert_fp)
@@ -75,9 +78,9 @@ impl BindingStore {
             .unwrap_or_else(|| self.data.global.bindings.len())
     }
 
-    pub(super) fn set_binding_path(&mut self, cert_fp: &str, identifier: &str, input_path: String) {
+    pub(super) fn set_binding(&mut self, cert_fp: &str, identifier: &str, binding: ActionBinding) {
         let server = self.data.servers.entry(cert_fp.to_string()).or_default();
-        server.bindings.insert(identifier.to_string(), input_path);
+        server.bindings.insert(identifier.to_string(), binding);
     }
 
     pub(super) fn save(&self) -> Result<()> {
@@ -91,5 +94,47 @@ impl BindingStore {
         fs::write(&self.path, content)
             .with_context(|| format!("failed to write {}", self.path.display()))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_tests() -> Self {
+        Self { path: PathBuf::new(), data: PersistedData::default() }
+    }
+}
+
+fn reset_corrupt_store_file(path: &PathBuf) {
+    if let Err(remove_err) = fs::remove_file(path) {
+        log::warn!("failed to delete incompatible bindings file {}: {remove_err}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::bindings::{
+        DeviceFilter, DeviceType, InputDescriptor, KeyboardKey, RawSource,
+    };
+    use crate::game::protocol;
+
+    #[test]
+    fn structured_binding_store_round_trips() {
+        let binding = ActionBinding {
+            action_type: protocol::InputType::Toggle,
+            sources: vec![RawSource {
+                device: DeviceFilter::any(DeviceType::Keyboard),
+                input: InputDescriptor::Key { code: KeyboardKey::KeyW },
+            }],
+        };
+
+        let json = serde_json::to_string(&PersistedData {
+            global: PersistedSettings {
+                bindings: HashMap::from([(String::from("move_up"), binding.clone())]),
+            },
+            servers: HashMap::new(),
+        })
+        .expect("serialize");
+
+        let parsed: PersistedData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.global.bindings.get("move_up"), Some(&binding));
     }
 }

@@ -8,7 +8,6 @@ use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
 };
-use taffy::prelude::*;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -643,275 +642,203 @@ impl Renderer {
         let vw = virtual_w as f32;
         let vh = virtual_h as f32;
 
-        let panel_w = (vw * 0.86).clamp(540.0, (vw - 24.0).max(540.0));
-        let panel_h = (vh * 0.84).clamp(420.0, (vh - 24.0).max(420.0));
-        let panel_x = vw * 0.5;
-        let panel_y = vh * 0.5;
-        let panel_left = panel_x - panel_w * 0.5;
-        let panel_top = panel_y - panel_h * 0.5;
-        let ui_scale = (panel_w / 760.0).clamp(1.0, 2.0).round();
-        let pad = 20.0 * ui_scale;
-        let gap = 14.0 * ui_scale;
-        let header_h = 56.0 * ui_scale;
-        let action_h = 72.0 * ui_scale;
-        let row2_h = 84.0 * ui_scale;
-        let controls_h = 68.0 * ui_scale;
-        let mut taffy: TaffyTree<()> = TaffyTree::new();
-        let (Ok(header), Ok(action), Ok(left_card), Ok(right_card), Ok(controls), Ok(sources)) = (
-            taffy.new_leaf(Style {
-                size: Size { width: percent(1.0), height: length(header_h) },
-                ..Default::default()
-            }),
-            taffy.new_leaf(Style {
-                size: Size { width: percent(1.0), height: length(action_h) },
-                ..Default::default()
-            }),
-            taffy.new_leaf(Style {
-                flex_grow: 1.0,
-                flex_basis: length(0.0),
-                size: Size { width: auto(), height: percent(1.0) },
-                ..Default::default()
-            }),
-            taffy.new_leaf(Style {
-                flex_grow: 1.0,
-                flex_basis: length(0.0),
-                size: Size { width: auto(), height: percent(1.0) },
-                ..Default::default()
-            }),
-            taffy.new_leaf(Style {
-                size: Size { width: percent(1.0), height: length(controls_h) },
-                ..Default::default()
-            }),
-            taffy.new_leaf(Style {
-                flex_grow: 1.0,
-                min_size: Size { width: auto(), height: length(70.0 * ui_scale) },
-                ..Default::default()
-            }),
-        ) else {
-            return overlay;
-        };
-        let Ok(row2) = taffy.new_with_children(
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Row,
-                gap: Size { width: length(gap), height: length(0.0) },
-                size: Size { width: percent(1.0), height: length(row2_h) },
-                ..Default::default()
-            },
-            &[left_card, right_card],
-        ) else {
-            return overlay;
-        };
-        let Ok(root) = taffy.new_with_children(
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
-                size: Size { width: length(panel_w), height: length(panel_h) },
-                padding: Rect {
-                    left: length(pad),
-                    right: length(pad),
-                    top: length(pad),
-                    bottom: length(pad),
-                },
-                gap: Size { width: length(0.0), height: length(gap) },
-                ..Default::default()
-            },
-            &[header, action, row2, controls, sources],
-        ) else {
-            return overlay;
-        };
-        if taffy
-            .compute_layout(
-                root,
-                Size {
-                    width: AvailableSpace::Definite(panel_w),
-                    height: AvailableSpace::Definite(panel_h),
-                },
-            )
-            .is_err()
-        {
-            return overlay;
-        }
+        let ui_scale = ((vw.min(vh) / 720.0).clamp(0.9, 1.35) * 100.0).round() / 100.0;
+        let outer_margin = (32.0 * ui_scale).max(18.0);
+        let panel_w = (vw * 0.72).clamp(520.0, (vw - outer_margin * 2.0).max(520.0));
+        let panel_h = (vh * 0.74).clamp(360.0, (vh - outer_margin * 2.0).max(360.0));
+        let panel_left = ((vw - panel_w) * 0.5).max(outer_margin);
+        let panel_top = ((vh - panel_h) * 0.5).max(outer_margin);
+        let pad = 24.0 * ui_scale;
+        let section_gap = 18.0 * ui_scale;
+        let card_gap = 14.0 * ui_scale;
+        let left_col_w = (panel_w * 0.36).clamp(180.0, 280.0);
+        let right_col_w = panel_w - pad * 2.0 - left_col_w - card_gap;
+        let top_y = panel_top + pad;
+        let bottom_y = panel_top + panel_h - pad;
 
-        let get_rect = |node| {
-            let layout = taffy.layout(node).ok()?;
-            let left = panel_left + layout.location.x;
-            let top = panel_top + layout.location.y;
-            Some((left, top, layout.size.width, layout.size.height))
-        };
-        let Some((header_left, header_top, header_w, header_h)) = get_rect(header) else {
-            return overlay;
-        };
-        let Some((action_left, action_top, action_w, action_h)) = get_rect(action) else {
-            return overlay;
-        };
-        let Some((row2_left, row2_top, _row2_w, _row2_h)) = get_rect(row2) else {
-            return overlay;
-        };
-        let left_layout = match taffy.layout(left_card) {
-            Ok(layout) => layout,
-            Err(_) => return overlay,
-        };
-        let right_layout = match taffy.layout(right_card) {
-            Ok(layout) => layout,
-            Err(_) => return overlay,
-        };
-        let left_left = row2_left + left_layout.location.x;
-        let left_top = row2_top + left_layout.location.y;
-        let left_w = left_layout.size.width;
-        let left_h = left_layout.size.height;
-        let right_left = row2_left + right_layout.location.x;
-        let right_top = row2_top + right_layout.location.y;
-        let right_w = right_layout.size.width;
-        let right_h = right_layout.size.height;
-        if right_w <= 0.0 || right_h <= 0.0 {
-            return overlay;
-        }
-        let Some((controls_left, controls_top, controls_w, controls_h)) = get_rect(controls) else {
-            return overlay;
-        };
-        let Some((sources_left, sources_top, sources_w, sources_h)) = get_rect(sources) else {
-            return overlay;
-        };
+        let hero_h = 92.0 * ui_scale;
+        let info_h = 110.0 * ui_scale;
+        let footer_h = 64.0 * ui_scale;
+        let right_h = bottom_y - top_y;
+        let left_h = hero_h + section_gap + info_h + section_gap + footer_h;
+        let left_top = top_y + ((right_h - left_h).max(0.0) * 0.5);
+        let right_top = top_y;
+        let left_x = panel_left + pad;
+        let right_x = left_x + left_col_w + card_gap;
 
-        push_rect(&mut overlay.rects, panel_x, panel_y, panel_w, panel_h, 0x070b12);
-        draw_border(&mut overlay.rects, panel_left, panel_top, panel_w, panel_h, 0x2b3f5f);
-        push_rect(
-            &mut overlay.rects,
-            header_left + header_w * 0.5,
-            header_top + header_h * 0.5,
-            header_w,
-            header_h,
-            0x142033,
-        );
-        draw_text_line(
-            &mut overlay.texts,
-            header_left + 12.0 * ui_scale,
-            header_top + 14.0 * ui_scale,
-            "Input Binding",
-            header_w - 24.0 * ui_scale,
-            28.0 * ui_scale * 0.5,
-            0xe2e8f0,
-        );
+        let hero_top = left_top;
+        let info_top = hero_top + hero_h + section_gap;
+        let footer_top = info_top + info_h + section_gap;
+        let capture_h = right_h * 0.42;
+        let capture_top = right_top;
+        let supported_top = capture_top + capture_h + section_gap;
+        let supported_h = bottom_y - supported_top;
 
-        for (l, t, w, h) in [
-            (action_left, action_top, action_w, action_h),
-            (left_left, left_top, left_w, left_h),
-            (right_left, right_top, right_w, right_h),
-            (controls_left, controls_top, controls_w, controls_h),
-            (sources_left, sources_top, sources_w, sources_h),
+        let panel_fill = 0x0b1017;
+        let panel_border = 0x293242;
+        let card_fill = 0x111823;
+        let card_fill_emphasis = 0x151f2d;
+        let divider = 0x223042;
+        let text_primary = 0xe5e7eb;
+        let text_muted = 0x94a3b8;
+        let text_soft = 0xcbd5e1;
+        let accent = 0xcbd5e1;
+        let accent_warm = 0xf0d28a;
+        let accent_good = 0xa7d8b5;
+
+        push_rect(&mut overlay.rects, panel_left, panel_top, panel_w, panel_h, panel_fill);
+        draw_border(&mut overlay.rects, panel_left, panel_top, panel_w, panel_h, panel_border);
+
+        for (left, top, width, height, fill) in [
+            (left_x, hero_top, left_col_w, hero_h, card_fill_emphasis),
+            (left_x, info_top, left_col_w, info_h, card_fill),
+            (left_x, footer_top, left_col_w, footer_h, card_fill),
+            (right_x, capture_top, right_col_w, capture_h, card_fill_emphasis),
+            (right_x, supported_top, right_col_w, supported_h, card_fill),
         ] {
-            push_rect(&mut overlay.rects, l + w * 0.5, t + h * 0.5, w, h, 0x0f1727);
-            draw_border(&mut overlay.rects, l, t, w, h, 0x334155);
+            push_rect(&mut overlay.rects, left, top, width, height, fill);
+            draw_border(&mut overlay.rects, left, top, width, height, divider);
+        }
+
+        let section_pad = 18.0 * ui_scale;
+        let label_size = 11.0 * ui_scale;
+        let body_size = 14.0 * ui_scale;
+        let title_size = 27.0 * ui_scale;
+        let value_size = 18.0 * ui_scale;
+        let small_size = 12.0 * ui_scale;
+
+        draw_text_line(
+            &mut overlay.texts,
+            left_x + section_pad,
+            hero_top + 18.0 * ui_scale,
+            "INPUT BINDING",
+            left_col_w - section_pad * 2.0,
+            label_size,
+            text_muted,
+        );
+        draw_text_line(
+            &mut overlay.texts,
+            left_x + section_pad,
+            hero_top + 40.0 * ui_scale,
+            &prompt.identifier,
+            left_col_w - section_pad * 2.0,
+            title_size,
+            text_primary,
+        );
+        draw_text_line(
+            &mut overlay.texts,
+            left_x + section_pad,
+            hero_top + 70.0 * ui_scale,
+            &format!("{:?}", prompt.input_type),
+            left_col_w - section_pad * 2.0,
+            body_size,
+            accent,
+        );
+
+        let scope_label = if prompt.any_device_scope { "Any device (*)" } else { "Exact device" };
+        let capture_label = prompt.suggestion.as_deref().unwrap_or("Waiting for input");
+
+        draw_text_line(
+            &mut overlay.texts,
+            left_x + section_pad,
+            info_top + 18.0 * ui_scale,
+            "SCOPE",
+            left_col_w - section_pad * 2.0,
+            label_size,
+            text_muted,
+        );
+        draw_text_line(
+            &mut overlay.texts,
+            left_x + section_pad,
+            info_top + 40.0 * ui_scale,
+            scope_label,
+            left_col_w - section_pad * 2.0,
+            value_size,
+            accent_warm,
+        );
+        if let Some(hint) = &prompt.capture_hint {
+            draw_text_line(
+                &mut overlay.texts,
+                left_x + section_pad,
+                info_top + 72.0 * ui_scale,
+                hint,
+                left_col_w - section_pad * 2.0,
+                small_size,
+                text_soft,
+            );
         }
 
         draw_text_line(
             &mut overlay.texts,
-            action_left + 12.0 * ui_scale,
-            action_top + 12.0 * ui_scale,
-            &format!("Action: {}", prompt.identifier),
-            action_w - 24.0 * ui_scale,
-            22.0 * ui_scale * 0.5,
-            0xbfdbfe,
-        );
-        draw_text_line(
-            &mut overlay.texts,
-            action_left + 12.0 * ui_scale,
-            action_top + 36.0 * ui_scale,
-            &format!("Input Type: {:?}", prompt.input_type),
-            action_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0x93c5fd,
-        );
-
-        let scope_label = if prompt.any_device_scope { "Any Device (*)" } else { "Exact Device" };
-        let captured = prompt
-            .suggestion
-            .as_ref()
-            .map(|path| path.with_device_scope(prompt.any_device_scope).to_string())
-            .unwrap_or_else(|| "No input captured".to_string());
-        draw_text_line(
-            &mut overlay.texts,
-            left_left + 12.0 * ui_scale,
-            left_top + 10.0 * ui_scale,
-            "Device Scope",
-            left_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xf8fafc,
-        );
-        draw_text_line(
-            &mut overlay.texts,
-            left_left + 12.0 * ui_scale,
-            left_top + 36.0 * ui_scale,
-            scope_label,
-            left_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xfde68a,
-        );
-        draw_text_line(
-            &mut overlay.texts,
-            right_left + 12.0 * ui_scale,
-            right_top + 10.0 * ui_scale,
-            "Captured Input",
-            right_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xf8fafc,
-        );
-        draw_text_line(
-            &mut overlay.texts,
-            right_left + 12.0 * ui_scale,
-            right_top + 36.0 * ui_scale,
-            &captured,
-            right_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0x86efac,
+            left_x + section_pad,
+            footer_top + 16.0 * ui_scale,
+            "Enter confirm  |  Backspace skip  |  Tab scope  |  Esc close",
+            left_col_w - section_pad * 2.0,
+            small_size,
+            text_soft,
         );
 
         draw_text_line(
             &mut overlay.texts,
-            controls_left + 12.0 * ui_scale,
-            controls_top + 10.0 * ui_scale,
-            "Controls",
-            controls_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xf8fafc,
+            right_x + section_pad,
+            capture_top + 18.0 * ui_scale,
+            "CAPTURED INPUT",
+            right_col_w - section_pad * 2.0,
+            label_size,
+            text_muted,
         );
         draw_text_line(
             &mut overlay.texts,
-            controls_left + 12.0 * ui_scale,
-            controls_top + 36.0 * ui_scale,
-            "Enter confirm | Backspace skip | Tab toggle scope | Esc exit",
-            controls_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xfde68a,
+            right_x + section_pad,
+            capture_top + 48.0 * ui_scale,
+            capture_label,
+            right_col_w - section_pad * 2.0,
+            value_size,
+            accent_good,
+        );
+        draw_divider(
+            &mut overlay.rects,
+            right_x + section_pad,
+            capture_top + capture_h - 26.0 * ui_scale,
+            right_col_w - section_pad * 2.0,
+            divider,
+        );
+        draw_text_line(
+            &mut overlay.texts,
+            right_x + section_pad,
+            capture_top + capture_h - 18.0 * ui_scale,
+            "Press the control you want to bind. Confirm once the preview matches.",
+            right_col_w - section_pad * 2.0,
+            small_size,
+            text_muted,
         );
 
         draw_text_line(
             &mut overlay.texts,
-            sources_left + 12.0 * ui_scale,
-            sources_top + 10.0 * ui_scale,
-            "Supported Inputs",
-            sources_w - 24.0 * ui_scale,
-            18.0 * ui_scale * 0.5,
-            0xf8fafc,
+            right_x + section_pad,
+            supported_top + 18.0 * ui_scale,
+            "SUPPORTED INPUTS",
+            right_col_w - section_pad * 2.0,
+            label_size,
+            text_muted,
         );
-        let mut y = sources_top + 36.0 * ui_scale;
-        let max_y = sources_top + sources_h - 16.0 * ui_scale;
-        let line_h = 16.0 * ui_scale;
+        let line_height = 22.0 * ui_scale;
+        let mut y = supported_top + 48.0 * ui_scale;
+        let max_y = supported_top + supported_h - section_pad;
         for line in friendly_supported_lines(prompt) {
-            if y > max_y {
+            if y + line_height > max_y {
                 break;
             }
             draw_text_line(
                 &mut overlay.texts,
-                sources_left + 12.0 * ui_scale,
+                right_x + section_pad,
                 y,
-                &format!("- {line}"),
-                sources_w - 24.0 * ui_scale,
-                16.0 * ui_scale * 0.5,
-                0xcbd5e1,
+                &format!("• {line}"),
+                right_col_w - section_pad * 2.0,
+                body_size,
+                text_soft,
             );
-            y += line_h;
+            y += line_height;
         }
 
         overlay
@@ -1253,11 +1180,15 @@ fn draw_border(
     height: f32,
     color: u32,
 ) {
-    let t = 2.0;
-    push_rect(states, left + width * 0.5, top + t * 0.5, width, t, color);
-    push_rect(states, left + width * 0.5, top + height - t * 0.5, width, t, color);
-    push_rect(states, left + t * 0.5, top + height * 0.5, t, height, color);
-    push_rect(states, left + width - t * 0.5, top + height * 0.5, t, height, color);
+    let t = 1.0;
+    push_rect(states, left, top, width, t, color);
+    push_rect(states, left, top + height - t, width, t, color);
+    push_rect(states, left, top, t, height, color);
+    push_rect(states, left + width - t, top, t, height, color);
+}
+
+fn draw_divider(states: &mut Vec<RenderState>, left: f32, top: f32, width: f32, color: u32) {
+    push_rect(states, left, top, width, 1.0, color);
 }
 
 fn draw_text_line(
@@ -1311,9 +1242,12 @@ fn friendly_supported_lines(prompt: &BindingPromptState) -> Vec<String> {
     if prompt.allows_axis {
         lines.push("Mouse wheel/motion and gamepad analog axes".to_string());
     }
-    if prompt.joystick_scalar_fallback {
-        lines.push("2D joysticks currently send scalar values (protocol limitation)".to_string());
+    if prompt.allows_joystick {
+        lines.push("Gamepad sticks and keyboard virtual sticks".to_string());
     }
-    lines.push("Use Tab to switch between exact device and wildcard (*)".to_string());
+    if let Some(hint) = &prompt.capture_hint {
+        lines.push(hint.clone());
+    }
+    lines.push("Tab switches between exact device and wildcard (*) scope".to_string());
     lines
 }

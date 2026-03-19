@@ -153,7 +153,7 @@ mod tests {
             dependency_id,
             receipt_id: None,
             resource_type: "image/png".to_string(),
-            usage_count: -1,
+            usage_count: None,
             blob: Vec::new(),
         })
     }
