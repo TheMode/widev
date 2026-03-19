@@ -5,11 +5,14 @@ use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, Win
 use winit::keyboard::PhysicalKey;
 
 use super::model::{
-    DeviceFilter, DeviceType, GamepadAxis, GamepadButton, GamepadStick, InputDescriptor,
-    KeyboardKey, MouseAxis, MouseButtonKind, RawSource,
+    DeviceFilter, DeviceIdentity, DeviceType, GamepadAxis, GamepadButton, GamepadStick,
+    InputDescriptor, KeyModifiers, KeyboardKey, MouseAxis, MouseButtonKind, RawSource,
 };
 use super::protocol;
 use super::UiAction;
+use winit::keyboard::ModifiersState;
+#[cfg(target_os = "windows")]
+use winit::platform::windows::DeviceIdExtWindows;
 
 const GAMEPAD_AXIS_CAPTURE_THRESHOLD: f32 = 0.35;
 const GAMEPAD_STICK_CAPTURE_THRESHOLD: f32 = 0.45;
@@ -17,11 +20,12 @@ const MOUSE_AXIS_CAPTURE_THRESHOLD: f32 = 0.1;
 
 pub(crate) struct InputCapture {
     gamepad: Option<Gilrs>,
-    pressed_keys: HashSet<(String, KeyboardKey)>,
-    pressed_mouse_buttons: HashSet<(String, MouseButtonKind)>,
-    pressed_gamepad_buttons: HashSet<(String, GamepadButton)>,
-    mouse_axes: HashMap<(String, MouseAxis), f32>,
-    gamepad_axes: HashMap<(String, GamepadAxis), f32>,
+    current_modifiers: ModifiersState,
+    pressed_keys: HashSet<(DeviceIdentity, KeyboardKey)>,
+    pressed_mouse_buttons: HashSet<(DeviceIdentity, MouseButtonKind)>,
+    pressed_gamepad_buttons: HashSet<(DeviceIdentity, GamepadButton)>,
+    mouse_axes: HashMap<(DeviceIdentity, MouseAxis), f32>,
+    gamepad_axes: HashMap<(DeviceIdentity, GamepadAxis), f32>,
     just_pressed_keys: Vec<KeyboardKey>,
     just_captured_sources: Vec<RawSource>,
 }
@@ -37,6 +41,7 @@ impl InputCapture {
 
         Self {
             gamepad,
+            current_modifiers: ModifiersState::empty(),
             pressed_keys: HashSet::new(),
             pressed_mouse_buttons: HashSet::new(),
             pressed_gamepad_buttons: HashSet::new(),
@@ -53,10 +58,11 @@ impl InputCapture {
         };
 
         while let Some(event) = gamepad.next_event() {
-            let device = format!("{:?}", event.id);
+            let gamepad_info = gamepad.gamepad(event.id);
+            let device = gamepad_identity(gamepad_info.uuid(), Some(gamepad_info.os_name()));
             match event.event {
                 GilrsEventType::Connected => {
-                    log::info!("gamepad connected: {device}");
+                    log::info!("gamepad connected: {}", gamepad_info.os_name());
                 },
                 GilrsEventType::Disconnected => {
                     self.pressed_gamepad_buttons.retain(|(d, _)| d != &device);
@@ -65,10 +71,11 @@ impl InputCapture {
                 GilrsEventType::ButtonPressed(button, _) => {
                     if let Some(button) = gamepad_button_from_gilrs(button) {
                         self.pressed_gamepad_buttons.insert((device.clone(), button));
-                        self.just_captured_sources.push(RawSource {
-                            device: DeviceFilter::exact(DeviceType::Gamepad, device),
-                            input: InputDescriptor::GamepadButton { button },
-                        });
+                        self.just_captured_sources.push(captured_source(
+                            DeviceType::Gamepad,
+                            device,
+                            InputDescriptor::GamepadButton { button },
+                        ));
                     }
                 },
                 GilrsEventType::ButtonReleased(button, _) => {
@@ -80,19 +87,21 @@ impl InputCapture {
                     if let Some(axis) = gamepad_axis_from_gilrs(axis) {
                         self.gamepad_axes.insert((device.clone(), axis), value);
                         if value.abs() >= GAMEPAD_AXIS_CAPTURE_THRESHOLD {
-                            self.just_captured_sources.push(RawSource {
-                                device: DeviceFilter::exact(DeviceType::Gamepad, device.clone()),
-                                input: InputDescriptor::GamepadAxis { axis },
-                            });
+                            self.just_captured_sources.push(captured_source(
+                                DeviceType::Gamepad,
+                                device.clone(),
+                                InputDescriptor::GamepadAxis { axis },
+                            ));
                         }
                         if let Some(stick) = GamepadStick::from_axis(axis) {
                             let magnitude =
                                 read_gamepad_stick_magnitude(&self.gamepad_axes, &device, stick);
                             if magnitude >= GAMEPAD_STICK_CAPTURE_THRESHOLD {
-                                self.just_captured_sources.push(RawSource {
-                                    device: DeviceFilter::exact(DeviceType::Gamepad, device),
-                                    input: InputDescriptor::Stick { stick },
-                                });
+                                self.just_captured_sources.push(captured_source(
+                                    DeviceType::Gamepad,
+                                    device,
+                                    InputDescriptor::Stick { stick },
+                                ));
                             }
                         }
                     }
@@ -104,20 +113,35 @@ impl InputCapture {
 
     pub(crate) fn consume_window_event(&mut self, event: &WindowEvent) {
         match event {
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.current_modifiers = modifiers.state();
+            },
             WindowEvent::KeyboardInput { device_id, event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                let device = format!("{device_id:?}");
+                let device = keyboard_mouse_identity(&device_id);
                 match event.state {
                     ElementState::Pressed => {
                         if let Some(key) = keyboard_key_from_winit(code) {
                             if !event.repeat && self.pressed_keys.insert((device.clone(), key)) {
                                 self.just_pressed_keys.push(key);
-                                self.just_captured_sources.push(RawSource {
-                                    device: DeviceFilter::exact(DeviceType::Keyboard, device),
-                                    input: InputDescriptor::Key { code: key },
-                                });
+                                let input = if is_modifier_key(key) {
+                                    InputDescriptor::Key { code: key }
+                                } else {
+                                    let modifiers =
+                                        key_modifiers_from_state(self.current_modifiers);
+                                    if modifiers.is_empty() {
+                                        InputDescriptor::Key { code: key }
+                                    } else {
+                                        InputDescriptor::KeyChord { key, modifiers }
+                                    }
+                                };
+                                self.just_captured_sources.push(captured_source(
+                                    DeviceType::Keyboard,
+                                    device,
+                                    input,
+                                ));
                             }
                         }
                     },
@@ -129,15 +153,16 @@ impl InputCapture {
                 }
             },
             WindowEvent::MouseInput { device_id, state, button, .. } => {
-                let device = format!("{device_id:?}");
+                let device = keyboard_mouse_identity(&device_id);
                 match state {
                     ElementState::Pressed => {
                         if let Some(button) = mouse_button_from_winit(*button) {
                             if self.pressed_mouse_buttons.insert((device.clone(), button)) {
-                                self.just_captured_sources.push(RawSource {
-                                    device: DeviceFilter::exact(DeviceType::Mouse, device),
-                                    input: InputDescriptor::MouseButton { button },
-                                });
+                                self.just_captured_sources.push(captured_source(
+                                    DeviceType::Mouse,
+                                    device,
+                                    InputDescriptor::MouseButton { button },
+                                ));
                             }
                         }
                     },
@@ -149,7 +174,7 @@ impl InputCapture {
                 }
             },
             WindowEvent::MouseWheel { device_id, delta, .. } => {
-                let device = format!("{device_id:?}");
+                let device = keyboard_mouse_identity(&device_id);
                 let (x, y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (*x, *y),
                     MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
@@ -157,17 +182,19 @@ impl InputCapture {
 
                 if x.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                     self.mouse_axes.insert((device.clone(), MouseAxis::WheelX), x);
-                    self.just_captured_sources.push(RawSource {
-                        device: DeviceFilter::exact(DeviceType::Mouse, device.clone()),
-                        input: InputDescriptor::MouseAxis { axis: MouseAxis::WheelX },
-                    });
+                    self.just_captured_sources.push(captured_source(
+                        DeviceType::Mouse,
+                        device.clone(),
+                        InputDescriptor::MouseAxis { axis: MouseAxis::WheelX },
+                    ));
                 }
                 if y.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                     self.mouse_axes.insert((device.clone(), MouseAxis::WheelY), y);
-                    self.just_captured_sources.push(RawSource {
-                        device: DeviceFilter::exact(DeviceType::Mouse, device),
-                        input: InputDescriptor::MouseAxis { axis: MouseAxis::WheelY },
-                    });
+                    self.just_captured_sources.push(captured_source(
+                        DeviceType::Mouse,
+                        device,
+                        InputDescriptor::MouseAxis { axis: MouseAxis::WheelY },
+                    ));
                 }
             },
             _ => {},
@@ -180,22 +207,24 @@ impl InputCapture {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            let device = format!("{device_id:?}");
+            let device = keyboard_mouse_identity(&device_id);
             let dx = delta.0 as f32;
             let dy = delta.1 as f32;
             if dx.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                 self.mouse_axes.insert((device.clone(), MouseAxis::MotionX), dx);
-                self.just_captured_sources.push(RawSource {
-                    device: DeviceFilter::exact(DeviceType::Mouse, device.clone()),
-                    input: InputDescriptor::MouseAxis { axis: MouseAxis::MotionX },
-                });
+                self.just_captured_sources.push(captured_source(
+                    DeviceType::Mouse,
+                    device.clone(),
+                    InputDescriptor::MouseAxis { axis: MouseAxis::MotionX },
+                ));
             }
             if dy.abs() >= MOUSE_AXIS_CAPTURE_THRESHOLD {
                 self.mouse_axes.insert((device.clone(), MouseAxis::MotionY), dy);
-                self.just_captured_sources.push(RawSource {
-                    device: DeviceFilter::exact(DeviceType::Mouse, device),
-                    input: InputDescriptor::MouseAxis { axis: MouseAxis::MotionY },
-                });
+                self.just_captured_sources.push(captured_source(
+                    DeviceType::Mouse,
+                    device,
+                    InputDescriptor::MouseAxis { axis: MouseAxis::MotionY },
+                ));
             }
         }
     }
@@ -209,13 +238,16 @@ impl InputCapture {
                 .cloned()
                 .map(UiAction::Suggest),
         );
-        if self.just_pressed_keys.contains(&KeyboardKey::Enter) {
+        if self.current_modifiers.is_empty() && self.just_pressed_keys.contains(&KeyboardKey::Enter)
+        {
             out.push(UiAction::Confirm);
         }
-        if self.just_pressed_keys.contains(&KeyboardKey::Backspace) {
+        if self.current_modifiers.is_empty()
+            && self.just_pressed_keys.contains(&KeyboardKey::Backspace)
+        {
             out.push(UiAction::Skip);
         }
-        if self.just_pressed_keys.contains(&KeyboardKey::Tab) {
+        if self.current_modifiers.is_empty() && self.just_pressed_keys.contains(&KeyboardKey::Tab) {
             out.push(UiAction::ToggleDeviceScope);
         }
         out
@@ -223,26 +255,23 @@ impl InputCapture {
 
     pub(crate) fn read_binding_value(&self, source: &RawSource) -> protocol::InputPayload {
         match &source.input {
-            InputDescriptor::Key { code } => {
-                protocol::InputPayload::Toggle {
-                    pressed: self.read_pressed_key(&source.device, *code),
-                }
+            InputDescriptor::Key { code } => protocol::InputPayload::Toggle {
+                pressed: self.read_pressed_key(&source.device, *code),
             },
-            InputDescriptor::MouseButton { button } => {
-                protocol::InputPayload::Toggle {
-                    pressed: self.read_pressed_mouse_button(&source.device, *button),
-                }
+            InputDescriptor::MouseButton { button } => protocol::InputPayload::Toggle {
+                pressed: self.read_pressed_mouse_button(&source.device, *button),
             },
-            InputDescriptor::MouseAxis { axis } => {
-                protocol::InputPayload::Axis1D { value: self.read_mouse_axis(&source.device, *axis) }
+            InputDescriptor::MouseAxis { axis } => protocol::InputPayload::Axis1D {
+                value: self.read_mouse_axis(&source.device, *axis),
             },
-            InputDescriptor::GamepadButton { button } => {
-                protocol::InputPayload::Toggle {
-                    pressed: self.read_pressed_gamepad_button(&source.device, *button),
-                }
+            InputDescriptor::GamepadButton { button } => protocol::InputPayload::Toggle {
+                pressed: self.read_pressed_gamepad_button(&source.device, *button),
             },
-            InputDescriptor::GamepadAxis { axis } => {
-                protocol::InputPayload::Axis1D { value: self.read_gamepad_axis(&source.device, *axis) }
+            InputDescriptor::GamepadAxis { axis } => protocol::InputPayload::Axis1D {
+                value: self.read_gamepad_axis(&source.device, *axis),
+            },
+            InputDescriptor::KeyChord { key, modifiers } => protocol::InputPayload::Toggle {
+                pressed: self.read_pressed_key_chord(&source.device, *key, *modifiers),
             },
             InputDescriptor::VirtualStick { positive_x, negative_x, positive_y, negative_y } => {
                 let x =
@@ -268,6 +297,7 @@ impl InputCapture {
     }
 
     pub(crate) fn clear_active_inputs(&mut self) {
+        self.current_modifiers = ModifiersState::empty();
         self.pressed_keys.clear();
         self.pressed_mouse_buttons.clear();
         self.pressed_gamepad_buttons.clear();
@@ -295,6 +325,46 @@ impl InputCapture {
         })
     }
 
+    fn read_pressed_key_chord(
+        &self,
+        filter: &DeviceFilter,
+        key: KeyboardKey,
+        modifiers: KeyModifiers,
+    ) -> bool {
+        self.read_pressed_key(filter, key) && self.read_required_modifiers(filter, modifiers)
+    }
+
+    fn read_required_modifiers(&self, filter: &DeviceFilter, modifiers: KeyModifiers) -> bool {
+        (!modifiers.shift
+            || self.read_pressed_modifier(filter, KeyboardKey::ShiftLeft, KeyboardKey::ShiftRight))
+            && (!modifiers.control
+                || self.read_pressed_modifier(
+                    filter,
+                    KeyboardKey::ControlLeft,
+                    KeyboardKey::ControlRight,
+                ))
+            && (!modifiers.alt
+                || self.read_pressed_modifier(filter, KeyboardKey::AltLeft, KeyboardKey::AltRight))
+            && (!modifiers.super_key
+                || self.read_pressed_modifier(
+                    filter,
+                    KeyboardKey::SuperLeft,
+                    KeyboardKey::SuperRight,
+                ))
+    }
+
+    fn read_pressed_modifier(
+        &self,
+        filter: &DeviceFilter,
+        left: KeyboardKey,
+        right: KeyboardKey,
+    ) -> bool {
+        self.pressed_keys.iter().any(|(device_id, pressed)| {
+            filter.matches(DeviceType::Keyboard, device_id)
+                && (*pressed == left || *pressed == right)
+        })
+    }
+
     fn read_mouse_axis(&self, filter: &DeviceFilter, axis: MouseAxis) -> f32 {
         self.mouse_axes
             .iter()
@@ -316,10 +386,11 @@ impl InputCapture {
             .max_by(|a, b| a.abs().total_cmp(&b.abs()))
             .unwrap_or(0.0)
     }
+
 }
 
 fn axis_from_keys(
-    pressed_keys: &HashSet<(String, KeyboardKey)>,
+    pressed_keys: &HashSet<(DeviceIdentity, KeyboardKey)>,
     filter: &DeviceFilter,
     positive: KeyboardKey,
     negative: KeyboardKey,
@@ -333,14 +404,31 @@ fn axis_from_keys(
     (positive_pressed as i8 - negative_pressed as i8) as f32
 }
 
+fn key_modifiers_from_state(state: ModifiersState) -> KeyModifiers {
+    KeyModifiers {
+        shift: state.shift_key(),
+        control: state.control_key(),
+        alt: state.alt_key(),
+        super_key: state.super_key(),
+    }
+}
+
+fn captured_source(
+    device_type: DeviceType,
+    identity: DeviceIdentity,
+    input: InputDescriptor,
+) -> RawSource {
+    RawSource { device: DeviceFilter::exact_identity(device_type, identity), input }
+}
+
 fn read_gamepad_stick_magnitude(
-    gamepad_axes: &HashMap<(String, GamepadAxis), f32>,
-    device_id: &str,
+    gamepad_axes: &HashMap<(DeviceIdentity, GamepadAxis), f32>,
+    device_id: &DeviceIdentity,
     stick: GamepadStick,
 ) -> f32 {
     let (x_axis, y_axis) = stick.axes();
-    let x = gamepad_axes.get(&(device_id.to_string(), x_axis)).copied().unwrap_or(0.0);
-    let y = gamepad_axes.get(&(device_id.to_string(), y_axis)).copied().unwrap_or(0.0);
+    let x = gamepad_axes.get(&(device_id.clone(), x_axis)).copied().unwrap_or(0.0);
+    let y = gamepad_axes.get(&(device_id.clone(), y_axis)).copied().unwrap_or(0.0);
     x.hypot(y)
 }
 
@@ -354,6 +442,35 @@ fn is_prompt_control_input(source: &RawSource) -> bool {
                 | KeyboardKey::Escape,
         }
     )
+}
+
+fn is_modifier_key(key: KeyboardKey) -> bool {
+    matches!(
+        key,
+        KeyboardKey::ShiftLeft
+            | KeyboardKey::ShiftRight
+            | KeyboardKey::ControlLeft
+            | KeyboardKey::ControlRight
+            | KeyboardKey::AltLeft
+            | KeyboardKey::AltRight
+            | KeyboardKey::SuperLeft
+            | KeyboardKey::SuperRight
+    )
+}
+
+fn keyboard_mouse_identity(device_id: &winit::event::DeviceId) -> DeviceIdentity {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(value) = device_id.persistent_identifier() {
+            return DeviceIdentity::WindowsPersistent { value };
+        }
+    }
+
+    DeviceIdentity::session(format!("{device_id:?}"))
+}
+
+fn gamepad_identity(uuid: [u8; 16], label: Option<&str>) -> DeviceIdentity {
+    DeviceIdentity::Gamepad { uuid, label: label.map(|label| label.to_string()) }
 }
 
 fn keyboard_key_from_winit(code: winit::keyboard::KeyCode) -> Option<KeyboardKey> {

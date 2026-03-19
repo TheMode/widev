@@ -8,7 +8,8 @@ use anyhow::Result;
 pub(crate) use capture::InputCapture;
 #[allow(unused_imports)]
 pub(crate) use model::{
-    ActionBinding, DeviceFilter, DeviceType, GamepadStick, InputDescriptor, KeyboardKey, RawSource,
+    ActionBinding, DeviceFilter, DeviceIdentity, DeviceType, GamepadStick, InputDescriptor,
+    KeyModifiers, KeyboardKey, RawSource,
 };
 
 use super::persistence::BindingStore;
@@ -95,7 +96,7 @@ enum BindingCapture {
     Joystick {
         direct_source: Option<RawSource>,
         virtual_keys: [Option<KeyboardKey>; 4],
-        virtual_device_id: Option<String>,
+        virtual_device_id: Option<DeviceIdentity>,
     },
 }
 
@@ -257,13 +258,13 @@ impl BindingCapture {
     fn apply_input(&mut self, input_type: protocol::InputType, input: RawSource) {
         match self {
             Self::Single { suggested_source } => {
-                if is_source_compatible(&input, input_type) {
+                if input.input.is_compatible_for(input_type) {
                     *suggested_source = Some(input);
                 }
             },
             Self::Joystick { direct_source, virtual_keys, virtual_device_id } => {
                 match input.input {
-                    InputDescriptor::Stick { .. } if is_source_compatible(&input, input_type) => {
+                    InputDescriptor::Stick { .. } if input.input.is_compatible_for(input_type) => {
                         *direct_source = Some(input);
                         *virtual_keys = [None, None, None, None];
                         *virtual_device_id = None;
@@ -271,7 +272,7 @@ impl BindingCapture {
                     InputDescriptor::Key { code } => {
                         *direct_source = None;
                         if virtual_device_id.is_none() {
-                            *virtual_device_id = input.device.id.clone();
+                            *virtual_device_id = input.device.identity.clone();
                         }
                         if let Some(slot) = virtual_keys.iter_mut().find(|slot| slot.is_none()) {
                             *slot = Some(code);
@@ -286,11 +287,7 @@ impl BindingCapture {
     fn into_binding(self) -> Option<ActionBinding> {
         match self {
             Self::Single { suggested_source } => suggested_source.map(|source| ActionBinding {
-                action_type: if source.is_toggle_compatible() {
-                    protocol::InputType::Toggle
-                } else {
-                    protocol::InputType::Axis1D
-                },
+                action_type: source.input.default_action_type(),
                 sources: vec![source],
             }),
             Self::Joystick { direct_source: Some(source), .. } => Some(ActionBinding {
@@ -305,9 +302,10 @@ impl BindingCapture {
             } => Some(ActionBinding {
                 action_type: protocol::InputType::Joystick2D,
                 sources: vec![RawSource {
-                    device: model::DeviceFilter {
-                        device_type: DeviceType::Keyboard,
-                        id: virtual_device_id,
+                    device: if let Some(identity) = virtual_device_id {
+                        model::DeviceFilter::exact_identity(DeviceType::Keyboard, identity.clone())
+                    } else {
+                        model::DeviceFilter::any(DeviceType::Keyboard)
                     },
                     input: InputDescriptor::VirtualStick {
                         positive_x,
@@ -336,7 +334,10 @@ impl BindingCapture {
                     let device_label = if any_device_scope {
                         "*".to_string()
                     } else {
-                        virtual_device_id.clone().unwrap_or_else(|| "*".to_string())
+                        virtual_device_id
+                            .as_ref()
+                            .map(DeviceIdentity::display_label)
+                            .unwrap_or_else(|| "*".to_string())
                     };
                     Some(format!(
                         "keyboard/{device_label}/virtual_stick(+x={},-x={},+y={},-y={})",
@@ -397,24 +398,15 @@ fn default_capture(input_type: protocol::InputType) -> BindingCapture {
     }
 }
 
-fn is_source_compatible(source: &RawSource, input_type: protocol::InputType) -> bool {
-    match input_type {
-        protocol::InputType::Toggle => source.is_toggle_compatible(),
-        protocol::InputType::Axis1D => source.is_axis_1d_compatible(),
-        protocol::InputType::Joystick2D => source.is_joystick_2d_compatible(),
-    }
-}
-
 fn aggregate_binding_value<F>(binding: &ActionBinding, read_value: &mut F) -> protocol::InputPayload
 where
     F: FnMut(&RawSource) -> protocol::InputPayload,
 {
     match binding.action_type {
         protocol::InputType::Toggle => protocol::InputPayload::Toggle {
-            pressed: binding
-                .sources
-                .iter()
-                .any(|source| matches!(read_value(source), protocol::InputPayload::Toggle { pressed: true })),
+            pressed: binding.sources.iter().any(|source| {
+                matches!(read_value(source), protocol::InputPayload::Toggle { pressed: true })
+            }),
         },
         protocol::InputType::Axis1D => {
             let value = binding
