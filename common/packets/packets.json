@@ -53,6 +53,10 @@
     {
       "name": "PredictionKind",
       "variants": ["Interpolation", "Extrapolation"]
+    },
+    {
+      "name": "ElementKind",
+      "variants": ["SolidRect", "Texture", "Text"]
     }
   ],
   "bitmasks": [
@@ -198,7 +202,8 @@
       "name": "ElementAdd",
       "description": "Register a uniquely identified element.",
       "fields": [
-        { "name": "element_id", "type": "ElementId" }
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "kind", "type": "ElementKind" }
       ]
     },
     {
@@ -242,6 +247,24 @@
         { "name": "element_id", "type": "ElementId" },
         { "name": "width", "type": "f32" },
         { "name": "height", "type": "f32" }
+      ]
+    },
+    {
+      "name": "ElementSetTextContent",
+      "description": "Set the UTF-8 text content for one text element on this client.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "text", "type": "String" }
+      ]
+    },
+    {
+      "name": "ElementSetTextLayout",
+      "description": "Set text layout metrics for one text element on this client.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "max_width", "type": "f32" },
+        { "name": "font_size", "type": "f32" },
+        { "name": "line_height", "type": "f32" }
       ]
     },
     {

@@ -7,8 +7,9 @@ use uuid::Uuid;
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    DeliveryOutcome, DeliveryPolicy, InputType, MessageId, PacketBundle, PacketEnvelope,
-    PacketResource, PacketTarget, PredictionKind, S2CPacket, TransformPredictionMask,
+    DeliveryOutcome, DeliveryPolicy, ElementKind, InputType, MessageId, PacketBundle,
+    PacketEnvelope, PacketResource, PacketTarget, PredictionKind, S2CPacket,
+    TransformPredictionMask,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -99,7 +100,7 @@ impl RedSquareGame {
             let Some(other_player) = self.players.get(&element_id) else {
                 continue;
             };
-            bundle.push(S2CPacket::ElementAdd { element_id });
+            bundle.push(S2CPacket::ElementAdd { element_id, kind: ElementKind::Texture });
             bundle.push(S2CPacket::ElementSetTexture {
                 element_id,
                 resource_id: self.player_texture_id,
@@ -147,7 +148,10 @@ impl Game for RedSquareGame {
 
                 let mut bundle: PacketBundle = Vec::new();
                 bundle.extend([
-                    S2CPacket::ElementAdd { element_id: client_id },
+                    S2CPacket::ElementAdd {
+                        element_id: client_id,
+                        kind: ElementKind::Texture,
+                    },
                     S2CPacket::ElementSetTexture {
                         element_id: client_id,
                         resource_id: self.player_texture_id,

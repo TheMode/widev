@@ -461,25 +461,27 @@ impl RuntimeState {
         }
 
         let mut states = game.render_states();
+        let mut text_commands = game.text_commands();
         if settings.show_latency {
             if let Some(renderer) = self.rendering.renderer.as_ref() {
                 renderer
                     .build_latency_overlay(game.latency_snapshot())
-                    .merge_into(&mut states, &mut overlay_text);
+                    .merge_into(&mut states, &mut text_commands);
             }
         }
         states.extend(overlay_states);
+        text_commands.extend(overlay_text);
         let render_needed = self.rendering.force_redraw
             || self.rendering.cache.last_surface_state != Some(surface)
             || self.rendering.cache.last_render_revision != game.render_revision()
             || self.rendering.cache.last_rendered_states != states
-            || self.rendering.cache.last_rendered_text != overlay_text;
+            || self.rendering.cache.last_rendered_text != text_commands;
         if render_needed {
             if let Some(renderer) = self.rendering.renderer.as_mut() {
-                renderer.render(&states, game.resources(), &overlay_text)?;
+                renderer.render(&states, game.resources(), &text_commands)?;
             }
             self.rendering.cache.last_rendered_states = states;
-            self.rendering.cache.last_rendered_text = overlay_text;
+            self.rendering.cache.last_rendered_text = text_commands;
             self.rendering.cache.last_surface_state = Some(surface);
             self.rendering.cache.last_render_revision = game.render_revision();
             self.rendering.force_redraw = false;

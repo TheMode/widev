@@ -19,6 +19,7 @@ mod packets {
 mod persistence;
 use self::packet_chain::PacketChain;
 use self::packets as protocol;
+use self::renderer::TextCommand;
 mod renderer;
 
 const LERP_ALPHA: f32 = 0.35;
@@ -210,13 +211,18 @@ impl SessionBootstrap {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ElementState {
     visible: bool,
+    kind: protocol::ElementKind,
     color: protocol::Color,
     texture_id: Option<protocol::MessageId>,
     width: f32,
     height: f32,
+    text: String,
+    text_max_width: f32,
+    text_font_size: f32,
+    text_line_height: f32,
     last_authoritative: Vec2f,
     last_authoritative_at: Instant,
     target: Vec2f,
@@ -252,10 +258,15 @@ impl ElementState {
     fn hidden(now: Instant, prediction: PredictionConfig, color: protocol::Color) -> Self {
         Self {
             visible: false,
+            kind: protocol::ElementKind::SolidRect,
             color,
             texture_id: None,
             width: PLAYER_SIZE,
             height: PLAYER_SIZE,
+            text: String::new(),
+            text_max_width: PLAYER_SIZE,
+            text_font_size: 24.0,
+            text_line_height: 28.0,
             last_authoritative: Vec2f::default(),
             last_authoritative_at: now,
             target: Vec2f::default(),
@@ -426,7 +437,14 @@ impl ClientGame {
         self.elements
             .values()
             .filter(|e| {
-                e.visible && e.texture_id.and_then(|id| self.texture_resource(id)).is_some()
+                e.visible
+                    && match e.kind {
+                        protocol::ElementKind::SolidRect => true,
+                        protocol::ElementKind::Texture => {
+                            e.texture_id.and_then(|id| self.texture_resource(id)).is_some()
+                        },
+                        protocol::ElementKind::Text => false,
+                    }
             })
             .map(|e| RenderState {
                 x: e.draw.x,
@@ -435,6 +453,22 @@ impl ClientGame {
                 height: e.height,
                 color: oklch_to_u32(e.color),
                 texture_id: e.texture_id,
+            })
+            .collect()
+    }
+
+    fn text_commands(&self) -> Vec<TextCommand> {
+        self.elements
+            .values()
+            .filter(|e| e.visible && e.kind == protocol::ElementKind::Text && !e.text.is_empty())
+            .map(|e| TextCommand {
+                text: e.text.clone(),
+                x: e.draw.x,
+                y: e.draw.y,
+                max_width: e.text_max_width.max(1.0),
+                font_size: e.text_font_size.max(1.0),
+                line_height: e.text_line_height.max(e.text_font_size + 1.0),
+                color: oklch_to_u32(e.color),
             })
             .collect()
     }
@@ -594,13 +628,15 @@ impl ClientGame {
         Ok(())
     }
 
-    fn handle_element_add(&mut self, element_id: u32) {
+    fn handle_element_add(&mut self, element_id: u32, kind: protocol::ElementKind) {
         let now = Instant::now();
         let prediction =
             self.pending_prediction.remove(&element_id).unwrap_or(self.default_prediction);
-        self.elements
-            .entry(element_id)
-            .or_insert_with(|| ElementState::hidden(now, prediction, DEFAULT_ELEMENT_TINT));
+        self.elements.entry(element_id).or_insert_with(|| {
+            let mut element = ElementState::hidden(now, prediction, DEFAULT_ELEMENT_TINT);
+            element.kind = kind;
+            element
+        });
     }
 
     fn handle_element_move(&mut self, element_id: u32, x: f32, y: f32) {
@@ -619,7 +655,10 @@ impl ClientGame {
 
     fn apply_element_color(&mut self, element_id: u32, color: protocol::Color) {
         if let Some(element) = self.elements.get_mut(&element_id) {
-            element.color = color;
+            if element.color != color {
+                element.color = color;
+                self.bump_render_revision();
+            }
         } else {
             log::debug!("ignored ElementSetColor for unknown element_id={element_id}");
         }
@@ -660,11 +699,51 @@ impl ClientGame {
 
     fn apply_element_size(&mut self, element_id: u32, width: f32, height: f32) {
         if let Some(element) = self.elements.get_mut(&element_id) {
-            element.width = width;
-            element.height = height;
-            self.bump_render_revision();
+            let width = width.max(1.0);
+            let height = height.max(1.0);
+            if element.width != width || element.height != height {
+                element.width = width;
+                element.height = height;
+                self.bump_render_revision();
+            }
         } else {
             log::debug!("ignored ElementSetSize for unknown element_id={element_id}");
+        }
+    }
+
+    fn apply_element_text_content(&mut self, element_id: u32, text: String) {
+        if let Some(element) = self.elements.get_mut(&element_id) {
+            if element.text != text {
+                element.text = text;
+                self.bump_render_revision();
+            }
+        } else {
+            log::debug!("ignored ElementSetTextContent for unknown element_id={element_id}");
+        }
+    }
+
+    fn apply_element_text_layout(
+        &mut self,
+        element_id: u32,
+        max_width: f32,
+        font_size: f32,
+        line_height: f32,
+    ) {
+        if let Some(element) = self.elements.get_mut(&element_id) {
+            let max_width = max_width.max(1.0);
+            let font_size = font_size.max(1.0);
+            let line_height = line_height.max(font_size + 1.0);
+            if element.text_max_width != max_width
+                || element.text_font_size != font_size
+                || element.text_line_height != line_height
+            {
+                element.text_max_width = max_width;
+                element.text_font_size = font_size;
+                element.text_line_height = line_height;
+                self.bump_render_revision();
+            }
+        } else {
+            log::debug!("ignored ElementSetTextLayout for unknown element_id={element_id}");
         }
     }
 
@@ -725,6 +804,17 @@ impl ClientGame {
             protocol::S2CPacket::ElementSetSize { element_id, width, height } => {
                 self.apply_element_size(element_id, width, height);
             },
+            protocol::S2CPacket::ElementSetTextContent { element_id, text } => {
+                self.apply_element_text_content(element_id, text);
+            },
+            protocol::S2CPacket::ElementSetTextLayout {
+                element_id,
+                max_width,
+                font_size,
+                line_height,
+            } => {
+                self.apply_element_text_layout(element_id, max_width, font_size, line_height);
+            },
             protocol::S2CPacket::ElementSetTexture { element_id, resource_id } => {
                 self.apply_element_texture(element_id, resource_id);
             },
@@ -734,8 +824,8 @@ impl ClientGame {
             protocol::S2CPacket::BindingDeclare { binding_id, identifier, input_type } => {
                 self.handle_binding_declare(binding_id, identifier, input_type)?;
             },
-            protocol::S2CPacket::ElementAdd { element_id } => {
-                self.handle_element_add(element_id);
+            protocol::S2CPacket::ElementAdd { element_id, kind } => {
+                self.handle_element_add(element_id, kind);
             },
             protocol::S2CPacket::ElementMove { element_id, x, y } => {
                 self.handle_element_move(element_id, x, y);

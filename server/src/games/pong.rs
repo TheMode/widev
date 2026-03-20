@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    DeliveryPolicy, InputType, MessageId, PacketBundle, PacketControl, PacketEnvelope,
-    PacketResource, PacketTarget, S2CPacket,
+    DeliveryPolicy, ElementKind, InputType, MessageId, PacketBundle, PacketControl,
+    PacketEnvelope, PacketResource, PacketTarget, S2CPacket,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -19,6 +19,10 @@ const BALL_SIZE: f32 = 16.0;
 const BALL_SPEED_INITIAL: f32 = 250.0;
 const BALL_SPEED_MAX: f32 = 450.0;
 const PADDLE_MARGIN: f32 = 30.0;
+const SCORE_TEXT_Y: f32 = 24.0;
+const SCORE_TEXT_MAX_WIDTH: f32 = 120.0;
+const SCORE_FONT_SIZE: f32 = 36.0;
+const SCORE_LINE_HEIGHT: f32 = 40.0;
 
 #[derive(Default)]
 struct PaddleInput {
@@ -127,6 +131,14 @@ impl PongGame {
         state.control(PacketControl::Barrier { target: PacketTarget::Client(client_id) });
     }
 
+    fn score_element_id(match_id: u64) -> u32 {
+        0xF000_0000 | ((match_id as u32) & 0x0FFF_FFFF)
+    }
+
+    fn score_text(m: &Match) -> String {
+        format!("{} - {}", m.score1, m.score2)
+    }
+
     fn send_waiting_screen(&mut self, state: &mut GameState, client_id: ClientId) {
         let message_id = state.alloc_message_id();
 
@@ -168,6 +180,7 @@ impl PongGame {
         let is_player1 = m.player1 == client_id;
         let player_element = if is_player1 { m.player1 } else { m.player2 };
         let opponent_element = if is_player1 { m.player2 } else { m.player1 };
+        let score_element = Self::score_element_id(match_id);
 
         let paddle_y = if is_player1 { m.paddle1.y } else { m.paddle2.y };
         let opponent_paddle_y = if is_player1 { m.paddle2.y } else { m.paddle1.y };
@@ -203,7 +216,7 @@ impl PongGame {
                 identifier: "move_down".to_string(),
                 input_type: InputType::Toggle,
             },
-            S2CPacket::ElementAdd { element_id: player_element },
+            S2CPacket::ElementAdd { element_id: player_element, kind: ElementKind::Texture },
             S2CPacket::ElementSetTexture {
                 element_id: player_element,
                 resource_id: self.texture_id,
@@ -219,7 +232,7 @@ impl PongGame {
                 x: if is_player1 { m.paddle1.x } else { m.paddle2.x },
                 y: paddle_y,
             },
-            S2CPacket::ElementAdd { element_id: opponent_element },
+            S2CPacket::ElementAdd { element_id: opponent_element, kind: ElementKind::Texture },
             S2CPacket::ElementSetTexture {
                 element_id: opponent_element,
                 resource_id: self.texture_id,
@@ -238,11 +251,28 @@ impl PongGame {
                 x: if is_player1 { m.paddle2.x } else { m.paddle1.x },
                 y: opponent_paddle_y,
             },
-            S2CPacket::ElementAdd { element_id: 0 },
+            S2CPacket::ElementAdd { element_id: 0, kind: ElementKind::Texture },
             S2CPacket::ElementSetTexture { element_id: 0, resource_id: self.texture_id },
             S2CPacket::ElementSetColor { element_id: 0, color: [1.0, 1.0, 1.0, 1.0] },
             S2CPacket::ElementSetSize { element_id: 0, width: BALL_SIZE, height: BALL_SIZE },
             S2CPacket::ElementMove { element_id: 0, x: m.ball.x, y: m.ball.y },
+            S2CPacket::ElementAdd { element_id: score_element, kind: ElementKind::Text },
+            S2CPacket::ElementSetColor { element_id: score_element, color: [0.96, 0.02, 250.0, 1.0] },
+            S2CPacket::ElementSetTextLayout {
+                element_id: score_element,
+                max_width: SCORE_TEXT_MAX_WIDTH,
+                font_size: SCORE_FONT_SIZE,
+                line_height: SCORE_LINE_HEIGHT,
+            },
+            S2CPacket::ElementSetTextContent {
+                element_id: score_element,
+                text: Self::score_text(m),
+            },
+            S2CPacket::ElementMove {
+                element_id: score_element,
+                x: GAME_WIDTH * 0.5 - SCORE_TEXT_MAX_WIDTH * 0.5,
+                y: SCORE_TEXT_Y,
+            },
             S2CPacket::Join {},
         ];
 
@@ -256,11 +286,16 @@ impl PongGame {
 
     fn send_score_update(&mut self, state: &mut GameState, match_id: u64) {
         let Some(m) = self.matches.get(&match_id) else { return };
+        let score_element = Self::score_element_id(match_id);
 
         let bundle: PacketBundle = vec![
             S2CPacket::ElementMove { element_id: m.player1, x: m.paddle1.x, y: m.paddle1.y },
             S2CPacket::ElementMove { element_id: m.player2, x: m.paddle2.x, y: m.paddle2.y },
             S2CPacket::ElementMove { element_id: 0, x: m.ball.x, y: m.ball.y },
+            S2CPacket::ElementSetTextContent {
+                element_id: score_element,
+                text: Self::score_text(m),
+            },
         ];
 
         state.send(PacketEnvelope::bundle(PacketTarget::Broadcast, bundle).droppable());
