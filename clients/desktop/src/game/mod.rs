@@ -215,22 +215,34 @@ impl SessionBootstrap {
 #[derive(Clone)]
 struct ElementState {
     visible: bool,
-    kind: protocol::ElementKind,
     depth: i32,
     color: protocol::Color,
-    texture_id: Option<protocol::MessageId>,
-    width: f32,
-    height: f32,
-    text: String,
-    text_max_width: f32,
-    text_font_size: f32,
-    text_line_height: f32,
+    visual: ElementVisual,
     last_authoritative: Vec2f,
     last_authoritative_at: Instant,
     target: Vec2f,
     draw: Vec2f,
     velocity: Vec2f,
     prediction: PredictionConfig,
+}
+
+#[derive(Clone)]
+enum ElementVisual {
+    SolidRect {
+        width: f32,
+        height: f32,
+    },
+    Texture {
+        width: f32,
+        height: f32,
+        texture_id: Option<protocol::MessageId>,
+    },
+    Text {
+        text: String,
+        max_width: f32,
+        font_size: f32,
+        line_height: f32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -260,16 +272,9 @@ impl ElementState {
     fn hidden(now: Instant, prediction: PredictionConfig, color: protocol::Color) -> Self {
         Self {
             visible: false,
-            kind: protocol::ElementKind::SolidRect,
             depth: 0,
             color,
-            texture_id: None,
-            width: PLAYER_SIZE,
-            height: PLAYER_SIZE,
-            text: String::new(),
-            text_max_width: PLAYER_SIZE,
-            text_font_size: 24.0,
-            text_line_height: 28.0,
+            visual: ElementVisual::new(protocol::ElementKind::SolidRect),
             last_authoritative: Vec2f::default(),
             last_authoritative_at: now,
             target: Vec2f::default(),
@@ -319,6 +324,32 @@ impl ElementState {
                 self.draw.y =
                     predicted_y + (self.target.y - predicted_y) * PREDICTION_CORRECTION_ALPHA;
             },
+        }
+    }
+}
+
+impl ElementVisual {
+    fn new(kind: protocol::ElementKind) -> Self {
+        match kind {
+            protocol::ElementKind::SolidRect => {
+                Self::SolidRect { width: PLAYER_SIZE, height: PLAYER_SIZE }
+            },
+            protocol::ElementKind::Texture => {
+                Self::Texture { width: PLAYER_SIZE, height: PLAYER_SIZE, texture_id: None }
+            },
+            protocol::ElementKind::Text => Self::Text {
+                text: String::new(),
+                max_width: PLAYER_SIZE,
+                font_size: 24.0,
+                line_height: 28.0,
+            },
+        }
+    }
+
+    fn texture_id(&self) -> Option<protocol::MessageId> {
+        match self {
+            Self::Texture { texture_id, .. } => *texture_id,
+            Self::SolidRect { .. } | Self::Text { .. } => None,
         }
     }
 }
@@ -436,57 +467,62 @@ impl ClientGame {
         Ok(())
     }
 
-    pub(super) fn render_states(&self) -> Vec<RenderState> {
-        self
-            .elements
-            .iter()
-            .filter_map(|(&element_id, e)| {
-                let renderable = e.visible
-                    && match e.kind {
-                        protocol::ElementKind::SolidRect => true,
-                        protocol::ElementKind::Texture => {
-                            e.texture_id.and_then(|id| self.texture_resource(id)).is_some()
-                        },
-                        protocol::ElementKind::Text => false,
-                    };
-                renderable.then_some((element_id, e))
-            })
-            .map(|(_, e)| RenderState {
-                x: e.draw.x,
-                y: e.draw.y,
-                width: e.width,
-                height: e.height,
-                depth: e.depth,
-                color: oklch_to_u32(e.color),
-                texture_id: e.texture_id,
-            })
-            .collect()
-    }
+    fn build_scene(&self, render_states: &mut Vec<RenderState>, text_commands: &mut Vec<TextCommand>) {
+        let mut sorted_text_commands = Vec::new();
+        for (&element_id, element) in &self.elements {
+            if !element.visible {
+                continue;
+            }
 
-    fn text_commands(&self) -> Vec<TextCommand> {
-        let mut commands: Vec<_> = self
-            .elements
-            .iter()
-            .filter(|(_, e)| e.visible && e.kind == protocol::ElementKind::Text && !e.text.is_empty())
-            .map(|(&element_id, e)| {
-                (
-                    e.depth,
-                    element_id,
-                    TextCommand {
-                        text: e.text.clone(),
-                        x: e.draw.x,
-                        y: e.draw.y,
-                        max_width: e.text_max_width.max(1.0),
-                        font_size: e.text_font_size.max(1.0),
-                        line_height: e.text_line_height.max(e.text_font_size + 1.0),
-                        depth: e.depth,
-                        color: oklch_to_u32(e.color),
-                    },
-                )
-            })
-            .collect();
-        commands.sort_by_key(|(depth, element_id, _)| (*depth, *element_id));
-        commands.into_iter().map(|(_, _, command)| command).collect()
+            match &element.visual {
+                ElementVisual::SolidRect { width, height } => render_states.push(RenderState {
+                    x: element.draw.x,
+                    y: element.draw.y,
+                    width: *width,
+                    height: *height,
+                    depth: element.depth,
+                    color: oklch_to_u32(element.color),
+                    texture_id: None,
+                }),
+                ElementVisual::Texture { width, height, texture_id } => {
+                    if texture_id.and_then(|id| self.texture_resource(id)).is_none() {
+                        continue;
+                    }
+                    render_states.push(RenderState {
+                        x: element.draw.x,
+                        y: element.draw.y,
+                        width: *width,
+                        height: *height,
+                        depth: element.depth,
+                        color: oklch_to_u32(element.color),
+                        texture_id: *texture_id,
+                    });
+                },
+                ElementVisual::Text { text, max_width, font_size, line_height } => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    sorted_text_commands.push((
+                        element.depth,
+                        element_id,
+                        TextCommand {
+                            text: text.clone(),
+                            x: element.draw.x,
+                            y: element.draw.y,
+                            max_width: (*max_width).max(1.0),
+                            font_size: (*font_size).max(1.0),
+                            line_height: (*line_height).max(*font_size + 1.0),
+                            depth: element.depth,
+                            color: oklch_to_u32(element.color),
+                        },
+                    ));
+                },
+            }
+        }
+
+        sorted_text_commands.sort_by_key(|(depth, element_id, _)| (*depth, *element_id));
+        text_commands
+            .extend(sorted_text_commands.into_iter().map(|(_, _, command)| command));
     }
 
     pub(super) fn resources(&self) -> &HashMap<protocol::MessageId, ClientResource> {
@@ -650,7 +686,7 @@ impl ClientGame {
             self.pending_prediction.remove(&element_id).unwrap_or(self.default_prediction);
         self.elements.entry(element_id).or_insert_with(|| {
             let mut element = ElementState::hidden(now, prediction, DEFAULT_ELEMENT_TINT);
-            element.kind = kind;
+            element.visual = ElementVisual::new(kind);
             element
         });
     }
@@ -717,9 +753,24 @@ impl ClientGame {
         if let Some(element) = self.elements.get_mut(&element_id) {
             let width = width.max(1.0);
             let height = height.max(1.0);
-            if element.width != width || element.height != height {
-                element.width = width;
-                element.height = height;
+            let changed = match &mut element.visual {
+                ElementVisual::SolidRect { width: current_width, height: current_height }
+                | ElementVisual::Texture {
+                    width: current_width,
+                    height: current_height,
+                    ..
+                } => {
+                    if *current_width == width && *current_height == height {
+                        false
+                    } else {
+                        *current_width = width;
+                        *current_height = height;
+                        true
+                    }
+                },
+                ElementVisual::Text { .. } => false,
+            };
+            if changed {
                 self.bump_render_revision();
             }
         } else {
@@ -740,9 +791,11 @@ impl ClientGame {
 
     fn apply_element_text_content(&mut self, element_id: u32, text: String) {
         if let Some(element) = self.elements.get_mut(&element_id) {
-            if element.text != text {
-                element.text = text;
-                self.bump_render_revision();
+            if let ElementVisual::Text { text: current_text, .. } = &mut element.visual {
+                if *current_text != text {
+                    *current_text = text;
+                    self.bump_render_revision();
+                }
             }
         } else {
             log::debug!("ignored ElementSetTextContent for unknown element_id={element_id}");
@@ -760,14 +813,22 @@ impl ClientGame {
             let max_width = max_width.max(1.0);
             let font_size = font_size.max(1.0);
             let line_height = line_height.max(font_size + 1.0);
-            if element.text_max_width != max_width
-                || element.text_font_size != font_size
-                || element.text_line_height != line_height
+            if let ElementVisual::Text {
+                max_width: current_max_width,
+                font_size: current_font_size,
+                line_height: current_line_height,
+                ..
+            } = &mut element.visual
             {
-                element.text_max_width = max_width;
-                element.text_font_size = font_size;
-                element.text_line_height = line_height;
-                self.bump_render_revision();
+                if *current_max_width != max_width
+                    || *current_font_size != font_size
+                    || *current_line_height != line_height
+                {
+                    *current_max_width = max_width;
+                    *current_font_size = font_size;
+                    *current_line_height = line_height;
+                    self.bump_render_revision();
+                }
             }
         } else {
             log::debug!("ignored ElementSetTextLayout for unknown element_id={element_id}");
@@ -778,7 +839,7 @@ impl ClientGame {
         let removed_elements: Vec<(u32, Option<protocol::MessageId>)> = self
             .elements
             .drain()
-            .map(|(element_id, element)| (element_id, element.texture_id))
+            .map(|(element_id, element)| (element_id, element.visual.texture_id()))
             .collect();
         for (element_id, texture_id) in removed_elements {
             if let Some(resource_id) = texture_id {
@@ -862,7 +923,7 @@ impl ClientGame {
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
                 if let Some(element) = self.elements.remove(&element_id) {
-                    if let Some(resource_id) = element.texture_id {
+                    if let Some(resource_id) = element.visual.texture_id() {
                         self.release_resource_binding(resource_id, element_id);
                     }
                 }
@@ -1010,7 +1071,7 @@ impl ClientGame {
             .elements
             .iter()
             .filter_map(|(&element_id, element)| {
-                (element.texture_id == Some(resource_id)).then_some(element_id)
+                (element.visual.texture_id() == Some(resource_id)).then_some(element_id)
             })
             .collect();
 
@@ -1026,7 +1087,7 @@ impl ClientGame {
     }
 
     fn element_texture_id(&self, element_id: u32) -> Option<Option<protocol::MessageId>> {
-        self.elements.get(&element_id).map(|element| element.texture_id)
+        self.elements.get(&element_id).map(|element| element.visual.texture_id())
     }
 
     fn set_element_texture_id(
@@ -1037,11 +1098,16 @@ impl ClientGame {
         let Some(element) = self.elements.get_mut(&element_id) else {
             return false;
         };
-        if element.texture_id == texture_id {
-            return false;
+        match &mut element.visual {
+            ElementVisual::Texture { texture_id: current_texture_id, .. } => {
+                if *current_texture_id == texture_id {
+                    return false;
+                }
+                *current_texture_id = texture_id;
+                true
+            },
+            ElementVisual::SolidRect { .. } | ElementVisual::Text { .. } => false,
         }
-        element.texture_id = texture_id;
-        true
     }
 
     fn bump_render_revision(&mut self) {

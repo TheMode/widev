@@ -460,8 +460,9 @@ impl RuntimeState {
             }
         }
 
-        let mut states = game.render_states();
-        let mut text_commands = game.text_commands();
+        let mut states = Vec::new();
+        let mut text_commands = Vec::new();
+        game.build_scene(&mut states, &mut text_commands);
         if settings.show_latency {
             if let Some(renderer) = self.rendering.renderer.as_ref() {
                 renderer

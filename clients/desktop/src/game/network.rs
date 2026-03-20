@@ -347,9 +347,6 @@ fn queue_immediate_responses<'a>(
     for message in messages {
         match message {
             protocol::decode::DecodedServerMessage::Envelope(envelope) => {
-                if let Some(message_id) = envelope.receipt_id {
-                    queue_c2s_packet(pending_writes, protocol::C2SPacket::Receipt { message_id });
-                }
                 for packet in &envelope.packets {
                     if let protocol::S2CPacket::Ping { nonce } = packet {
                         queue_c2s_packet(
@@ -359,11 +356,7 @@ fn queue_immediate_responses<'a>(
                     }
                 }
             },
-            protocol::decode::DecodedServerMessage::Resource(resource) => {
-                if let Some(message_id) = resource.receipt_id {
-                    queue_c2s_packet(pending_writes, protocol::C2SPacket::Receipt { message_id });
-                }
-            },
+            protocol::decode::DecodedServerMessage::Resource(_) => {},
         };
     }
 }
