@@ -30,7 +30,8 @@ struct VsIn {
     @location(0) unit_pos: vec2<f32>,
     @location(1) center: vec2<f32>,
     @location(2) size: vec2<f32>,
-    @location(3) color: vec4<f32>,
+    @location(3) depth: f32,
+    @location(4) color: vec4<f32>,
 };
 
 struct VsOut {
@@ -47,7 +48,7 @@ fn vs_main(input: VsIn) -> VsOut {
     );
 
     var out: VsOut;
-    out.position = vec4<f32>(ndc, 0.0, 1.0);
+    out.position = vec4<f32>(ndc, input.depth, 1.0);
     out.color = input.color;
     return out;
 }
@@ -77,7 +78,8 @@ struct VsIn {
     @location(0) unit_pos: vec2<f32>,
     @location(1) center: vec2<f32>,
     @location(2) size: vec2<f32>,
-    @location(3) color: vec4<f32>,
+    @location(3) depth: f32,
+    @location(4) color: vec4<f32>,
 };
 
 struct VsOut {
@@ -95,7 +97,7 @@ fn vs_main(input: VsIn) -> VsOut {
     );
 
     var out: VsOut;
-    out.position = vec4<f32>(ndc, 0.0, 1.0);
+    out.position = vec4<f32>(ndc, input.depth, 1.0);
     out.uv = input.unit_pos + vec2<f32>(0.5, 0.5);
     out.color = input.color;
     return out;
@@ -118,6 +120,8 @@ struct Vertex {
 struct InstanceRaw {
     center: [f32; 2],
     size: [f32; 2],
+    depth: f32,
+    _pad: f32,
     color: [f32; 4],
 }
 
@@ -133,6 +137,14 @@ struct GpuTexture {
     bind_group: wgpu::BindGroup,
 }
 
+struct DepthTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const MAX_SCENE_DEPTH: f32 = 4096.0;
+
 const QUAD_VERTICES: [Vertex; 4] = [
     Vertex { pos: [-0.5, -0.5] },
     Vertex { pos: [0.5, -0.5] },
@@ -141,6 +153,7 @@ const QUAD_VERTICES: [Vertex; 4] = [
 ];
 
 const QUAD_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+const OVERLAY_DEPTH: i32 = 10_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TextCommand {
@@ -150,6 +163,7 @@ pub(super) struct TextCommand {
     pub(super) max_width: f32,
     pub(super) font_size: f32,
     pub(super) line_height: f32,
+    pub(super) depth: i32,
     pub(super) color: u32,
 }
 
@@ -187,6 +201,7 @@ pub(super) struct Renderer {
     texture_bind_group_layout: wgpu::BindGroupLayout,
     texture_sampler: wgpu::Sampler,
     textures: HashMap<u128, GpuTexture>,
+    depth_target: DepthTarget,
     virtual_dimension_lock: Option<(u32, u32)>,
     aspect_ratio_lock: Option<(u32, u32)>,
     clear_color: wgpu::Color,
@@ -319,6 +334,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        let depth_target = create_depth_target(&device, config.width, config.height);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("widev-pipeline-layout"),
@@ -359,6 +375,11 @@ impl Renderer {
                             wgpu::VertexAttribute {
                                 offset: 16,
                                 shader_location: 3,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 24,
+                                shader_location: 4,
                                 format: wgpu::VertexFormat::Float32x4,
                             },
                         ],
@@ -376,7 +397,13 @@ impl Renderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -421,6 +448,11 @@ impl Renderer {
                             wgpu::VertexAttribute {
                                 offset: 16,
                                 shader_location: 3,
+                                format: wgpu::VertexFormat::Float32,
+                            },
+                            wgpu::VertexAttribute {
+                                offset: 24,
+                                shader_location: 4,
                                 format: wgpu::VertexFormat::Float32x4,
                             },
                         ],
@@ -438,7 +470,13 @@ impl Renderer {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -494,6 +532,7 @@ impl Renderer {
             texture_bind_group_layout,
             texture_sampler,
             textures: HashMap::new(),
+            depth_target,
             virtual_dimension_lock: None,
             aspect_ratio_lock: None,
             clear_color: wgpu::Color::BLACK,
@@ -515,6 +554,7 @@ impl Renderer {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
+        self.depth_target = create_depth_target(&self.device, self.config.width, self.config.height);
         self.write_screen_uniform();
     }
 
@@ -588,7 +628,14 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_target.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
                 multiview_mask: None,
@@ -903,6 +950,8 @@ impl Renderer {
             // centered, so convert to a center point here.
             center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
             size: [state.width, state.height],
+            depth: scene_depth(state.depth),
+            _pad: 0.0,
             color: unpack_color(state.color),
         }));
         self.queue.write_buffer(
@@ -922,6 +971,8 @@ impl Renderer {
             // centered, so convert to a center point here.
             center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
             size: [state.width, state.height],
+            depth: scene_depth(state.depth),
+            _pad: 0.0,
             color: unpack_color(state.color),
         }));
         self.queue.write_buffer(
@@ -1164,12 +1215,39 @@ fn oklch_to_clear_color([l, c, h_deg, alpha]: [f32; 4]) -> wgpu::Color {
     wgpu::Color { r, g, b, a: alpha.clamp(0.0, 1.0) as f64 }
 }
 
+fn create_depth_target(device: &wgpu::Device, width: u32, height: u32) -> DepthTarget {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("widev-depth-target"),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    DepthTarget { _texture: texture, view }
+}
+
+fn scene_depth(depth: i32) -> f32 {
+    (0.5 + (depth as f32 / (MAX_SCENE_DEPTH * 2.0))).clamp(0.0, 1.0)
+}
+
 fn push_rect(states: &mut Vec<RenderState>, x: f32, y: f32, width: f32, height: f32, color: u32) {
     let sx = x.round();
     let sy = y.round();
     let sw = width.max(1.0).round();
     let sh = height.max(1.0).round();
-    states.push(RenderState { x: sx, y: sy, width: sw, height: sh, color, texture_id: None });
+    states.push(RenderState {
+        x: sx,
+        y: sy,
+        width: sw,
+        height: sh,
+        depth: OVERLAY_DEPTH,
+        color,
+        texture_id: None,
+    });
 }
 
 fn draw_border(
@@ -1207,6 +1285,7 @@ fn draw_text_line(
         max_width: max_width.max(1.0),
         font_size: font_size.max(1.0),
         line_height: (font_size * 1.2).max(font_size + 2.0),
+        depth: OVERLAY_DEPTH,
         color,
     });
 }

@@ -471,6 +471,7 @@ impl RuntimeState {
         }
         states.extend(overlay_states);
         text_commands.extend(overlay_text);
+        text_commands.sort_by_key(|command| command.depth);
         let render_needed = self.rendering.force_redraw
             || self.rendering.cache.last_surface_state != Some(surface)
             || self.rendering.cache.last_render_revision != game.render_revision()

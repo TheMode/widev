@@ -250,6 +250,14 @@
       ]
     },
     {
+      "name": "ElementSetDepth",
+      "description": "Set the draw depth for one element on this client. Higher values draw later.",
+      "fields": [
+        { "name": "element_id", "type": "ElementId" },
+        { "name": "depth", "type": "i32" }
+      ]
+    },
+    {
       "name": "ElementSetTextContent",
       "description": "Set the UTF-8 text content for one text element on this client.",
       "fields": [

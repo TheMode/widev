@@ -112,6 +112,7 @@ pub(super) struct RenderState {
     pub(super) y: f32,
     pub(super) width: f32,
     pub(super) height: f32,
+    pub(super) depth: i32,
     pub(super) color: u32,
     pub(super) texture_id: Option<protocol::MessageId>,
 }
@@ -215,6 +216,7 @@ impl SessionBootstrap {
 struct ElementState {
     visible: bool,
     kind: protocol::ElementKind,
+    depth: i32,
     color: protocol::Color,
     texture_id: Option<protocol::MessageId>,
     width: f32,
@@ -259,6 +261,7 @@ impl ElementState {
         Self {
             visible: false,
             kind: protocol::ElementKind::SolidRect,
+            depth: 0,
             color,
             texture_id: None,
             width: PLAYER_SIZE,
@@ -434,23 +437,26 @@ impl ClientGame {
     }
 
     pub(super) fn render_states(&self) -> Vec<RenderState> {
-        self.elements
-            .values()
-            .filter(|e| {
-                e.visible
+        self
+            .elements
+            .iter()
+            .filter_map(|(&element_id, e)| {
+                let renderable = e.visible
                     && match e.kind {
                         protocol::ElementKind::SolidRect => true,
                         protocol::ElementKind::Texture => {
                             e.texture_id.and_then(|id| self.texture_resource(id)).is_some()
                         },
                         protocol::ElementKind::Text => false,
-                    }
+                    };
+                renderable.then_some((element_id, e))
             })
-            .map(|e| RenderState {
+            .map(|(_, e)| RenderState {
                 x: e.draw.x,
                 y: e.draw.y,
                 width: e.width,
                 height: e.height,
+                depth: e.depth,
                 color: oklch_to_u32(e.color),
                 texture_id: e.texture_id,
             })
@@ -458,19 +464,29 @@ impl ClientGame {
     }
 
     fn text_commands(&self) -> Vec<TextCommand> {
-        self.elements
-            .values()
-            .filter(|e| e.visible && e.kind == protocol::ElementKind::Text && !e.text.is_empty())
-            .map(|e| TextCommand {
-                text: e.text.clone(),
-                x: e.draw.x,
-                y: e.draw.y,
-                max_width: e.text_max_width.max(1.0),
-                font_size: e.text_font_size.max(1.0),
-                line_height: e.text_line_height.max(e.text_font_size + 1.0),
-                color: oklch_to_u32(e.color),
+        let mut commands: Vec<_> = self
+            .elements
+            .iter()
+            .filter(|(_, e)| e.visible && e.kind == protocol::ElementKind::Text && !e.text.is_empty())
+            .map(|(&element_id, e)| {
+                (
+                    e.depth,
+                    element_id,
+                    TextCommand {
+                        text: e.text.clone(),
+                        x: e.draw.x,
+                        y: e.draw.y,
+                        max_width: e.text_max_width.max(1.0),
+                        font_size: e.text_font_size.max(1.0),
+                        line_height: e.text_line_height.max(e.text_font_size + 1.0),
+                        depth: e.depth,
+                        color: oklch_to_u32(e.color),
+                    },
+                )
             })
-            .collect()
+            .collect();
+        commands.sort_by_key(|(depth, element_id, _)| (*depth, *element_id));
+        commands.into_iter().map(|(_, _, command)| command).collect()
     }
 
     pub(super) fn resources(&self) -> &HashMap<protocol::MessageId, ClientResource> {
@@ -711,6 +727,17 @@ impl ClientGame {
         }
     }
 
+    fn apply_element_depth(&mut self, element_id: u32, depth: i32) {
+        if let Some(element) = self.elements.get_mut(&element_id) {
+            if element.depth != depth {
+                element.depth = depth;
+                self.bump_render_revision();
+            }
+        } else {
+            log::debug!("ignored ElementSetDepth for unknown element_id={element_id}");
+        }
+    }
+
     fn apply_element_text_content(&mut self, element_id: u32, text: String) {
         if let Some(element) = self.elements.get_mut(&element_id) {
             if element.text != text {
@@ -803,6 +830,9 @@ impl ClientGame {
             },
             protocol::S2CPacket::ElementSetSize { element_id, width, height } => {
                 self.apply_element_size(element_id, width, height);
+            },
+            protocol::S2CPacket::ElementSetDepth { element_id, depth } => {
+                self.apply_element_depth(element_id, depth);
             },
             protocol::S2CPacket::ElementSetTextContent { element_id, text } => {
                 self.apply_element_text_content(element_id, text);
