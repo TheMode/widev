@@ -661,7 +661,7 @@ mod tests {
                 target_label: "Broadcast".to_string(),
                 priority: <&str>::from(priority).to_string(),
                 order: format!("{:?}", order),
-                delivery: "FireAndForget",
+                delivery: "FireAndForget".to_string(),
                 dependency_label: None,
                 sequence_id: None,
                 components: Vec::new(),

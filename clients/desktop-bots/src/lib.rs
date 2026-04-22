@@ -477,8 +477,9 @@ fn run_worker(
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, on_shutdown_signal as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_shutdown_signal as libc::sighandler_t);
+        let handler = on_shutdown_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
     }
 }
 

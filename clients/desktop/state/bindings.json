@@ -5,6 +5,20 @@
   "servers": {
     "fd90b14e4724da347dac29665806aeb5edd243087dc197d7391a49b3591121ec": {
       "bindings": {
+        "move_left": {
+          "type": "Toggle",
+          "sources": [
+            {
+              "device": {
+                "type": "keyboard"
+              },
+              "input": {
+                "kind": "key",
+                "code": "KeyA"
+              }
+            }
+          ]
+        },
         "move_up": {
           "type": "Toggle",
           "sources": [
@@ -29,6 +43,20 @@
               "input": {
                 "kind": "key",
                 "code": "KeyS"
+              }
+            }
+          ]
+        },
+        "move_right": {
+          "type": "Toggle",
+          "sources": [
+            {
+              "device": {
+                "type": "keyboard"
+              },
+              "input": {
+                "kind": "key",
+                "code": "KeyD"
               }
             }
           ]
