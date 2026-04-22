@@ -14,19 +14,38 @@
 From the workspace root:
 
 ```bash
-cargo run -p widev-server -- 127.0.0.1:4433
+cargo run -p xtask -- server
 ```
 
-In another terminal:
+Start the client against the default local server:
 
 ```bash
-cargo run -p widev-desktop-client -- 127.0.0.1:4433
+cargo run -p xtask -- client
+```
+
+Or launch both in one command for local testing:
+
+```bash
+cargo run -p xtask -- play
 ```
 
 Optional bot runner:
 
 ```bash
-cargo run -p widev-desktop-bots -- 127.0.0.1:4433
+cargo run -p xtask -- bots
+```
+
+`xtask` uses debug builds by default so edit-test cycles stay fast. Add `--release` when you want optimized binaries, for example:
+
+```bash
+cargo run -p xtask -- play --release
+cargo run -p xtask -- bots --release --count=1000
+```
+
+For profiling, generate a flamegraph for a running server with:
+
+```bash
+cargo run -p xtask -- flame --name widev-server --duration 30 --output server-flame.svg
 ```
 
 ## Notes

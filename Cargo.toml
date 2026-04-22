@@ -4,6 +4,7 @@ members = [
   "clients/desktop",
   "clients/desktop-bots",
   "common/protocol_codegen",
+  "xtask",
 ]
 resolver = "2"
 
