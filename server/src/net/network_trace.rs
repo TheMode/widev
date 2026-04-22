@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -1370,11 +1370,7 @@ fn sequence_label(order: PacketOrder) -> Option<String> {
 }
 
 fn queue_name_for_trace(trace: &DispatchTraceMeta) -> &'static str {
-    if trace.sequence_id.is_some() {
-        "sequence"
-    } else {
-        "independent"
-    }
+    if trace.sequence_id.is_some() { "sequence" } else { "independent" }
 }
 
 fn stream_id_hint_from_order(_order: &str) -> Option<u64> {

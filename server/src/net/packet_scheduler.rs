@@ -728,9 +728,11 @@ mod tests {
         assert!(scheduler.push(SchedulerCommand::Message(first), now).is_empty());
         let actions = scheduler.push(SchedulerCommand::Message(second), now);
         assert_eq!(actions.len(), 2);
-        assert!(actions
-            .iter()
-            .all(|a| matches!(a, SchedulerAction::DispatchMessage { force_flush: false, .. })));
+        assert!(
+            actions
+                .iter()
+                .all(|a| matches!(a, SchedulerAction::DispatchMessage { force_flush: false, .. }))
+        );
     }
 
     #[test]
@@ -848,16 +850,18 @@ mod tests {
     fn coalescing_resource_works() {
         let now = Instant::now();
         let mut scheduler = PacketScheduler::new();
-        assert!(scheduler
-            .push(
-                SchedulerCommand::Message(resource(
-                    PacketPriority::Coalescing { target_payload_bytes: 256 },
-                    PacketOrder::Independent,
-                    128,
-                )),
-                now,
-            )
-            .is_empty());
+        assert!(
+            scheduler
+                .push(
+                    SchedulerCommand::Message(resource(
+                        PacketPriority::Coalescing { target_payload_bytes: 256 },
+                        PacketOrder::Independent,
+                        128,
+                    )),
+                    now,
+                )
+                .is_empty()
+        );
     }
 
     #[test]

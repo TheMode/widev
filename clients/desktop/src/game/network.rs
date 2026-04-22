@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -149,11 +149,7 @@ impl QuicClient {
 
     pub(super) fn path_rtt(&self) -> Option<Duration> {
         let micros = self.path_rtt_us.load(Ordering::Relaxed);
-        if micros == 0 {
-            None
-        } else {
-            Some(Duration::from_micros(micros))
-        }
+        if micros == 0 { None } else { Some(Duration::from_micros(micros)) }
     }
 
     pub(super) fn poll(&mut self) -> Result<IncomingPackets> {

@@ -12,7 +12,7 @@ mod net;
 
 pub use net::{network_trace, packet_codec, packet_scheduler, packets};
 
-use game_loop::{handle_network_events, GameLoop, ShutdownSignal};
+use game_loop::{GameLoop, ShutdownSignal, handle_network_events};
 use game_state::GameState;
 use net::network::NetworkRuntime;
 

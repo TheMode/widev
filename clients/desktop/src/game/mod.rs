@@ -68,7 +68,7 @@ impl ClientResource {
             Some(-1) => return Err(anyhow::anyhow!("invalid resource usage_count=-1")),
             Some(count) if count >= 0 => Some(count as u32),
             Some(negative) => {
-                return Err(anyhow::anyhow!("invalid resource usage_count={negative}"))
+                return Err(anyhow::anyhow!("invalid resource usage_count={negative}"));
             },
         };
         let payload = decode_resource_payload(&resource_type, blob);

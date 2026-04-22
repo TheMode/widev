@@ -178,8 +178,8 @@ impl Game for RedSquareGame {
                 },
                 DeliveryOutcome::TransportDropped { reason } => {
                     log::info!(
-                            "transport dropped message {message_id:032x} for client {client_id}: {reason:?}"
-                        );
+                        "transport dropped message {message_id:032x} for client {client_id}: {reason:?}"
+                    );
                 },
                 DeliveryOutcome::ClientProcessed => {
                     log::info!("client {client_id} processed message {message_id:032x}");

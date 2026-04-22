@@ -1,15 +1,15 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::LoopOptions;
 use crate::game::{Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::net::network::NetworkRuntime;
-use crate::LoopOptions;
 
 pub struct GameLoop {
     config: LoopOptions,

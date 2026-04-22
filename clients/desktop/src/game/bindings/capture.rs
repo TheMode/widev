@@ -4,12 +4,12 @@ use gilrs::{Axis as GilrsAxis, Button as GilrsButton, EventType as GilrsEventTyp
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::PhysicalKey;
 
+use super::UiAction;
 use super::model::{
     DeviceFilter, DeviceIdentity, DeviceType, GamepadAxis, GamepadButton, GamepadStick,
     InputDescriptor, KeyModifiers, KeyboardKey, MouseAxis, MouseButtonKind, RawSource,
 };
 use super::protocol;
-use super::UiAction;
 use winit::keyboard::ModifiersState;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::DeviceIdExtWindows;

@@ -1,6 +1,6 @@
 use crate::packets::{
-    encode_s2c, DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketOrder,
-    PacketPayload, PacketResource, S2CPacket,
+    DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketOrder, PacketPayload,
+    PacketResource, S2CPacket, encode_s2c,
 };
 
 pub fn serialize_s2c_packet_message(packet: &S2CPacket) -> Option<Vec<u8>> {

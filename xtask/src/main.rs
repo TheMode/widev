@@ -6,7 +6,7 @@ use std::process::{self, Child, Command};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:4433";
@@ -60,11 +60,7 @@ struct ProfileArgs {
 
 impl ProfileArgs {
     fn profile(self) -> BuildProfile {
-        if self.release {
-            BuildProfile::Release
-        } else {
-            BuildProfile::Dev
-        }
+        if self.release { BuildProfile::Release } else { BuildProfile::Dev }
     }
 }
 
@@ -527,11 +523,7 @@ fn run_optional_sudo(use_sudo: bool, program: &str, args: &[OsString]) -> Result
 
 fn run_status(command: &mut Command, error: &str) -> Result<()> {
     let status = command.status().context(error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("{}: {}", error, status)
-    }
+    if status.success() { Ok(()) } else { bail!("{}: {}", error, status) }
 }
 
 fn stop_child(child: &mut Child) {

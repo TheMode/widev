@@ -12,10 +12,10 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use super::bindings::BindingPromptState;
 use super::ClientResource;
 use super::LatencySnapshot;
 use super::RenderState;
+use super::bindings::BindingPromptState;
 
 const SHADER_SOURCE: &str = r#"
 struct Screen {
@@ -1202,11 +1202,7 @@ fn enforce_aspect(width: u32, height: u32, numerator: u32, denominator: u32) -> 
     let target_width = ((height as u64 * numerator as u64) / denominator as u64).max(1) as u32;
     let delta_h = (target_height as i64 - height as i64).abs();
     let delta_w = (target_width as i64 - width as i64).abs();
-    if delta_h <= delta_w {
-        (width, target_height)
-    } else {
-        (target_width, height)
-    }
+    if delta_h <= delta_w { (width, target_height) } else { (target_width, height) }
 }
 
 fn oklch_to_clear_color([l, c, h_deg, alpha]: [f32; 4]) -> wgpu::Color {

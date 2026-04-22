@@ -1,10 +1,10 @@
-use std::collections::{hash_map::Entry, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::fs;
 use std::io::{self, IoSliceMut};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -746,11 +746,7 @@ fn handle_add_connection(shard: &mut ShardState, client_addr: SocketAddr, initia
 
     let Ok(client_id) =
         shard.next_client_id.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
-            if id == u32::MAX {
-                None
-            } else {
-                Some(id + 1)
-            }
+            if id == u32::MAX { None } else { Some(id + 1) }
         })
     else {
         log::error!("exhausted global ClientId space; rejecting new connection from {client_addr}");

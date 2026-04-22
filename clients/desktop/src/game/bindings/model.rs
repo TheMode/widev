@@ -104,11 +104,7 @@ impl DeviceFilter {
     }
 
     pub(crate) fn with_scope(&self, any_device: bool) -> Self {
-        if any_device {
-            Self::any(self.device_type)
-        } else {
-            self.clone()
-        }
+        if any_device { Self::any(self.device_type) } else { self.clone() }
     }
 
     fn display_label(&self) -> String {
@@ -511,16 +507,13 @@ impl fmt::Display for RawSource {
             InputDescriptor::KeyChord { key, modifiers } => {
                 write!(f, "keyboard/{}/chord({modifiers}{key})", self.device.display_label())
             },
-            InputDescriptor::VirtualStick {
-                positive_x,
-                negative_x,
-                positive_y,
-                negative_y,
-            } => write!(
-                f,
-                "keyboard/{}/virtual_stick(+x={positive_x},-x={negative_x},+y={positive_y},-y={negative_y})",
-                self.device.display_label()
-            ),
+            InputDescriptor::VirtualStick { positive_x, negative_x, positive_y, negative_y } => {
+                write!(
+                    f,
+                    "keyboard/{}/virtual_stick(+x={positive_x},-x={negative_x},+y={positive_y},-y={negative_y})",
+                    self.device.display_label()
+                )
+            },
             InputDescriptor::Stick { stick } => {
                 write!(f, "gamepad/{}/stick/{stick}", self.device.display_label())
             },

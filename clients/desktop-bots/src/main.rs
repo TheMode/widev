@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
-use widev_desktop_bots::{run_with_flow, AckAndMoveFlow, BotRunnerConfig, PassiveFlow};
+use widev_desktop_bots::{AckAndMoveFlow, BotRunnerConfig, PassiveFlow, run_with_flow};
 
 #[derive(Debug, Parser)]
 #[command(name = "widev-desktop-bots")]
