@@ -148,10 +148,7 @@ impl Game for RedSquareGame {
 
                 let mut bundle: PacketBundle = Vec::new();
                 bundle.extend([
-                    S2CPacket::ElementAdd {
-                        element_id: client_id,
-                        kind: ElementKind::Texture,
-                    },
+                    S2CPacket::ElementAdd { element_id: client_id, kind: ElementKind::Texture },
                     S2CPacket::ElementSetTexture {
                         element_id: client_id,
                         resource_id: self.player_texture_id,

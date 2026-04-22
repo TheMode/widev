@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use crate::game::{ClientId, Game, NetworkEvent};
 use crate::game_state::GameState;
 use crate::packets::{
-    DeliveryPolicy, ElementKind, InputType, MessageId, PacketBundle, PacketControl,
-    PacketEnvelope, PacketResource, PacketTarget, S2CPacket,
+    DeliveryPolicy, ElementKind, InputType, MessageId, PacketBundle, PacketControl, PacketEnvelope,
+    PacketResource, PacketTarget, S2CPacket,
 };
 
 const GAME_WIDTH: f32 = 800.0;
@@ -257,7 +257,10 @@ impl PongGame {
             S2CPacket::ElementSetSize { element_id: 0, width: BALL_SIZE, height: BALL_SIZE },
             S2CPacket::ElementMove { element_id: 0, x: m.ball.x, y: m.ball.y },
             S2CPacket::ElementAdd { element_id: score_element, kind: ElementKind::Text },
-            S2CPacket::ElementSetColor { element_id: score_element, color: [0.96, 0.02, 250.0, 1.0] },
+            S2CPacket::ElementSetColor {
+                element_id: score_element,
+                color: [0.96, 0.02, 250.0, 1.0],
+            },
             S2CPacket::ElementSetTextLayout {
                 element_id: score_element,
                 max_width: SCORE_TEXT_MAX_WIDTH,

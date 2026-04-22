@@ -467,7 +467,11 @@ impl ClientGame {
         Ok(())
     }
 
-    fn build_scene(&self, render_states: &mut Vec<RenderState>, text_commands: &mut Vec<TextCommand>) {
+    fn build_scene(
+        &self,
+        render_states: &mut Vec<RenderState>,
+        text_commands: &mut Vec<TextCommand>,
+    ) {
         let mut sorted_text_commands = Vec::new();
         for (&element_id, element) in &self.elements {
             if !element.visible {
@@ -521,8 +525,7 @@ impl ClientGame {
         }
 
         sorted_text_commands.sort_by_key(|(depth, element_id, _)| (*depth, *element_id));
-        text_commands
-            .extend(sorted_text_commands.into_iter().map(|(_, _, command)| command));
+        text_commands.extend(sorted_text_commands.into_iter().map(|(_, _, command)| command));
     }
 
     pub(super) fn resources(&self) -> &HashMap<protocol::MessageId, ClientResource> {
@@ -755,11 +758,7 @@ impl ClientGame {
             let height = height.max(1.0);
             let changed = match &mut element.visual {
                 ElementVisual::SolidRect { width: current_width, height: current_height }
-                | ElementVisual::Texture {
-                    width: current_width,
-                    height: current_height,
-                    ..
-                } => {
+                | ElementVisual::Texture { width: current_width, height: current_height, .. } => {
                     if *current_width == width && *current_height == height {
                         false
                     } else {

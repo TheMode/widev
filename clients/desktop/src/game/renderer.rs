@@ -554,7 +554,8 @@ impl Renderer {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_target = create_depth_target(&self.device, self.config.width, self.config.height);
+        self.depth_target =
+            create_depth_target(&self.device, self.config.width, self.config.height);
         self.write_screen_uniform();
     }
 
@@ -680,10 +681,7 @@ impl Renderer {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
@@ -1236,7 +1234,11 @@ fn oklch_to_clear_color([l, c, h_deg, alpha]: [f32; 4]) -> wgpu::Color {
 fn create_depth_target(device: &wgpu::Device, width: u32, height: u32) -> DepthTarget {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("widev-depth-target"),
-        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,

@@ -386,7 +386,6 @@ impl InputCapture {
             .max_by(|a, b| a.abs().total_cmp(&b.abs()))
             .unwrap_or(0.0)
     }
-
 }
 
 fn axis_from_keys(
