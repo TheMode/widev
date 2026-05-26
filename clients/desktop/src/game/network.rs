@@ -251,7 +251,7 @@ fn run_worker(
         }
         let datagrams = drain_datagrams(&mut conn, &mut app_buf);
         let streams = drain_streams(&mut conn, &mut app_buf, &mut stream_states);
-        let messages = decode_server_messages(datagrams.into_iter().chain(streams.into_iter()));
+        let messages = decode_server_messages(datagrams.into_iter().chain(streams));
         queue_immediate_responses(&mut pending_writes, &messages);
 
         if poll_timed_out || conn.timeout().is_some_and(|value| value.is_zero()) {
@@ -262,7 +262,7 @@ fn run_worker(
         advertise_spare_scids(&mut conn);
 
         flush_stream_writes(&mut conn, &mut pending_writes)?;
-        let _ = flush_outgoing(&socket, &mut conn, &mut send_buf)?;
+        flush_outgoing(&socket, &mut conn, &mut send_buf)?;
 
         refresh_shared_connection_state(&conn, &is_established, &peer_cert_der, &path_rtt_us);
         let established = conn.is_established();
@@ -436,11 +436,10 @@ fn recv_udp(
         }
 
         let recv_info = RecvInfo { from, to: local_addr };
-        if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info) {
-            if err != quiche::Error::Done {
+        if let Err(err) = conn.recv(&mut recv_buf[..len], recv_info)
+            && err != quiche::Error::Done {
                 log::warn!("client conn.recv error: {err:?}");
             }
-        }
     }
     Ok(())
 }
@@ -495,11 +494,10 @@ fn refresh_shared_connection_state(
         return;
     }
 
-    if let Ok(mut cert_slot) = peer_cert_der.lock() {
-        if cert_slot.is_none() {
+    if let Ok(mut cert_slot) = peer_cert_der.lock()
+        && cert_slot.is_none() {
             *cert_slot = conn.peer_cert().map(|bytes| bytes.to_vec());
         }
-    }
     if let Some(path) = conn.path_stats().next() {
         path_rtt_us.store(path.rtt.as_micros() as u64, Ordering::Relaxed);
     }
@@ -559,11 +557,7 @@ fn flush_stream_writes(
     conn: &mut quiche::Connection,
     pending_writes: &mut VecDeque<PendingStreamWrite>,
 ) -> Result<()> {
-    loop {
-        let Some(mut write) = pending_writes.pop_front() else {
-            break;
-        };
-
+    while let Some(mut write) = pending_writes.pop_front() {
         match conn.stream_send(CLIENT_STREAM_ID, &write.data[write.offset..], false) {
             Ok(written) => {
                 write.offset += written;
@@ -587,24 +581,19 @@ fn flush_outgoing(
     socket: &MioUdpSocket,
     conn: &mut quiche::Connection,
     send_buf: &mut [u8],
-) -> Result<bool> {
-    let mut sent_any = false;
+) -> Result<()> {
     loop {
         match conn.send(send_buf) {
-            Ok((len, send_info)) => {
-                match socket.send_to(&send_buf[..len], send_info.to) {
-                    Ok(_) => {},
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(err) => return Err(err).context("socket send_to failed"),
-                }
-                sent_any = true;
+            Ok((len, send_info)) => match socket.send_to(&send_buf[..len], send_info.to) {
+                Ok(_) => {},
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err).context("socket send_to failed"),
             },
             Err(quiche::Error::Done) => break,
             Err(err) => return Err(anyhow::anyhow!("conn.send failed: {err:?}")),
         }
     }
-
-    Ok(sent_any)
+    Ok(())
 }
 
 fn build_client_quic_config() -> Result<quiche::Config> {

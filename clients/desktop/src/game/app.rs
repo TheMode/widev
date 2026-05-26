@@ -235,7 +235,6 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Err(err) = self.runtime.tick_frame(&mut self.game, &self.settings) {
                     log::error!("client frame error: {err:#}");
                     event_loop.exit();
-                    return;
                 }
             },
             WindowEvent::Destroyed => {},
@@ -259,7 +258,7 @@ impl Default for AppSettings {
 struct RuntimeState {
     windowing: WindowState,
     rendering: RenderingState,
-    input: InputState,
+    input: InputCapture,
     network_migration: NetworkMigrationCoordinator,
 }
 
@@ -268,7 +267,7 @@ impl Default for RuntimeState {
         Self {
             windowing: WindowState::default(),
             rendering: RenderingState::default(),
-            input: InputState::default(),
+            input: InputCapture::new(),
             network_migration: NetworkMigrationCoordinator::new(),
         }
     }
@@ -455,7 +454,7 @@ impl RuntimeState {
             self.rendering.last_prompt_signature = None;
             window.set_title(game.game_name());
             if self.windowing.focused {
-                let input_capture = &self.input.capture;
+                let input_capture = &self.input;
                 game.send_bound_inputs(|path| input_capture.read_binding_value(path))?;
             }
         }
@@ -463,13 +462,12 @@ impl RuntimeState {
         let mut states = Vec::new();
         let mut text_commands = Vec::new();
         game.build_scene(&mut states, &mut text_commands);
-        if settings.show_latency {
-            if let Some(renderer) = self.rendering.renderer.as_ref() {
+        if settings.show_latency
+            && let Some(renderer) = self.rendering.renderer.as_ref() {
                 renderer
                     .build_latency_overlay(game.latency_snapshot())
                     .merge_into(&mut states, &mut text_commands);
             }
-        }
         states.extend(overlay_states);
         text_commands.extend(overlay_text);
         text_commands.sort_by_key(|command| command.depth);
@@ -507,7 +505,7 @@ impl Default for WindowState {
 }
 
 impl WindowState {
-    fn set_focused(&mut self, focused: bool, input: &mut InputState) {
+    fn set_focused(&mut self, focused: bool, input: &mut InputCapture) {
         self.focused = focused;
         if !focused {
             input.clear_active_inputs();
@@ -545,42 +543,6 @@ impl WindowState {
         }
 
         rendering.cache.last_applied_window_lock = Some(next_lock);
-    }
-}
-
-struct InputState {
-    capture: InputCapture,
-}
-
-impl Default for InputState {
-    fn default() -> Self {
-        Self { capture: InputCapture::new() }
-    }
-}
-
-impl InputState {
-    fn poll_gamepads(&mut self) {
-        self.capture.poll_gamepads();
-    }
-
-    fn binding_actions(&mut self) -> Vec<super::bindings::UiAction> {
-        self.capture.binding_actions()
-    }
-
-    fn consume_device_event(&mut self, device_id: winit::event::DeviceId, event: DeviceEvent) {
-        self.capture.consume_device_event(device_id, event);
-    }
-
-    fn consume_window_event(&mut self, event: &WindowEvent) {
-        self.capture.consume_window_event(event);
-    }
-
-    fn clear_active_inputs(&mut self) {
-        self.capture.clear_active_inputs();
-    }
-
-    fn end_frame(&mut self) {
-        self.capture.end_frame();
     }
 }
 

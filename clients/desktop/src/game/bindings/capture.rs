@@ -120,11 +120,11 @@ impl InputCapture {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                let device = keyboard_mouse_identity(&device_id);
+                let device = keyboard_mouse_identity(device_id);
                 match event.state {
                     ElementState::Pressed => {
-                        if let Some(key) = keyboard_key_from_winit(code) {
-                            if !event.repeat && self.pressed_keys.insert((device.clone(), key)) {
+                        if let Some(key) = keyboard_key_from_winit(code)
+                            && !event.repeat && self.pressed_keys.insert((device.clone(), key)) {
                                 self.just_pressed_keys.push(key);
                                 let input = if is_modifier_key(key) {
                                     InputDescriptor::Key { code: key }
@@ -143,7 +143,6 @@ impl InputCapture {
                                     input,
                                 ));
                             }
-                        }
                     },
                     ElementState::Released => {
                         if let Some(key) = keyboard_key_from_winit(code) {
@@ -153,18 +152,17 @@ impl InputCapture {
                 }
             },
             WindowEvent::MouseInput { device_id, state, button, .. } => {
-                let device = keyboard_mouse_identity(&device_id);
+                let device = keyboard_mouse_identity(device_id);
                 match state {
                     ElementState::Pressed => {
-                        if let Some(button) = mouse_button_from_winit(*button) {
-                            if self.pressed_mouse_buttons.insert((device.clone(), button)) {
+                        if let Some(button) = mouse_button_from_winit(*button)
+                            && self.pressed_mouse_buttons.insert((device.clone(), button)) {
                                 self.just_captured_sources.push(captured_source(
                                     DeviceType::Mouse,
                                     device,
                                     InputDescriptor::MouseButton { button },
                                 ));
                             }
-                        }
                     },
                     ElementState::Released => {
                         if let Some(button) = mouse_button_from_winit(*button) {
@@ -174,7 +172,7 @@ impl InputCapture {
                 }
             },
             WindowEvent::MouseWheel { device_id, delta, .. } => {
-                let device = keyboard_mouse_identity(&device_id);
+                let device = keyboard_mouse_identity(device_id);
                 let (x, y) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (*x, *y),
                     MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),

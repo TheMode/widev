@@ -51,7 +51,7 @@ fn main() -> Result<()> {
 
     match args.flow.as_str() {
         "passive" => run_with_flow(cfg, |_| Box::new(PassiveFlow)),
-        "ack-move" => run_with_flow(cfg, |_| Box::new(AckAndMoveFlow::new())),
+        "ack-move" => run_with_flow(cfg, |_| Box::new(AckAndMoveFlow::default())),
         other => bail!("unknown flow '{}'; expected: passive | ack-move", other),
     }
 }

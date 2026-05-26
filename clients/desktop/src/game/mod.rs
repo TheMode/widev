@@ -65,7 +65,6 @@ impl ClientResource {
     fn new(resource_type: String, usage_count: Option<i32>, blob: &[u8]) -> Result<Self> {
         let remaining_uses = match usage_count {
             None => None,
-            Some(-1) => return Err(anyhow::anyhow!("invalid resource usage_count=-1")),
             Some(count) if count >= 0 => Some(count as u32),
             Some(negative) => {
                 return Err(anyhow::anyhow!("invalid resource usage_count={negative}"));
@@ -790,12 +789,11 @@ impl ClientGame {
 
     fn apply_element_text_content(&mut self, element_id: u32, text: String) {
         if let Some(element) = self.elements.get_mut(&element_id) {
-            if let ElementVisual::Text { text: current_text, .. } = &mut element.visual {
-                if *current_text != text {
+            if let ElementVisual::Text { text: current_text, .. } = &mut element.visual
+                && *current_text != text {
                     *current_text = text;
                     self.bump_render_revision();
                 }
-            }
         } else {
             log::debug!("ignored ElementSetTextContent for unknown element_id={element_id}");
         }
@@ -818,17 +816,15 @@ impl ClientGame {
                 line_height: current_line_height,
                 ..
             } = &mut element.visual
-            {
-                if *current_max_width != max_width
+                && (*current_max_width != max_width
                     || *current_font_size != font_size
-                    || *current_line_height != line_height
+                    || *current_line_height != line_height)
                 {
                     *current_max_width = max_width;
                     *current_font_size = font_size;
                     *current_line_height = line_height;
                     self.bump_render_revision();
                 }
-            }
         } else {
             log::debug!("ignored ElementSetTextLayout for unknown element_id={element_id}");
         }
@@ -859,13 +855,13 @@ impl ClientGame {
             protocol::S2CPacket::SetGameName { name } => {
                 self.bootstrap.set_game_name(name);
             },
-            protocol::S2CPacket::Join {} => {
+            protocol::S2CPacket::Join => {
                 if !matches!(self.phase, ClientPhase::JoinedPendingWindow | ClientPhase::Running) {
                     self.phase = ClientPhase::JoinedPendingWindow;
                     log::info!("join received; client can initialize surfaces and render");
                 }
             },
-            protocol::S2CPacket::ResetScene {} => {
+            protocol::S2CPacket::ResetScene => {
                 self.reset_scene();
             },
             protocol::S2CPacket::SurfaceLockDimensions { surface_id, width, height } => {
@@ -921,11 +917,10 @@ impl ClientGame {
                 self.handle_element_move(element_id, x, y);
             },
             protocol::S2CPacket::ElementRemove { element_id } => {
-                if let Some(element) = self.elements.remove(&element_id) {
-                    if let Some(resource_id) = element.visual.texture_id() {
+                if let Some(element) = self.elements.remove(&element_id)
+                    && let Some(resource_id) = element.visual.texture_id() {
                         self.release_resource_binding(resource_id, element_id);
                     }
-                }
                 self.pending_prediction.remove(&element_id);
             },
         }
@@ -1147,7 +1142,9 @@ fn decode_png_texture(bytes: &[u8]) -> Result<TextureResource> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info()?;
-    let mut rgba = vec![0; reader.output_buffer_size()];
+    let output_size =
+        reader.output_buffer_size().ok_or_else(|| anyhow::anyhow!("png output size overflow"))?;
+    let mut rgba = vec![0; output_size];
     let info = reader.next_frame(&mut rgba)?;
     if info.color_type != png::ColorType::Rgba {
         return Err(anyhow::anyhow!("expected RGBA png output, got {:?}", info.color_type));

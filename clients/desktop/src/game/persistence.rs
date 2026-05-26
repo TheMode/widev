@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::bindings::ActionBinding;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Default)]
 struct PersistedData {
     #[serde(default)]
     global: PersistedSettings,
@@ -15,11 +16,6 @@ struct PersistedData {
     servers: HashMap<String, PersistedSettings>,
 }
 
-impl Default for PersistedData {
-    fn default() -> Self {
-        Self { global: PersistedSettings::default(), servers: HashMap::new() }
-    }
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedSettings {

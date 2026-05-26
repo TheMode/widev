@@ -119,24 +119,13 @@ impl BotFlow for PassiveFlow {
     }
 }
 
+#[derive(Default)]
 pub struct AckAndMoveFlow {
     up: Option<u16>,
     down: Option<u16>,
     left: Option<u16>,
     right: Option<u16>,
     ticks: u64,
-}
-
-impl AckAndMoveFlow {
-    pub fn new() -> Self {
-        Self { up: None, down: None, left: None, right: None, ticks: 0 }
-    }
-}
-
-impl Default for AckAndMoveFlow {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl BotFlow for AckAndMoveFlow {
@@ -423,15 +412,14 @@ fn run_worker(
             return Ok(());
         }
 
-        if let Some(deadline) = shutdown_deadline {
-            if Instant::now() >= deadline {
+        if let Some(deadline) = shutdown_deadline
+            && Instant::now() >= deadline {
                 if config.close_on_exit {
                     send_connection_close_for_sessions(&mut sessions, &mut send_buf);
                 }
                 clear_sessions(&mut sessions, &mut index_by_token, poll.registry());
                 return Ok(());
             }
-        }
 
         let wait = if had_activity { Duration::ZERO } else { compute_poll_wait(&sessions) };
         poll.poll(&mut events, Some(wait)).context("poll failed")?;
@@ -464,11 +452,10 @@ fn run_worker(
 
         if !recv_failed_tokens.is_empty() {
             for token in recv_failed_tokens {
-                if let Some(&session_idx) = index_by_token.get(&token) {
-                    if let Some(session) = sessions.get_mut(session_idx) {
+                if let Some(&session_idx) = index_by_token.get(&token)
+                    && let Some(session) = sessions.get_mut(session_idx) {
                         session.conn.close(false, 0, b"recv error").ok();
                     }
-                }
             }
             remove_closed_sessions(&mut sessions, &mut index_by_token, poll.registry());
         }
@@ -581,8 +568,8 @@ fn process_session_logic(
         had_activity = true;
     }
 
-    if let Some(interval) = session.tick_interval {
-        if now >= session.next_tick_at {
+    if let Some(interval) = session.tick_interval
+        && now >= session.next_tick_at {
             let mut ctx = BotContext { bot_id: session.bot_id, outgoing: &mut session.outgoing };
             session.flow.on_tick(&mut ctx, now)?;
             while session.next_tick_at <= now {
@@ -590,7 +577,6 @@ fn process_session_logic(
             }
             had_activity = true;
         }
-    }
 
     if !session.outgoing.is_empty() {
         for packet in session.outgoing.drain(..) {
@@ -601,12 +587,11 @@ fn process_session_logic(
         }
     }
 
-    if let Some(timeout) = session.conn.timeout() {
-        if timeout.is_zero() {
+    if let Some(timeout) = session.conn.timeout()
+        && timeout.is_zero() {
             session.conn.on_timeout();
             had_activity = true;
         }
-    }
 
     if flush_outgoing(session, send_buf)? {
         had_activity = true;
@@ -630,11 +615,10 @@ fn recv_udp(session: &mut BotSession, recv_buf: &mut [u8]) -> Result<bool> {
         }
 
         let recv_info = RecvInfo { from, to: session.local_addr };
-        if let Err(err) = session.conn.recv(&mut recv_buf[..len], recv_info) {
-            if err != quiche::Error::Done {
+        if let Err(err) = session.conn.recv(&mut recv_buf[..len], recv_info)
+            && err != quiche::Error::Done {
                 log::debug!("bot {} conn.recv error: {err:?}", session.bot_id);
             }
-        }
         had_activity = true;
     }
     Ok(had_activity)
@@ -765,7 +749,7 @@ fn compute_poll_wait(sessions: &[BotSession]) -> Duration {
             return Duration::ZERO;
         }
 
-        if let Some(_) = session.tick_interval {
+        if session.tick_interval.is_some() {
             if session.next_tick_at <= now {
                 return Duration::ZERO;
             }
@@ -921,7 +905,7 @@ fn clear_sessions(
     index_by_token: &mut HashMap<Token, usize>,
     registry: &mio::Registry,
 ) {
-    while let Some(mut session) = sessions.pop() {
+    for mut session in sessions.drain(..) {
         registry.deregister(&mut session.socket).ok();
     }
     index_by_token.clear();

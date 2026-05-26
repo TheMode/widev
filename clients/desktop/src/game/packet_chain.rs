@@ -88,42 +88,17 @@ fn dependency_id(message: &protocol::decode::DecodedServerMessage) -> Option<pro
 fn required_resource_ids(
     message: &protocol::decode::DecodedServerMessage,
 ) -> impl Iterator<Item = protocol::MessageId> + '_ {
-    match message {
-        protocol::decode::DecodedServerMessage::Envelope(envelope) => {
-            EitherRequiredResources::Packets(
-                envelope.packets.iter().filter_map(required_resource_id),
-            )
-        },
-        protocol::decode::DecodedServerMessage::Resource(_) => {
-            EitherRequiredResources::Empty(std::iter::empty())
-        },
-    }
+    let packets = match message {
+        protocol::decode::DecodedServerMessage::Envelope(envelope) => envelope.packets.as_slice(),
+        protocol::decode::DecodedServerMessage::Resource(_) => &[],
+    };
+    packets.iter().filter_map(required_resource_id)
 }
 
 fn required_resource_id(packet: &protocol::S2CPacket) -> Option<protocol::MessageId> {
     match packet {
         protocol::S2CPacket::ElementSetTexture { resource_id, .. } => Some(*resource_id),
         _ => None,
-    }
-}
-
-enum EitherRequiredResources<I, E> {
-    Packets(I),
-    Empty(E),
-}
-
-impl<I, E> Iterator for EitherRequiredResources<I, E>
-where
-    I: Iterator<Item = protocol::MessageId>,
-    E: Iterator<Item = protocol::MessageId>,
-{
-    type Item = protocol::MessageId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Packets(iter) => iter.next(),
-            Self::Empty(iter) => iter.next(),
-        }
     }
 }
 

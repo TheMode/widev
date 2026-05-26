@@ -175,9 +175,9 @@ impl BindingState {
         identifier: String,
         input_type: protocol::InputType,
     ) -> DeclareBindingOutcome {
-        if let Some(cert_fp) = cert_fp {
-            if let Some(saved_binding) = self.store.get_binding(cert_fp, &identifier) {
-                if saved_binding.action_type == input_type {
+        if let Some(cert_fp) = cert_fp
+            && let Some(saved_binding) = self.store.get_binding(cert_fp, &identifier)
+                && saved_binding.action_type == input_type {
                     self.activate_binding(binding_id, saved_binding.clone());
                     return DeclareBindingOutcome::Restored {
                         binding_id,
@@ -185,8 +185,6 @@ impl BindingState {
                         identifier,
                     };
                 }
-            }
-        }
 
         self.pending_bindings.push_back(PendingBinding {
             id: binding_id,
@@ -207,7 +205,7 @@ impl BindingState {
         let mut outgoing = Vec::new();
         for binding in &mut self.active_bindings {
             let value = aggregate_binding_value(&binding.binding, &mut read_value);
-            if !payload_changed(&binding.last_value, &value) {
+            if binding.last_value == value {
                 continue;
             }
 
@@ -435,10 +433,6 @@ where
             protocol::InputPayload::Joystick2D { x, y }
         },
     }
-}
-
-fn payload_changed(previous: &protocol::InputPayload, next: &protocol::InputPayload) -> bool {
-    previous != next
 }
 
 fn default_payload(input_type: protocol::InputType) -> protocol::InputPayload {

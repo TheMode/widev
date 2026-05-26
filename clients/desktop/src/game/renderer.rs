@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -338,7 +337,7 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("widev-pipeline-layout"),
-            bind_group_layouts: &[&uniform_layout],
+            bind_group_layouts: &[Some(&uniform_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -399,8 +398,8 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -411,7 +410,7 @@ impl Renderer {
         let textured_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("widev-textured-pipeline-layout"),
-                bind_group_layouts: &[&uniform_layout, &texture_bind_group_layout],
+                bind_group_layouts: &[Some(&uniform_layout), Some(&texture_bind_group_layout)],
                 immediate_size: 0,
             });
         let textured_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -472,8 +471,8 @@ impl Renderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -593,17 +592,16 @@ impl Renderer {
         self.write_textured_instances(&textured_states);
 
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost => {
                 self.resize(self.size);
                 return Ok(());
             },
-            Err(wgpu::SurfaceError::Outdated) => return Ok(()),
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(wgpu::SurfaceError::Other) => return Ok(()),
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                return Err(anyhow::anyhow!("wgpu surface out of memory"));
-            },
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return Ok(()),
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (vp_x, vp_y, vp_w, vp_h) = self.compute_viewport();
@@ -961,15 +959,7 @@ impl Renderer {
             return;
         }
         self.instance_staging.clear();
-        self.instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
-            // Game-space positions are top-left corners; the quad geometry is
-            // centered, so convert to a center point here.
-            center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
-            size: [state.width, state.height],
-            depth: scene_depth(state.depth),
-            _pad: 0.0,
-            color: unpack_color(state.color),
-        }));
+        self.instance_staging.extend(render_states.iter().copied().map(instance_from_state));
         self.queue.write_buffer(
             &self.instance_buffer,
             0,
@@ -982,15 +972,8 @@ impl Renderer {
             return;
         }
         self.textured_instance_staging.clear();
-        self.textured_instance_staging.extend(render_states.iter().map(|state| InstanceRaw {
-            // Game-space positions are top-left corners; the quad geometry is
-            // centered, so convert to a center point here.
-            center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
-            size: [state.width, state.height],
-            depth: scene_depth(state.depth),
-            _pad: 0.0,
-            color: unpack_color(state.color),
-        }));
+        self.textured_instance_staging
+            .extend(render_states.iter().copied().map(instance_from_state));
         self.queue.write_buffer(
             &self.textured_instance_buffer,
             0,
@@ -1035,16 +1018,8 @@ impl Renderer {
                 &texture.rgba,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(
-                        NonZeroU32::new(texture.width.max(1) * 4)
-                            .expect("texture row bytes must be non-zero")
-                            .into(),
-                    ),
-                    rows_per_image: Some(
-                        NonZeroU32::new(texture.height.max(1))
-                            .expect("texture height must be non-zero")
-                            .into(),
-                    ),
+                    bytes_per_row: Some(texture.width.max(1) * 4),
+                    rows_per_image: Some(texture.height.max(1)),
                 },
                 size,
             );
@@ -1078,13 +1053,12 @@ impl Renderer {
     }
 
     fn compute_virtual_size(&self) -> (u32, u32) {
-        if let Some((width, height)) = self.virtual_dimension_lock {
-            if width > 0 && height > 0 {
+        if let Some((width, height)) = self.virtual_dimension_lock
+            && width > 0 && height > 0 {
                 return (width, height);
             }
-        }
-        if let Some((numerator, denominator)) = self.aspect_ratio_lock {
-            if numerator > 0 && denominator > 0 {
+        if let Some((numerator, denominator)) = self.aspect_ratio_lock
+            && numerator > 0 && denominator > 0 {
                 return enforce_aspect(
                     self.config.width.max(1),
                     self.config.height.max(1),
@@ -1092,7 +1066,6 @@ impl Renderer {
                     denominator,
                 );
             }
-        }
         (self.config.width.max(1), self.config.height.max(1))
     }
 
@@ -1185,6 +1158,18 @@ impl Renderer {
             &mut self.swash_cache,
         )?;
         Ok(())
+    }
+}
+
+fn instance_from_state(state: &RenderState) -> InstanceRaw {
+    // Game-space positions are top-left corners; the quad geometry is
+    // centered, so convert to a center point here.
+    InstanceRaw {
+        center: [state.x + state.width * 0.5, state.y + state.height * 0.5],
+        size: [state.width, state.height],
+        depth: scene_depth(state.depth),
+        _pad: 0.0,
+        color: unpack_color(state.color),
     }
 }
 
