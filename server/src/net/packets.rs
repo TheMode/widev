@@ -19,7 +19,7 @@ pub enum PacketPriority {
     Normal,
     /// Prefer freshness over reliability when the session is over budget.
     ///
-    /// If the envelope is `Independent`, has no identifier, and its encoded
+    /// If the envelope is `Unordered`, has no identifier, and its encoded
     /// payload fits a single writable QUIC datagram, the transport may send it
     /// as a datagram instead of opening a stream. Otherwise, stream-backed
     /// sends may be dropped instead of being queued when congestion budget is
@@ -118,38 +118,6 @@ impl PacketMeta {
             dependency: None,
         }
     }
-
-    fn set_droppable(&mut self) {
-        self.priority = PacketPriority::Droppable;
-    }
-
-    fn set_max_delay(&mut self, max_delay: Duration) {
-        self.priority = PacketPriority::MaxDelay { max_delay };
-    }
-
-    fn set_coalescing(&mut self, target_payload_bytes: usize) {
-        self.priority = PacketPriority::Coalescing { target_payload_bytes };
-    }
-
-    fn set_delivery(&mut self, delivery: DeliveryPolicy) {
-        self.delivery = delivery;
-    }
-
-    fn set_unordered(&mut self) {
-        self.order = PacketOrder::Unordered;
-    }
-
-    fn set_dependency(&mut self, message_id: MessageId) {
-        self.dependency = Some(message_id);
-    }
-
-    fn set_sequence(&mut self, sequence_id: uuid::Uuid) {
-        self.order = PacketOrder::Sequence { id: sequence_id, seal: false };
-    }
-
-    fn set_sequence_end(&mut self, sequence_id: uuid::Uuid) {
-        self.order = PacketOrder::Sequence { id: sequence_id, seal: true };
-    }
 }
 
 #[derive(Clone)]
@@ -228,17 +196,17 @@ impl PacketEnvelope {
     }
 
     pub fn droppable(mut self) -> Self {
-        self.meta.set_droppable();
+        self.meta.priority = PacketPriority::Droppable;
         self
     }
 
     pub fn max_delay(mut self, max_delay: Duration) -> Self {
-        self.meta.set_max_delay(max_delay);
+        self.meta.priority = PacketPriority::MaxDelay { max_delay };
         self
     }
 
     pub fn coalescing(mut self, target_payload_bytes: usize) -> Self {
-        self.meta.set_coalescing(target_payload_bytes);
+        self.meta.priority = PacketPriority::Coalescing { target_payload_bytes };
         self
     }
 
@@ -248,27 +216,27 @@ impl PacketEnvelope {
     }
 
     pub fn delivery(mut self, delivery: DeliveryPolicy) -> Self {
-        self.meta.set_delivery(delivery);
+        self.meta.delivery = delivery;
         self
     }
 
     pub fn unordered(mut self) -> Self {
-        self.meta.set_unordered();
+        self.meta.order = PacketOrder::Unordered;
         self
     }
 
     pub fn dependency(mut self, message_id: MessageId) -> Self {
-        self.meta.set_dependency(message_id);
+        self.meta.dependency = Some(message_id);
         self
     }
 
     pub fn sequence(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.meta.set_sequence(sequence_id);
+        self.meta.order = PacketOrder::Sequence { id: sequence_id, seal: false };
         self
     }
 
     pub fn sequence_end(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.meta.set_sequence_end(sequence_id);
+        self.meta.order = PacketOrder::Sequence { id: sequence_id, seal: true };
         self
     }
 
@@ -296,42 +264,42 @@ impl PacketResource {
     }
 
     pub fn droppable(mut self) -> Self {
-        self.meta.set_droppable();
+        self.meta.priority = PacketPriority::Droppable;
         self
     }
 
     pub fn max_delay(mut self, max_delay: Duration) -> Self {
-        self.meta.set_max_delay(max_delay);
+        self.meta.priority = PacketPriority::MaxDelay { max_delay };
         self
     }
 
     pub fn coalescing(mut self, target_payload_bytes: usize) -> Self {
-        self.meta.set_coalescing(target_payload_bytes);
+        self.meta.priority = PacketPriority::Coalescing { target_payload_bytes };
         self
     }
 
     pub fn delivery(mut self, delivery: DeliveryPolicy) -> Self {
-        self.meta.set_delivery(delivery);
+        self.meta.delivery = delivery;
         self
     }
 
     pub fn unordered(mut self) -> Self {
-        self.meta.set_unordered();
+        self.meta.order = PacketOrder::Unordered;
         self
     }
 
     pub fn dependency(mut self, message_id: MessageId) -> Self {
-        self.meta.set_dependency(message_id);
+        self.meta.dependency = Some(message_id);
         self
     }
 
     pub fn sequence(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.meta.set_sequence(sequence_id);
+        self.meta.order = PacketOrder::Sequence { id: sequence_id, seal: false };
         self
     }
 
     pub fn sequence_end(mut self, sequence_id: uuid::Uuid) -> Self {
-        self.meta.set_sequence_end(sequence_id);
+        self.meta.order = PacketOrder::Sequence { id: sequence_id, seal: true };
         self
     }
 

@@ -1,6 +1,6 @@
 use crate::packets::{
-    DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketPayload, PacketResource,
-    S2CPacket, encode_s2c,
+    DeliveryPolicy, PacketEnvelope, PacketMessage, PacketPayload, PacketResource, S2CPacket,
+    encode_s2c,
 };
 
 pub fn serialize_s2c_packet_message(packet: &S2CPacket) -> Option<Vec<u8>> {
@@ -106,15 +106,11 @@ fn append_envelope_header(out: &mut Vec<u8>, envelope: &PacketEnvelope) {
     out.push(flags);
 
     if let Some(id) = envelope.id {
-        out.extend_from_slice(&envelope_id_to_bytes(id));
+        out.extend_from_slice(&id.to_be_bytes());
     }
     if let Some(dependency_id) = envelope.meta.dependency {
-        out.extend_from_slice(&envelope_id_to_bytes(dependency_id));
+        out.extend_from_slice(&dependency_id.to_be_bytes());
     }
-}
-
-fn envelope_id_to_bytes(id: MessageId) -> [u8; 16] {
-    id.to_be_bytes()
 }
 
 fn frame_top_level_payload(kind: FrameKind, payload: &[u8]) -> Vec<u8> {

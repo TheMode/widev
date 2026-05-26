@@ -108,10 +108,8 @@ pub enum TraceDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
 pub enum BackpressureReason {
     FlowControlWindow,
-    Other,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1022,10 +1020,9 @@ impl SessionTracer {
         if !self.tracer.enabled() {
             return;
         }
-        let stream_id = stream_id_hint_from_order(&trace.order).unwrap_or(0);
         self.emitter.emit_stream_queued(
             trace,
-            stream_id,
+            0,
             queued_before,
             queued_after,
             inflight_before,
@@ -1368,10 +1365,6 @@ fn queue_name_for_trace(trace: &DispatchTraceMeta) -> &'static str {
     if trace.sequence_id.is_some() { "sequence" } else { "independent" }
 }
 
-fn stream_id_hint_from_order(_order: &str) -> Option<u64> {
-    None
-}
-
 fn envelope_label(envelope: &PacketEnvelope) -> String {
     match &envelope.payload {
         crate::packets::PacketPayload::Single(packet) => variant_name(packet),
@@ -1452,7 +1445,6 @@ impl Describe for BackpressureReason {
     fn describe(&self) -> String {
         match self {
             Self::FlowControlWindow => "flow_control_window".to_string(),
-            Self::Other => "other".to_string(),
         }
     }
 }

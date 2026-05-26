@@ -1012,38 +1012,23 @@ fn decode_and_forward_c2s(
     event_tx: &mpsc::Sender<NetworkEvent>,
 ) {
     match crate::packets::decode_c2s(bytes) {
-        Ok(crate::packets::C2SPacket::Ping { nonce }) => {
-            session.tracer.on_rx_packet(
-                transport,
-                bytes.len(),
-                &crate::packets::C2SPacket::Ping { nonce },
-                None,
-            );
+        Ok(packet @ crate::packets::C2SPacket::Ping { nonce }) => {
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet, None);
             if let Some(bytes) =
                 serialize_s2c_packet_message(&crate::packets::S2CPacket::Pong { nonce })
             {
                 let _ = session.conn.dgram_send(&bytes);
             }
         },
-        Ok(crate::packets::C2SPacket::Pong { nonce }) => {
+        Ok(packet @ crate::packets::C2SPacket::Pong { nonce }) => {
             let rtt_ms = session
                 .pending_ping_nonces
                 .remove(&nonce)
                 .map(|sent_at| sent_at.elapsed().as_secs_f64() * 1000.0);
-            session.tracer.on_rx_packet(
-                transport,
-                bytes.len(),
-                &crate::packets::C2SPacket::Pong { nonce },
-                rtt_ms,
-            );
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet, rtt_ms);
         },
-        Ok(crate::packets::C2SPacket::Receipt { message_id }) => {
-            session.tracer.on_rx_packet(
-                transport,
-                bytes.len(),
-                &crate::packets::C2SPacket::Receipt { message_id },
-                None,
-            );
+        Ok(packet @ crate::packets::C2SPacket::Receipt { message_id }) => {
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet, None);
             session
                 .tracer
                 .on_transport_outcome(message_id, crate::packets::DeliveryOutcome::ClientProcessed);
@@ -1053,13 +1038,8 @@ fn decode_and_forward_c2s(
                 outcome: crate::packets::DeliveryOutcome::ClientProcessed,
             });
         },
-        Ok(crate::packets::C2SPacket::Disconnect {}) => {
-            session.tracer.on_rx_packet(
-                transport,
-                bytes.len(),
-                &crate::packets::C2SPacket::Disconnect {},
-                None,
-            );
+        Ok(packet @ crate::packets::C2SPacket::Disconnect {}) => {
+            session.tracer.on_rx_packet(transport, bytes.len(), &packet, None);
             session.disconnect_requested = true;
             let _ = session.conn.close(true, 0, b"client_disconnect");
         },
