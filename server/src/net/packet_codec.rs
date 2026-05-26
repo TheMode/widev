@@ -1,6 +1,6 @@
 use crate::packets::{
-    DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketOrder, PacketPayload,
-    PacketResource, S2CPacket, encode_s2c,
+    DeliveryPolicy, MessageId, PacketEnvelope, PacketMessage, PacketPayload, PacketResource,
+    S2CPacket, encode_s2c,
 };
 
 pub fn serialize_s2c_packet_message(packet: &S2CPacket) -> Option<Vec<u8>> {
@@ -57,13 +57,13 @@ fn serialize_resource_payload(resource: &PacketResource) -> Option<Vec<u8>> {
     if resource.meta.delivery == DeliveryPolicy::RequireClientReceipt {
         flags |= FLAG_CLIENT_PROCESSED_RECEIPT;
     }
-    if matches!(resource.meta.order, PacketOrder::Dependency(_)) {
+    if resource.meta.dependency.is_some() {
         flags |= FLAG_HAS_DEPENDENCY;
     }
 
     payload.push(flags);
     payload.extend_from_slice(&resource.id.to_be_bytes());
-    if let PacketOrder::Dependency(dependency_id) = resource.meta.order {
+    if let Some(dependency_id) = resource.meta.dependency {
         payload.extend_from_slice(&dependency_id.to_be_bytes());
     }
 
@@ -100,7 +100,7 @@ fn append_envelope_header(out: &mut Vec<u8>, envelope: &PacketEnvelope) {
     if envelope.meta.delivery == DeliveryPolicy::RequireClientReceipt {
         flags |= FLAG_CLIENT_PROCESSED_RECEIPT;
     }
-    if matches!(envelope.meta.order, crate::packets::PacketOrder::Dependency(_)) {
+    if envelope.meta.dependency.is_some() {
         flags |= FLAG_HAS_DEPENDENCY;
     }
     out.push(flags);
@@ -108,7 +108,7 @@ fn append_envelope_header(out: &mut Vec<u8>, envelope: &PacketEnvelope) {
     if let Some(id) = envelope.id {
         out.extend_from_slice(&envelope_id_to_bytes(id));
     }
-    if let crate::packets::PacketOrder::Dependency(dependency_id) = envelope.meta.order {
+    if let Some(dependency_id) = envelope.meta.dependency {
         out.extend_from_slice(&envelope_id_to_bytes(dependency_id));
     }
 }

@@ -770,7 +770,7 @@ impl SessionTracer {
             priority: envelope.meta.priority.describe(),
             order: envelope.meta.order.describe(),
             delivery: envelope.meta.delivery.describe(),
-            dependency_label: dependency_message_label(envelope.meta.order),
+            dependency_label: dependency_message_label(envelope.meta.dependency),
             sequence_id: sequence_label(envelope.meta.order),
             components,
         };
@@ -800,7 +800,7 @@ impl SessionTracer {
             priority: resource.meta.priority.describe(),
             order: resource.meta.order.describe(),
             delivery: resource.meta.delivery.describe(),
-            dependency_label: dependency_message_label(resource.meta.order),
+            dependency_label: dependency_message_label(resource.meta.dependency),
             sequence_id: sequence_label(resource.meta.order),
             components: vec![PacketComponent {
                 index: 0,
@@ -1340,7 +1340,7 @@ fn packet_components_from_envelope(
 
 fn determine_flow_kind(priority: PacketPriority, order: PacketOrder, has_id: bool) -> FlowKind {
     match (priority, order) {
-        (PacketPriority::Droppable, PacketOrder::Independent) if !has_id => FlowKind::Datagram,
+        (PacketPriority::Droppable, PacketOrder::Unordered) if !has_id => FlowKind::Datagram,
         _ => FlowKind::Envelope,
     }
 }
@@ -1353,19 +1353,14 @@ fn describe_target(target: PacketTarget) -> String {
     }
 }
 
-fn dependency_message_label(order: PacketOrder) -> Option<String> {
-    match order {
-        PacketOrder::Dependency(message_id) => Some(message_id.to_string()),
-        _ => None,
-    }
+fn dependency_message_label(dependency: Option<MessageId>) -> Option<String> {
+    dependency.map(|id| id.to_string())
 }
 
 fn sequence_label(order: PacketOrder) -> Option<String> {
     match order {
-        PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
-            Some(sequence_id.to_string())
-        },
-        _ => None,
+        PacketOrder::Sequence { id, .. } => Some(id.to_string()),
+        PacketOrder::Unordered => None,
     }
 }
 
@@ -1415,10 +1410,9 @@ impl Describe for PacketPriority {
 impl Describe for PacketOrder {
     fn describe(&self) -> String {
         match self {
-            Self::Independent => "Independent".to_string(),
-            Self::Dependency(message_id) => format!("Dependency({message_id})"),
-            Self::Sequence(sequence_id) => format!("Sequence({sequence_id})"),
-            Self::SequenceEnd(sequence_id) => format!("SequenceEnd({sequence_id})"),
+            Self::Unordered => "Unordered".to_string(),
+            Self::Sequence { id, seal: false } => format!("Sequence({id})"),
+            Self::Sequence { id, seal: true } => format!("SequenceEnd({id})"),
         }
     }
 }

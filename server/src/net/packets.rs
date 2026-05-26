@@ -45,15 +45,12 @@ pub enum PacketPriority {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PacketOrder {
-    /// No ordering relationship with any other packet.
+    /// No scheduler-level ordering relationship with any other packet.
     #[default]
-    Independent,
-    /// Declare a client-visible dependency on another envelope's id.
-    Dependency(MessageId),
-    /// Append this packet to the reused stream for this sequence.
-    Sequence(uuid::Uuid),
-    /// Append this packet to the reused stream for this sequence, then send FIN.
-    SequenceEnd(uuid::Uuid),
+    Unordered,
+    /// Append this packet to the reused stream for this sequence. When
+    /// `seal` is true, FIN the stream after this packet.
+    Sequence { id: uuid::Uuid, seal: bool },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -106,6 +103,9 @@ pub struct PacketMeta {
     pub priority: PacketPriority,
     pub order: PacketOrder,
     pub delivery: DeliveryPolicy,
+    /// Client-visible dependency on another envelope's id. Independent of
+    /// `order` — a sequenced packet may also declare a dependency.
+    pub dependency: Option<MessageId>,
 }
 
 impl PacketMeta {
@@ -115,6 +115,7 @@ impl PacketMeta {
             priority: PacketPriority::default(),
             order: PacketOrder::default(),
             delivery: DeliveryPolicy::default(),
+            dependency: None,
         }
     }
 
@@ -134,20 +135,20 @@ impl PacketMeta {
         self.delivery = delivery;
     }
 
-    fn set_independent(&mut self) {
-        self.order = PacketOrder::Independent;
+    fn set_unordered(&mut self) {
+        self.order = PacketOrder::Unordered;
     }
 
     fn set_dependency(&mut self, message_id: MessageId) {
-        self.order = PacketOrder::Dependency(message_id);
+        self.dependency = Some(message_id);
     }
 
     fn set_sequence(&mut self, sequence_id: uuid::Uuid) {
-        self.order = PacketOrder::Sequence(sequence_id);
+        self.order = PacketOrder::Sequence { id: sequence_id, seal: false };
     }
 
     fn set_sequence_end(&mut self, sequence_id: uuid::Uuid) {
-        self.order = PacketOrder::SequenceEnd(sequence_id);
+        self.order = PacketOrder::Sequence { id: sequence_id, seal: true };
     }
 }
 
@@ -251,8 +252,8 @@ impl PacketEnvelope {
         self
     }
 
-    pub fn independent(mut self) -> Self {
-        self.meta.set_independent();
+    pub fn unordered(mut self) -> Self {
+        self.meta.set_unordered();
         self
     }
 
@@ -314,8 +315,8 @@ impl PacketResource {
         self
     }
 
-    pub fn independent(mut self) -> Self {
-        self.meta.set_independent();
+    pub fn unordered(mut self) -> Self {
+        self.meta.set_unordered();
         self
     }
 

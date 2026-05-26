@@ -1722,15 +1722,15 @@ impl Session {
 
     fn resolve_stream_target(&mut self, order: PacketOrder) -> StreamTarget {
         match order {
-            PacketOrder::Independent | PacketOrder::Dependency(_) => {
+            PacketOrder::Unordered => {
                 StreamTarget { stream_id: self.alloc_server_uni_stream_id(), fin: true }
             },
-            PacketOrder::Sequence(sequence_id) => {
-                StreamTarget { stream_id: self.sequence_stream_id(sequence_id), fin: false }
+            PacketOrder::Sequence { id, seal: false } => {
+                StreamTarget { stream_id: self.sequence_stream_id(id), fin: false }
             },
-            PacketOrder::SequenceEnd(sequence_id) => {
-                let stream_id = self.sequence_stream_id(sequence_id);
-                self.sequence_streams.remove(&sequence_id);
+            PacketOrder::Sequence { id, seal: true } => {
+                let stream_id = self.sequence_stream_id(id);
+                self.sequence_streams.remove(&id);
                 StreamTarget { stream_id, fin: true }
             },
         }

@@ -169,7 +169,7 @@ impl PongGame {
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
                 .id(message_id)
                 .delivery(DeliveryPolicy::RequireClientReceipt)
-                .independent(),
+                .unordered(),
         );
     }
 
@@ -193,7 +193,7 @@ impl PongGame {
                 self.texture_png.clone(),
                 None,
             )
-            .independent(),
+            .unordered(),
         );
 
         let bundle = vec![
@@ -283,7 +283,7 @@ impl PongGame {
             PacketEnvelope::bundle(PacketTarget::Client(client_id), bundle)
                 .id(message_id)
                 .delivery(DeliveryPolicy::RequireClientReceipt)
-                .independent(),
+                .unordered(),
         );
     }
 
@@ -449,7 +449,7 @@ impl PongGame {
     fn send_match_cleanup(&mut self, state: &mut GameState, client_id: ClientId) {
         state.send(
             PacketEnvelope::single(PacketTarget::Client(client_id), S2CPacket::ResetScene {})
-                .independent(),
+                .unordered(),
         );
     }
 

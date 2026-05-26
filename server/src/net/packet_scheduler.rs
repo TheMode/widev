@@ -40,8 +40,9 @@
 //! ## Ordering
 //!
 //! Messages belong to ordering categories that constrain dispatch order:
-//! - **Independent/Dependency**: No sequence ordering constraints
-//! - **Sequence/SequenceEnd(Uuid)**: Must dispatch in order within same sequence_id
+//! - **Unordered**: No sequence ordering constraints
+//! - **Sequence { id, seal }**: Must dispatch in order within same sequence id.
+//!   `seal: true` signals FIN on the carrying packet.
 //!
 //! ## Priority Policies
 //!
@@ -136,7 +137,7 @@ impl DispatchMessage {
                 self.meta.priority,
                 PacketPriority::Droppable | PacketPriority::MaxDelay { .. }
             )
-            && matches!(self.meta.order, PacketOrder::Independent | PacketOrder::Dependency(_))
+            && matches!(self.meta.order, PacketOrder::Unordered)
             && self.id.is_none()
     }
 
@@ -360,11 +361,11 @@ impl PacketScheduler {
             reason,
         });
         match scheduled.message.order() {
-            PacketOrder::Independent | PacketOrder::Dependency(_) => {
+            PacketOrder::Unordered => {
                 self.pending_independent.push_front(scheduled);
             },
-            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
-                self.pending_sequences.entry(sequence_id).or_default().push_front(scheduled);
+            PacketOrder::Sequence { id, .. } => {
+                self.pending_sequences.entry(id).or_default().push_front(scheduled);
             },
         }
     }
@@ -476,20 +477,20 @@ impl PacketScheduler {
     fn enqueue_message(&mut self, message: DispatchMessage, now: Instant) {
         let scheduled = ScheduledMessage::new(message, now);
         match scheduled.message.order() {
-            PacketOrder::Independent | PacketOrder::Dependency(_) => {
+            PacketOrder::Unordered => {
                 self.pending_independent.push_back(scheduled);
             },
-            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
-                self.pending_sequences.entry(sequence_id).or_default().push_back(scheduled);
+            PacketOrder::Sequence { id, .. } => {
+                self.pending_sequences.entry(id).or_default().push_back(scheduled);
             },
         }
     }
 
     fn queue_len_for_order(&self, order: PacketOrder) -> usize {
         match order {
-            PacketOrder::Independent | PacketOrder::Dependency(_) => self.pending_independent.len(),
-            PacketOrder::Sequence(sequence_id) | PacketOrder::SequenceEnd(sequence_id) => {
-                self.pending_sequences.get(&sequence_id).map(|q| q.len()).unwrap_or(0)
+            PacketOrder::Unordered => self.pending_independent.len(),
+            PacketOrder::Sequence { id, .. } => {
+                self.pending_sequences.get(&id).map(|q| q.len()).unwrap_or(0)
             },
         }
     }
@@ -550,8 +551,8 @@ impl PacketScheduler {
 
 fn order_to_queue_name(order: PacketOrder) -> &'static str {
     match order {
-        PacketOrder::Independent | PacketOrder::Dependency(_) => "independent",
-        PacketOrder::Sequence(_) | PacketOrder::SequenceEnd(_) => "sequence",
+        PacketOrder::Unordered => "independent",
+        PacketOrder::Sequence { .. } => "sequence",
     }
 }
 
@@ -649,6 +650,7 @@ mod tests {
                 priority,
                 order,
                 delivery: DeliveryPolicy::FireAndForget,
+                dependency: None,
             },
             framed: vec![0; framed_len],
             trace: DispatchTraceMeta {
@@ -675,7 +677,7 @@ mod tests {
         let mut scheduler = PacketScheduler::new();
         let env = envelope(
             PacketPriority::MaxDelay { max_delay: Duration::from_millis(50) },
-            PacketOrder::Independent,
+            PacketOrder::Unordered,
             128,
         );
 
@@ -703,7 +705,7 @@ mod tests {
         let mut scheduler = PacketScheduler::new();
         let first = envelope(
             PacketPriority::Coalescing { target_payload_bytes: 600 },
-            PacketOrder::Independent,
+            PacketOrder::Unordered,
             250,
         );
 
@@ -716,12 +718,12 @@ mod tests {
         let mut scheduler = PacketScheduler::new();
         let first = envelope(
             PacketPriority::Coalescing { target_payload_bytes: 600 },
-            PacketOrder::Independent,
+            PacketOrder::Unordered,
             250,
         );
         let second = envelope(
             PacketPriority::Coalescing { target_payload_bytes: 400 },
-            PacketOrder::Independent,
+            PacketOrder::Unordered,
             400,
         );
 
@@ -743,14 +745,14 @@ mod tests {
 
         let first = envelope(
             PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
-            PacketOrder::Sequence(seq_id),
+            PacketOrder::Sequence { id: seq_id, seal: false },
             128,
         );
         scheduler.push(SchedulerCommand::Message(first.clone()), now);
         scheduler.requeue_deferred_message(first, now, RetryReason::Congestion);
 
         // Second message for same sequence should queue behind
-        let second = envelope(PacketPriority::Normal, PacketOrder::Sequence(seq_id), 64);
+        let second = envelope(PacketPriority::Normal, PacketOrder::Sequence { id: seq_id, seal: false }, 64);
         let actions = scheduler.push(SchedulerCommand::Message(second), now);
         assert!(
             actions.is_empty()
@@ -759,7 +761,7 @@ mod tests {
 
         // Different sequence should dispatch immediately
         let other_seq = Uuid::from_u128(2);
-        let other = envelope(PacketPriority::Normal, PacketOrder::Sequence(other_seq), 64);
+        let other = envelope(PacketPriority::Normal, PacketOrder::Sequence { id: other_seq, seal: false }, 64);
         let actions = scheduler.push(SchedulerCommand::Message(other), now);
         assert!(matches!(actions.as_slice(), [SchedulerAction::DispatchMessage { .. }]));
     }
@@ -772,7 +774,7 @@ mod tests {
 
         let msg = envelope(
             PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
-            PacketOrder::Sequence(seq_id),
+            PacketOrder::Sequence { id: seq_id, seal: false },
             128,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
@@ -801,7 +803,7 @@ mod tests {
 
         let msg = envelope(
             PacketPriority::MaxDelay { max_delay: Duration::from_secs(1) },
-            PacketOrder::Sequence(seq_id),
+            PacketOrder::Sequence { id: seq_id, seal: false },
             128,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
@@ -820,7 +822,7 @@ mod tests {
 
         let msg = envelope(
             PacketPriority::Coalescing { target_payload_bytes: 900 },
-            PacketOrder::Independent,
+            PacketOrder::Unordered,
             300,
         );
         scheduler.push(SchedulerCommand::Message(msg), now);
@@ -835,7 +837,7 @@ mod tests {
         ));
 
         // New messages blocked while barrier pending
-        let blocked = envelope(PacketPriority::Normal, PacketOrder::Independent, 100);
+        let blocked = envelope(PacketPriority::Normal, PacketOrder::Unordered, 100);
         assert!(scheduler.push(SchedulerCommand::Message(blocked), now).is_empty());
 
         // Releases after drain
@@ -855,7 +857,7 @@ mod tests {
                 .push(
                     SchedulerCommand::Message(resource(
                         PacketPriority::Coalescing { target_payload_bytes: 256 },
-                        PacketOrder::Independent,
+                        PacketOrder::Unordered,
                         128,
                     )),
                     now,
@@ -872,7 +874,7 @@ mod tests {
 
         let msg = envelope(
             PacketPriority::MaxDelay { max_delay: Duration::from_millis(100) },
-            PacketOrder::Sequence(seq_id),
+            PacketOrder::Sequence { id: seq_id, seal: false },
             64,
         );
         scheduler.push(SchedulerCommand::Message(msg.clone()), now);
