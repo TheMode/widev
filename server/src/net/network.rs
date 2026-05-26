@@ -1279,6 +1279,7 @@ struct PendingStreamWrite {
 #[derive(Default)]
 struct QuicStreamState {
     recv_buffer: Vec<u8>,
+    recv_consumed: usize,
     pending_writes: VecDeque<PendingStreamWrite>,
     recv_finished: bool,
 }
@@ -1365,6 +1366,17 @@ impl Session {
     fn ingest_stream_data(&mut self, stream_id: u64, bytes: &[u8], fin: bool) -> Vec<Vec<u8>> {
         let client_id = self.client_id;
         let state = self.stream_state_mut(stream_id, "rx");
+
+        // Reclaim space at the front before appending so the buffer doesn't grow
+        // unboundedly. Threshold keeps this amortized O(1) per consumed byte.
+        if state.recv_consumed > 0
+            && (state.recv_consumed == state.recv_buffer.len()
+                || state.recv_consumed >= state.recv_buffer.len() / 2)
+        {
+            state.recv_buffer.drain(..state.recv_consumed);
+            state.recv_consumed = 0;
+        }
+
         state.recv_buffer.extend_from_slice(bytes);
         if fin && !state.recv_finished {
             log::debug!("server stream {} received FIN from client {}", stream_id, client_id);
@@ -1372,16 +1384,18 @@ impl Session {
         state.recv_finished |= fin;
 
         let mut frames = Vec::new();
-        while let Some(frame) = pop_frame(&mut state.recv_buffer) {
+        while let Some(frame) = pop_frame(&state.recv_buffer, &mut state.recv_consumed) {
             frames.push(frame);
         }
-        if state.recv_finished && !state.recv_buffer.is_empty() {
+        let unread = state.recv_buffer.len() - state.recv_consumed;
+        if state.recv_finished && unread > 0 {
             log::warn!(
                 "dropping {} trailing bytes on stream {} after FIN (incomplete frame)",
-                state.recv_buffer.len(),
+                unread,
                 stream_id
             );
             state.recv_buffer.clear();
+            state.recv_consumed = 0;
         }
 
         self.cleanup_stream_if_closed(stream_id);
@@ -1949,7 +1963,7 @@ impl Session {
     fn cleanup_stream_if_closed(&mut self, stream_id: u64) {
         let should_remove = if let Some(state) = self.streams.get(&stream_id) {
             state.pending_writes.is_empty()
-                && state.recv_buffer.is_empty()
+                && state.recv_buffer.len() == state.recv_consumed
                 && (state.recv_finished || self.conn.stream_finished(stream_id))
         } else {
             false
@@ -2027,15 +2041,16 @@ impl Session {
     }
 }
 
-fn pop_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    if buffer.len() < 4 {
+fn pop_frame(buffer: &[u8], consumed: &mut usize) -> Option<Vec<u8>> {
+    let unread = &buffer[*consumed..];
+    if unread.len() < 4 {
         return None;
     }
-    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-    if buffer.len() < 4 + len {
+    let len = u32::from_be_bytes([unread[0], unread[1], unread[2], unread[3]]) as usize;
+    if unread.len() < 4 + len {
         return None;
     }
-    let payload = buffer[4..4 + len].to_vec();
-    buffer.drain(..4 + len);
+    let payload = unread[4..4 + len].to_vec();
+    *consumed += 4 + len;
     Some(payload)
 }
