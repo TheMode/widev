@@ -559,9 +559,7 @@ fn order_to_queue_name(order: PacketOrder) -> &'static str {
 impl ScheduledMessage {
     fn new(message: DispatchMessage, now: Instant) -> Self {
         let (deadline_at, coalescing_target) = match message.priority() {
-            PacketPriority::MaxDelay { max_delay } => {
-                (now.checked_add(max_delay).or(Some(now)), None)
-            },
+            PacketPriority::MaxDelay { max_delay } => (now.checked_add(max_delay), None),
             PacketPriority::Coalescing { target_payload_bytes } => {
                 (None, Some(target_payload_bytes))
             },

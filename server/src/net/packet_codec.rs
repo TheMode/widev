@@ -36,7 +36,7 @@ fn serialize_envelope_payload(envelope: &PacketEnvelope) -> Option<Vec<u8>> {
             }
 
             for packet in bundle {
-                let _ = append_packet_frame(&mut payload, packet);
+                append_packet_frame(&mut payload, packet)?;
             }
         },
     }

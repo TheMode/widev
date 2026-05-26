@@ -30,6 +30,7 @@ const RECV_BATCH_SIZE: usize = quinn_udp::BATCH_SIZE;
 const SERVER_CONN_ID_LEN: usize = quiche::MAX_CONN_ID_LEN;
 const FIRST_SERVER_UNI_STREAM_ID: u64 = 3;
 const PING_INTERVAL: Duration = Duration::from_secs(2);
+const PING_NONCE_TTL: Duration = Duration::from_secs(30);
 const IO_MAX_WAIT: Duration = Duration::from_millis(10);
 const IO_BACKPRESSURE_WAIT: Duration = Duration::from_millis(1);
 const STREAM_RESET_ERROR_CODE: u64 = 0;
@@ -1302,10 +1303,13 @@ impl Session {
             return;
         }
 
+        let now = Instant::now();
+        self.pending_ping_nonces.retain(|_, sent_at| now.duration_since(*sent_at) < PING_NONCE_TTL);
+
         let nonce = self.next_ping_nonce;
         self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1).max(1);
-        self.pending_ping_nonces.insert(nonce, Instant::now());
-        self.last_ping_sent_at = Instant::now();
+        self.pending_ping_nonces.insert(nonce, now);
+        self.last_ping_sent_at = now;
 
         if let Some(bytes) =
             serialize_s2c_packet_message(&crate::packets::S2CPacket::Ping { nonce })

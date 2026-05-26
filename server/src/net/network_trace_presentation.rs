@@ -524,7 +524,7 @@ impl TraceRenderer {
             let since_start = (ts - state.started_at_ms).max(0.0);
             let delta = (ts - previous_ts).max(0.0);
             previous_ts = ts;
-            if let Some(description) = Self::render_flow_step(event, verbose) {
+            if let Some(description) = Self::render_flow_step(event) {
                 lines.push(format!(
                     "    +{:>8}ms  Δ{:>8}ms  {}",
                     fmt_ms(since_start),
@@ -551,7 +551,7 @@ impl TraceRenderer {
         lines
     }
 
-    fn render_flow_step(event: &TraceEvent, verbose: bool) -> Option<String> {
+    fn render_flow_step(event: &TraceEvent) -> Option<String> {
         match event {
             TraceEvent::FlowRegistered { context, .. } => Some(format!(
                 "register kind={} target={} bytes={} msg={}",
@@ -719,13 +719,7 @@ impl TraceRenderer {
             )),
             TraceEvent::SessionStart { .. }
             | TraceEvent::SessionSnapshot { .. }
-            | TraceEvent::RxEvent { .. } => {
-                if verbose {
-                    None
-                } else {
-                    None
-                }
-            },
+            | TraceEvent::RxEvent { .. } => None,
         }
     }
 }
