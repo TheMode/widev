@@ -10,7 +10,7 @@ mod game_state;
 mod games;
 mod net;
 
-pub use net::{network_trace, packet_codec, packet_scheduler, packets};
+pub use net::{network_trace, packet_codec, packet_scheduler, packets, retry};
 
 use game_loop::{GameLoop, ShutdownSignal, handle_network_events};
 use game_state::GameState;
